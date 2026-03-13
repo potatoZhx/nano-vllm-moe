@@ -10,6 +10,7 @@ from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
 
 
 class ModelRunner:
@@ -32,8 +33,14 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        setattr(hf_config, "enable_heterogeneous", config.enable_heterogeneous)
         self.model = self.MODEL_TYPE_DICT[hf_config.model_type](hf_config)
-        load_model(self.model, config.model)
+        if config.enable_heterogeneous and hasattr(self.model, "enable_heterogeneous_mode"):
+            loader = HeterogeneousModelLoader(config)
+            layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
+            self.model.enable_heterogeneous_mode(layer_caches, cpu_expert_pool)
+        else:
+            load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

@@ -6,3 +6,4 @@ from .layer import (
 )
 from .indexing import get_expert_counts_and_idx
 from .functional import fused_moe_linear
+from .heterogeneous import heterogeneous_moe_forward

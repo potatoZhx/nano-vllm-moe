@@ -14,7 +14,9 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
+from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.expert.cache import LayerExpertCache
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -209,8 +211,36 @@ class Qwen3MoeFusedSparseMoeBlock(nn.Module):
         self.gate_up_proj = MergedColumnParallelFusedMoeLinear(hidden_size, [intermediate_size] * 2, num_experts)
         self.down_proj = RowParallelFusedMoeLinear(intermediate_size, hidden_size, num_experts)
         self.act_fn = SiluAndMul()
+        self.heterogeneous_enabled = False
+        self.expert_cache: LayerExpertCache | None = None
+        self.cpu_expert_pool: dict[int, dict[str, torch.Tensor]] | None = None
+
+    def enable_heterogeneous(
+        self,
+        expert_cache: LayerExpertCache,
+        cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
+    ):
+        self.expert_cache = expert_cache
+        self.cpu_expert_pool = cpu_expert_pool
+        self.heterogeneous_enabled = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.heterogeneous_enabled:
+            router_logits = self.gate(hidden_states)
+            routing_weights = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.num_selected, dim=-1)
+            if self.norm_topk_prob:
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
+            return heterogeneous_moe_forward(
+                hidden_states=hidden_states,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                expert_cache=self.expert_cache,
+                cpu_expert_pool=self.cpu_expert_pool,
+                act_fn=self.act_fn,
+            )
+
         M, hidden_dim = hidden_states.shape
         router_logits = self.gate(hidden_states)
         routing_weights = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
@@ -234,6 +264,53 @@ class Qwen3MoeFusedSparseMoeBlock(nn.Module):
         output = (expert_output * routing_weights.unsqueeze(-1)).sum(dim=1)
 
         return output
+
+
+class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        num_experts_per_tok: int,
+        norm_topk_prob: bool,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_selected = num_experts_per_tok
+        self.norm_topk_prob = norm_topk_prob
+
+        self.gate = RowParallelLinear(hidden_size, num_experts, bias=False)
+        self.act_fn = SiluAndMul()
+        self.expert_cache: LayerExpertCache | None = None
+        self.cpu_expert_pool: dict[int, dict[str, torch.Tensor]] | None = None
+
+    def enable_heterogeneous(
+        self,
+        expert_cache: LayerExpertCache,
+        cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
+    ) -> None:
+        self.expert_cache = expert_cache
+        self.cpu_expert_pool = cpu_expert_pool
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.expert_cache is None:
+            raise RuntimeError("Heterogeneous MoE block is not initialized with expert cache.")
+
+        router_logits = self.gate(hidden_states)
+        routing_weights = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.num_selected, dim=-1)
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        return heterogeneous_moe_forward(
+            hidden_states=hidden_states,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            expert_cache=self.expert_cache,
+            cpu_expert_pool=self.cpu_expert_pool,
+            act_fn=self.act_fn,
+        )
 
 
 # Qwen3MoeSparseMoeBlock
@@ -268,14 +345,22 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeBlock(
-                num_experts=config.num_experts,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                num_experts_per_tok=config.num_experts_per_tok,
-                norm_topk_prob=config.norm_topk_prob,
-                hidden_act=config.hidden_act,
-            )
+            if getattr(config, "enable_heterogeneous", False):
+                self.mlp = Qwen3MoeHeterogeneousSparseMoeBlock(
+                    num_experts=config.num_experts,
+                    hidden_size=config.hidden_size,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    norm_topk_prob=config.norm_topk_prob,
+                )
+            else:
+                self.mlp = Qwen3MoeBlock(
+                    num_experts=config.num_experts,
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    norm_topk_prob=config.norm_topk_prob,
+                    hidden_act=config.hidden_act,
+                )
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
@@ -362,6 +447,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def enable_heterogeneous_mode(
+        self,
+        layer_caches: dict[int, LayerExpertCache],
+        cpu_expert_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
+    ):
+        for layer_idx, layer in enumerate(self.model.layers):
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                assert layer_idx in layer_caches, f"No cache for layer {layer_idx}"
+                assert layer_idx in cpu_expert_pool, f"No cpu expert pool for layer {layer_idx}"
+                layer.mlp.enable_heterogeneous(layer_caches[layer_idx], cpu_expert_pool[layer_idx])
 
     def load_model(
         self,

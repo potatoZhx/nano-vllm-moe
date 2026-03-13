@@ -86,10 +86,9 @@ nanovllm/
 │       ├── spec_scheduler.py  # 投机解码 Sequence 调度
 │       └── acceptance.py      # 接受策略接口 + 实现
 │
-├── expert/                    # **新增**
+├── expert/                    # **新增**（运行时 Expert 管理）
 │   ├── __init__.py
 │   ├── cache.py               # ExpertCacheManager（GPU Expert 缓存）
-│   ├── loader.py              # 异构参数加载器
 │   ├── placement.py           # ExpertPlacement 构建（draft/prefill）
 │   └── prefetcher.py          # Expert 预取调度
 │
@@ -98,6 +97,10 @@ nanovllm/
 │   │   ├── heterogeneous.py   # **新增**：异构 MoE forward（CPU+GPU 混合执行）
 │   │   └── ...                # 现有 Triton kernel 不修改
 │   └── ...
+│
+├── utils/
+│   ├── loader.py              # 现有：通用模型加载
+│   └── heterogeneous_loader.py # **新增**：异构参数加载器
 │
 ├── models/
 │   ├── qwen3_moe.py           # 修改：MoE block 支持异构模式
@@ -204,68 +207,343 @@ class Config:
     draft_scheduler: str = "simple"       # "simple" | "adaptive"
 ```
 
-### 4.2 异构参数加载器 (`expert/loader.py`)
+### 4.2 异构参数加载器 (`utils/heterogeneous_loader.py`)
+
+#### 为什么不放在 `expert/` 下
+
+`expert/` 包聚焦**运行时** Expert 管理（cache、placement、prefetch），而参数加载是**初始化阶段**的一次性操作，与 `ModelRunner.__init__()` 的流程紧密耦合。nano-vllm-moe 现有的加载入口在 `utils/loader.py`，异构加载器作为其扩展放在 `utils/heterogeneous_loader.py` 更自然。
 
 #### 职责
 
 在原有 `load_model()` 基础上，实现分层加载：
-1. 静态参数（attention, embedding, layernorm, router, lm_head, shared expert 若有）→ GPU（复用现有 `load_model`）
-2. 所有 routed Expert 权重 → CPU pinned memory
-3. 初始化 ExpertCacheManager（分层 slot buffer），根据配置将部分 Expert 加载到对应层的 slot 中
+1. 静态参数（attention, embedding, layernorm, router, lm_head, shared expert 若有）→ GPU（复用现有 `load_model` 逻辑）
+2. 所有 routed Expert 权重 → CPU pinned memory（`cpu_expert_pool`）
+3. 初始化 ExpertCacheManager（分层 slot buffer），根据配置将部分 Expert 从 CPU 加载到 GPU slot 中
 
-#### Expert 初始放置策略
+#### 与现有代码的关系
 
-```python
-def load_initial_placement(config, expert_cache, cpu_expert_pool):
-    """
-    确定哪些 Expert 初始加载到 GPU cache slot 中。
+现有加载链路：
 
-    1. 如果 config.expert_placement_config 指定了配置文件路径，
-       从文件读取 {layer_idx: [expert_indices]} 形式的映射
-    2. 如果未传入配置文件，则每层固定 S 个 slot，
-       随机选取 S 个 expert 加载到 slot 中
-    """
+```
+ModelRunner.__init__()
+  → load_model(self.model, config.model)              # utils/loader.py
+    → Qwen3MoeForCausalLM.load_model(path)            # models/qwen3_moe.py
+      → 遍历 safetensors，全部权重 → GPU
 ```
 
-配置文件格式示例（YAML）：
-```yaml
-# expert_placement.yaml
-placement:
-  0: [0, 3, 7, 12, 50, 100, 115, 127]   # 第 0 层：加载这些 expert
-  1: [1, 5, 9, 20, 60, 88, 110, 125]     # 第 1 层
-  # 未指定的层使用随机选取
+异构模式下的加载链路：
+
+```
+ModelRunner.__init__()
+  → heterogeneous_load_model(self.model, config)       # utils/heterogeneous_loader.py
+    → Step 1: _load_non_expert_weights(model, path)    # 非 Expert 权重 → GPU
+    → Step 2: _load_expert_weights_to_cpu(path)        # Expert 权重 → CPU pinned
+    → Step 3: _init_expert_cache(model, config, cpu_pool)  # 创建分层 slot buffer
+    → Step 4: _load_initial_placement(config, cache, cpu_pool)  # 初始 Expert → slot
+    → 返回 (cpu_expert_pool, expert_cache)
 ```
 
 #### 关键接口
 
 ```python
 class HeterogeneousModelLoader:
-    def load(self, model: Qwen3MoeForCausalLM, path: str, config: Config) -> ExpertCacheManager:
-        """
-        1. 使用原有 load_model 加载非 Expert 权重到 GPU
-        2. 将 Expert 权重保存到 CPU (pinned)
-        3. 初始化 ExpertCacheManager 并根据 placement 配置加载初始 Expert 到 slot
-        """
+    """
+    异构参数加载器。
+    替代标准 load_model，将 Expert 权重分流到 CPU 和 GPU slot buffer。
+    """
 
-    def _load_non_expert_weights(self, model, path):
-        """加载 attention, embed, norm, router, lm_head（及 shared expert 若有）权重"""
+    def __init__(self, config: Config):
+        self.config = config
+        self.hf_config = config.hf_config
+        self.packed_modules_mapping = Qwen3MoeForCausalLM.packed_modules_mapping
 
-    def _load_expert_weights_to_cpu(self, path) -> Dict[Tuple[int,int], Dict[str, Tensor]]:
-        """加载所有 routed Expert 权重到 CPU pinned memory"""
+    def load(
+        self,
+        model: Qwen3MoeForCausalLM,
+        path: str,
+    ) -> Tuple[Dict[Tuple[int,int], Dict[str, Tensor]], ExpertCacheManager]:
+        """
+        完整的异构加载流程。
+
+        Returns:
+            cpu_expert_pool: {(layer_idx, expert_idx): {"gate_up": Tensor, "down": Tensor}}
+            expert_cache: ExpertCacheManager（已完成初始 Expert 加载）
+        """
+        # Step 1: 非 Expert 权重 → GPU
+        self._load_non_expert_weights(model, path)
+
+        # Step 2: Expert 权重 → CPU pinned memory
+        cpu_expert_pool = self._load_expert_weights_to_cpu(path)
+
+        # Step 3: 创建 ExpertCacheManager（分配分层 slot buffer）
+        expert_cache = self._init_expert_cache(model, cpu_expert_pool)
+
+        # Step 4: 将初始 Expert 从 CPU 加载到 GPU slot
+        self._load_initial_placement(expert_cache, cpu_expert_pool)
+
+        return cpu_expert_pool, expert_cache
 ```
 
-#### 与现有代码的关系
+#### Step 1: 非 Expert 权重加载
 
-原有 `Qwen3MoeForCausalLM.load_model()` 将所有权重加载到 GPU。在异构模式下：
-- 非 Expert 权重：照常加载（复用 packed_modules_mapping 等逻辑）
-- Expert 权重（`mlp.experts.*` 和 `mlp.gate_up_proj` / `mlp.down_proj`）：加载到 CPU，然后根据 placement 配置选择性地加载到 GPU cache slot
+复用 `Qwen3MoeForCausalLM.load_model()` 的解析逻辑，但跳过 `mlp.experts.*` 权重。
+
+```python
+    def _load_non_expert_weights(self, model: Qwen3MoeForCausalLM, path: str):
+        """
+        加载非 Expert 权重到 GPU：
+        - attention (qkv_proj, o_proj)
+        - embed_tokens, lm_head
+        - layernorm (input_layernorm, post_attention_layernorm, norm)
+        - router gate (mlp.gate)
+        - shared expert（若存在：mlp.shared_expert.* / mlp.shared_experts.*）
+
+        实现方式：遍历 safetensors 文件，对于每个权重：
+        - 如果是 "mlp.experts." 开头的 → 跳过（由 Step 2 处理）
+        - 否则 → 使用现有 packed_modules_mapping 和 weight_loader 加载到 GPU
+        """
+        for file in glob(os.path.join(path, "*.safetensors")):
+            with safe_open(file, "pt", "cpu") as f:
+                for weight_name in f.keys():
+                    if "mlp.experts" in weight_name:
+                        continue  # Expert 权重由 Step 2 处理
+
+                    weight_tensor = f.get_tensor(weight_name)
+
+                    # 复用现有 packed_modules + weight_loader 逻辑
+                    is_loaded = False
+                    for k, (v, shard_id) in self.packed_modules_mapping.items():
+                        if k in weight_name:
+                            param_name = weight_name.replace(k, v)
+                            param = model.get_parameter(param_name)
+                            param.weight_loader(param, weight_tensor, shard_id)
+                            is_loaded = True
+                            break
+                    if not is_loaded:
+                        param = model.get_parameter(weight_name)
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, weight_tensor)
+```
+
+#### Step 2: Expert 权重加载到 CPU
+
+```python
+    def _load_expert_weights_to_cpu(
+        self, path: str
+    ) -> Dict[Tuple[int, int], Dict[str, Tensor]]:
+        """
+        加载所有 routed Expert 权重到 CPU pinned memory。
+
+        解析 safetensors 中 "mlp.experts.{expert_idx}.{gate/up/down}_proj.weight"，
+        需要处理 gate_proj + up_proj 的合并（与 MergedColumnParallelFusedMoeLinear 一致）。
+
+        Returns:
+            cpu_expert_pool: {
+                (layer_idx, expert_idx): {
+                    "gate_up": Tensor [2*intermediate, hidden],  # gate+up 合并
+                    "down":    Tensor [hidden, intermediate],
+                }
+            }
+        """
+        cpu_pool: Dict[Tuple[int,int], Dict[str, Tensor]] = {}
+        # 临时存储未合并的 gate/up
+        pending_gate: Dict[Tuple[int,int], Tensor] = {}
+        pending_up: Dict[Tuple[int,int], Tensor] = {}
+
+        for file in glob(os.path.join(path, "*.safetensors")):
+            with safe_open(file, "pt", "cpu") as f:
+                for weight_name in f.keys():
+                    if "mlp.experts" not in weight_name:
+                        continue
+
+                    weight_tensor = f.get_tensor(weight_name)
+                    layer_idx = self._parse_layer_idx(weight_name)
+                    expert_idx = self._parse_expert_idx(weight_name)
+                    key = (layer_idx, expert_idx)
+
+                    if key not in cpu_pool:
+                        cpu_pool[key] = {}
+
+                    if "down_proj" in weight_name:
+                        cpu_pool[key]["down"] = weight_tensor.pin_memory()
+                    elif "gate_proj" in weight_name:
+                        pending_gate[key] = weight_tensor
+                    elif "up_proj" in weight_name:
+                        pending_up[key] = weight_tensor
+
+        # 合并 gate + up → gate_up（与 MergedColumnParallelFusedMoeLinear 一致）
+        for key in pending_gate:
+            gate = pending_gate[key]
+            up = pending_up[key]
+            gate_up = torch.cat([gate, up], dim=0)  # [2*intermediate, hidden]
+            cpu_pool[key]["gate_up"] = gate_up.pin_memory()
+
+        return cpu_pool
+
+    @staticmethod
+    def _parse_layer_idx(weight_name: str) -> int:
+        """从 'model.layers.{idx}.mlp.experts...' 中提取 layer_idx"""
+        parts = weight_name.split(".")
+        return int(parts[parts.index("layers") + 1])
+
+    @staticmethod
+    def _parse_expert_idx(weight_name: str) -> int:
+        """从 '...mlp.experts.{idx}...' 中提取 expert_idx"""
+        parts = weight_name.split(".")
+        return int(parts[parts.index("experts") + 1])
+```
+
+#### Step 3: 创建 ExpertCacheManager
+
+```python
+    def _init_expert_cache(
+        self,
+        model: Qwen3MoeForCausalLM,
+        cpu_expert_pool: Dict,
+    ) -> ExpertCacheManager:
+        """
+        根据可用 GPU 显存创建分层 slot buffer。
+
+        1. 计算 slots_per_layer（见 §5.3）
+        2. 为每层分配 gate_up buffer [S, 2*inter, hidden] + down buffer [S, hidden, inter]
+        3. 创建空的 slot_to_expert / expert_to_slot 映射
+        """
+        model_config = self.hf_config
+        slots_per_layer = compute_slots_per_layer(self.config, model_config)
+
+        expert_cache = ExpertCacheManager(
+            model_config=model_config,
+            config=self.config,
+            cpu_expert_pool=cpu_expert_pool,
+            slots_per_layer=slots_per_layer,
+        )
+        return expert_cache
+```
+
+#### Step 4: 初始 Expert 加载到 GPU Slot
+
+```python
+    def _load_initial_placement(
+        self,
+        expert_cache: ExpertCacheManager,
+        cpu_expert_pool: Dict,
+    ):
+        """
+        将初始 Expert 从 CPU 加载到 GPU slot buffer。
+
+        读取策略：
+        1. config.expert_placement_config 存在 → 从 YAML 文件读取
+        2. 否则 → 每层随机选取 S 个 expert
+
+        对于每个 (layer_idx, expert_idx)：
+          expert_cache.cache_expert(layer_idx, expert_idx)
+            → cpu_pool 中取出权重
+            → copy_ 到 slot buffer 对应位置
+            → 更新映射表
+        """
+        placement = self._resolve_placement(expert_cache.slots_per_layer)
+
+        for layer_idx in range(self.hf_config.num_hidden_layers):
+            expert_indices = placement.get(layer_idx, [])
+            for expert_idx in expert_indices:
+                expert_cache.cache_expert(layer_idx, expert_idx)
+
+        torch.cuda.synchronize()
+
+    def _resolve_placement(self, slots_per_layer: int) -> Dict[int, List[int]]:
+        """
+        解析 Expert 初始放置配置。
+
+        Returns:
+            {layer_idx: [expert_indices]}  每层需要初始加载的 expert 列表
+        """
+        if self.config.expert_placement_config:
+            import yaml
+            with open(self.config.expert_placement_config) as f:
+                raw = yaml.safe_load(f)
+            placement = {}
+            for layer_idx in range(self.hf_config.num_hidden_layers):
+                if layer_idx in raw.get("placement", {}):
+                    indices = raw["placement"][layer_idx][:slots_per_layer]
+                else:
+                    indices = random.sample(
+                        range(self.hf_config.num_experts), slots_per_layer
+                    )
+                placement[layer_idx] = indices
+            return placement
+        else:
+            return {
+                layer_idx: random.sample(
+                    range(self.hf_config.num_experts), slots_per_layer
+                )
+                for layer_idx in range(self.hf_config.num_hidden_layers)
+            }
+```
+
+配置文件格式示例（YAML）：
+```yaml
+# expert_placement.yaml
+placement:
+  0: [0, 3, 7, 12, 50, 100, 115, 127]
+  1: [1, 5, 9, 20, 60, 88, 110, 125]
+  # 未指定的层使用随机选取
+```
+
+#### ModelRunner 集成
+
+```python
+# engine/model_runner.py 中 __init__ 的修改
+class ModelRunner:
+    def __init__(self, config, rank, event):
+        ...
+        self.model = self.MODEL_TYPE_DICT[hf_config.model_type](hf_config)
+
+        if config.enable_heterogeneous:
+            from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
+            loader = HeterogeneousModelLoader(config)
+            self.cpu_expert_pool, self.expert_cache = loader.load(self.model, config.model)
+        else:
+            load_model(self.model, config.model)
+            self.cpu_expert_pool = None
+            self.expert_cache = None
+
+        self.sampler = Sampler()
+        self.warmup_model()
+        self.allocate_kv_cache()
+        ...
+```
+
+#### Expert 权重格式说明
+
+nano-vllm-moe 中 Expert 权重的组织方式（与 `cpu_expert_pool` 的对应关系）：
+
+```
+safetensors 文件中:
+  model.layers.{L}.mlp.experts.{E}.gate_proj.weight  → [intermediate, hidden]
+  model.layers.{L}.mlp.experts.{E}.up_proj.weight    → [intermediate, hidden]
+  model.layers.{L}.mlp.experts.{E}.down_proj.weight  → [hidden, intermediate]
+
+cpu_expert_pool[(L, E)]:
+  "gate_up" → cat(gate_proj, up_proj, dim=0) → [2*intermediate, hidden]
+  "down"    → down_proj                      → [hidden, intermediate]
+
+ExpertCacheManager slot buffer:
+  gate_up_buffers[L]: [S, 2*intermediate, hidden]   # slot buffer
+  down_buffers[L]:    [S, hidden, intermediate]      # slot buffer
+
+加载到 slot:
+  gate_up_buffers[L][slot_idx].copy_(cpu_pool[(L, E)]["gate_up"])
+  down_buffers[L][slot_idx].copy_(cpu_pool[(L, E)]["down"])
+```
+
+> **注意**：nano-vllm-moe 原始代码中 `MergedColumnParallelFusedMoeLinear` 的 `weight` 形状为 `[E, 2*intermediate/tp_size, hidden]`，`RowParallelFusedMoeLinear` 的 `weight` 形状为 `[E, hidden, intermediate/tp_size]`。当前单卡场景 `tp_size=1`，因此 `cpu_expert_pool` 中存储的维度与 slot buffer 完全一致。
 
 #### Routed Expert 的 GPU 存储方式
 
-初始加载到 GPU 的 routed expert 不作为独立的静态参数存在，而是**直接写入 ExpertCacheManager 的分层 slot buffer** 中，并标记为 pinned（不可驱逐）或普通 cached 状态。这样做的好处是：
+初始加载到 GPU 的 routed expert **直接写入 ExpertCacheManager 的分层 slot buffer** 中，作为普通 cached 状态（可被后续驱逐替换）。这样做的好处是：
 - Expert 权重始终在分层连续 buffer `[S, N, K]` 中，可直接被 fused MoE kernel 使用
 - 避免了静态参数与 cache buffer 之间的数据不一致问题
-- 统一了 expert 的管理路径
+- 统一了 expert 的管理路径（加载、驱逐、替换均通过 ExpertCacheManager）
 
 ### 4.3 Expert Cache Manager (`expert/cache.py`)
 
@@ -1240,7 +1518,7 @@ def step(self):
 | 步骤 | 内容 | 涉及文件 |
 |------|------|---------|
 | 1.1 | Config 扩展 | `config.py` |
-| 1.2 | 异构参数加载器 | `expert/loader.py` |
+| 1.2 | 异构参数加载器 | `utils/heterogeneous_loader.py` |
 | 1.3 | Expert Cache Manager | `expert/cache.py` |
 | 1.4 | MoEExecutionPlan + placement 构建 | `expert/placement.py` |
 | 1.5 | 异构 MoE forward (heterogeneous.py) | `layers/fuse_moe/heterogeneous.py` |
@@ -1320,7 +1598,7 @@ else:
 
 | demo 功能 | nano-vllm-moe 改造方案 | 状态 |
 |-----------|----------------------|------|
-| ParameterLoader | `expert/loader.py` - HeterogeneousModelLoader | 新增 |
+| ParameterLoader | `utils/heterogeneous_loader.py` - HeterogeneousModelLoader | 新增 |
 | ExpertCache | `expert/cache.py` - ExpertCacheManager | 新增 |
 | ModelRunner 抽象 | 直接修改 `engine/model_runner.py` | 修改 |
 | build_prefill_placement | `expert/placement.py` - build_prefill_plan | 新增 |

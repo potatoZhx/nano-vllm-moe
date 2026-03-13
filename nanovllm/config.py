@@ -16,6 +16,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    enable_heterogeneous: bool = False
+    heterogeneous_slots_per_layer: int = 0
+    cpu_expert_pin_memory: bool = True
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
