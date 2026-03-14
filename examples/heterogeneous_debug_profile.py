@@ -75,7 +75,7 @@ def patch_heterogeneous(stats: dict):
         return out
 
     def hetero_wrapped(hidden_states, selected_experts, routing_weights, expert_cache, cpu_expert_pool, act_fn):
-        _, _ = hidden_states.shape
+        M, _ = hidden_states.shape
         top_k = routing_weights.size(1)
 
         flat_selected = selected_experts.reshape(-1)
@@ -89,10 +89,9 @@ def patch_heterogeneous(stats: dict):
             lambda: hetero.build_moe_execution_plan(flat_selected, expert_cache),
         )
 
-        if plan.gpu_slots.numel() > 0:
-            gpu_route_indices = plan.gpu_indices[plan.sort_idx]
-            gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
-            gpu_weights = flat_weights[gpu_route_indices]
+        if plan.gpu_route_indices.numel() > 0:
+            gpu_token_indices = torch.div(plan.gpu_route_indices, top_k, rounding_mode="floor")
+            gpu_weights = flat_weights.index_select(0, plan.gpu_route_indices)
             gpu_hidden = _record_cuda_time(
                 "hetero_gpu_gather_ms",
                 lambda: hidden_states[gpu_token_indices],
@@ -107,15 +106,13 @@ def patch_heterogeneous(stats: dict):
                 "hetero_fused_down_ms",
                 lambda: hetero.fused_moe_linear(act_fn(gate_up), down_buffer, plan.m_sizes),
             )
+            gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
             _record_cuda_time(
                 "hetero_scatter_ms",
-                lambda: output.index_add_(0, gpu_token_indices, gpu_expert_out * gpu_weights.unsqueeze(-1)),
+                lambda: output.index_add_(0, gpu_token_indices, gpu_expert_out),
             )
 
-        if plan.gpu_slots.numel() < flat_selected.numel():
-            cpu_indices = torch.nonzero(~plan.gpu_mask, as_tuple=False).flatten()
-        else:
-            cpu_indices = None
+        cpu_indices = plan.cpu_route_indices
 
         if cpu_indices is not None and cpu_indices.numel() > 0:
             stats["hetero_cpu_fallback_calls"] += 1
@@ -125,8 +122,8 @@ def patch_heterogeneous(stats: dict):
                 raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
             cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
             cpu_hidden = hidden_states[cpu_token_indices]
-            cpu_experts = flat_selected[cpu_indices]
-            cpu_weights = flat_weights[cpu_indices]
+            cpu_experts = flat_selected.index_select(0, cpu_indices)
+            cpu_weights = flat_weights.index_select(0, cpu_indices)
             for expert_idx in cpu_experts.unique().tolist():
                 expert_mask = cpu_experts == expert_idx
                 h = cpu_hidden[expert_mask]

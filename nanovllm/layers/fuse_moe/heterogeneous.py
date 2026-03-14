@@ -23,36 +23,31 @@ def heterogeneous_moe_forward(
     flat_selected = selected_experts.reshape(-1)
     flat_weights = routing_weights.reshape(-1)
 
-    token_indices = torch.arange(M, device=hidden_states.device, dtype=torch.int64).repeat_interleave(top_k)
-
     output = torch.zeros_like(hidden_states)
     plan = build_moe_execution_plan(flat_selected, expert_cache)
 
     # GPU path: cached experts are remapped to contiguous slot buffers.
-    if plan.gpu_slots.numel() > 0:
-        gpu_route_indices = plan.gpu_indices[plan.sort_idx]
-        gpu_token_indices = token_indices[gpu_route_indices]
+    if plan.gpu_route_indices.numel() > 0:
+        gpu_token_indices = torch.div(plan.gpu_route_indices, top_k, rounding_mode="floor")
         gpu_hidden = hidden_states[gpu_token_indices]
-        gpu_weights = flat_weights[gpu_route_indices]
+        gpu_weights = flat_weights.index_select(0, plan.gpu_route_indices)
         gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
 
         gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.m_sizes)
         gpu_expert_out = fused_moe_linear(act_fn(gate_up), down_buffer, plan.m_sizes)
-        output.index_add_(0, gpu_token_indices, gpu_expert_out * gpu_weights.unsqueeze(-1))
+        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+        output.index_add_(0, gpu_token_indices, gpu_expert_out)
 
     # Fallback path for uncached experts (kept for correctness in early integration).
-    if plan.gpu_slots.numel() < flat_selected.numel():
-        cpu_indices = torch.nonzero(~gpu_mask, as_tuple=False).flatten()
-    else:
-        cpu_indices = None
+    cpu_indices = plan.cpu_route_indices
 
     if cpu_indices is not None and cpu_indices.numel() > 0:
         if cpu_expert_pool is None:
             raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
-        cpu_token_indices = token_indices[cpu_indices]
+        cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
         cpu_hidden = hidden_states[cpu_token_indices]
-        cpu_experts = flat_selected[cpu_indices]
-        cpu_weights = flat_weights[cpu_indices]
+        cpu_experts = flat_selected.index_select(0, cpu_indices)
+        cpu_weights = flat_weights.index_select(0, cpu_indices)
 
         for expert_idx in cpu_experts.unique().tolist():
             expert_mask = cpu_experts == expert_idx
