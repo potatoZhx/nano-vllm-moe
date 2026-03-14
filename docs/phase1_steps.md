@@ -1655,6 +1655,177 @@ standard: <|endoftext|>Human: The task is to propose a practical strategy to bal
 heterogeneous: <|endoftext|>Human: The task is to propose a practical strategy to balance latency and memory usage in a deployment with limited GPU memory. The context provided includes observ...
 Saved report to: benchmarks/results/hetero_compare.json
 
+## 5.7 
+[prompt]
+好的，请进一步优化
+[response]
+我会再做一轮轻量但高频路径优化：去掉每次 forward 构造 `token_indices = arange(...).repeat_interleave(top_k)`，改为用路由索引直接 `// top_k` 还原 token id，从而进一步减少重排和临时张量。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py) 中的修补程序(34 行)
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py) 中的修补程序(33 行)
+
+
+```
+
+```
+
+```
+
+```
+
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py)，未发现问题
+
+这轮改动已通过检查。我现在跑异构/标准 debug 和端到端对比，确认这次“去 token_indices 构造”是否带来可见增益。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+
+这次异构 debug 出现异常回退（plan 激增到 17s），和改动点不一致，我会立刻复跑同命令确认是否是环境抖动；若稳定复现再回滚这次变更。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+
+读取记忆 [](file:///root/.vscode-server/data/User/globalStorage/github.copilot-chat/memory-tool/memories/preferences.md)
+
+已插入到记忆文件 [](file:///root/.vscode-server/data/User/globalStorage/github.copilot-chat/memory-tool/memories/preferences.md)
+
+已继续优化，并完成复测验证。
+
+本轮优化内容
+1. 去掉每次 forward 构造大索引张量
+- 之前每层都会构造 arange(...).repeat_interleave(top_k) 作为 token 索引。
+- 现在直接用路由索引做整除还原 token id：route_idx // top_k。
+- 这样减少了高频临时张量分配和重排开销。
+- 代码位置：
+heterogeneous.py
+
+2. debug 脚本同步到新实现
+- profiling 也改成 route_idx // top_k，保证统计口径一致。
+- 代码位置：
+heterogeneous_debug_profile.py
+
+结果对比（moe_spec）
+1. 端到端对比
+- Standard: 362.39 output tok/s
+- Heterogeneous: 315.51 output tok/s
+- 比值: 0.8706，差距 -12.94%
+- 相比上一轮 -15.22%，进一步收敛。
+
+2. 异构 debug（稳定复跑后）
+- throughput: 264.32 tok/s
+- hetero_plan_ms: 2386.97
+- hetero_remap_ms: 478.45
+- hetero_gpu_gather_ms: 234.02
+- hetero_scatter_ms: 955.62
+- fused 计算仍是大头，但调度链路已继续压缩。
+
+说明
+- 我遇到过一次明显异常慢结果（单次抖动），已按同命令立即复跑确认，最终以上数字是复跑稳定结果。
+
+下一步可继续做
+1. 进一步压 plan：尝试替换全量 sort 为更接近 slot-counting 的分组构建路径（S 较小时更可能收益）。
+2. 进一步压 scatter：减少 index_add 前中间张量，尽量合并权重与索引准备步骤。
+
+如果你同意，我就按第 1 点直接开做下一轮。
+
+Made changes.
+
+## 5.6 fork
+[prompt]
+我发现每次运行的速度波动，standard和heterogeneous路径的速度差异波动很大(6%,10%,17%)，为什么明明输入输出长度相同却会出现这种情况
+[response]
+我先快速核对采样与执行路径是否存在“同长度但不同计算量”的来源，然后给你一套可复现的降波动方法和推荐基准流程。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/sampling_params.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py)
+
+你这个现象很正常，核心原因是“长度相同 ≠ 计算路径相同”，再叠加硬件与运行时抖动，最终会出现你看到的比值波动（你贴的结果从约 -6% 到 -17%）。
+
+主要原因
+1. 采样本身不是严格确定性的  
+在 sampling_params.py 里，温度被限制为必须大于 1e-10，所以当前不是纯贪心。即使温度很低，也会有分叉。你日志里 exact_match_rate 约 0.56 到 0.62，已经证明不同运行的 token 序列并不完全一样。
+
+2. 同样的总 input/output token，不代表每一步的 MoE 负载相同  
+即便总长度一样，token 内容不同会导致专家路由分布不同，进而影响每步的 m_sizes、分组 GEMM 利用率、scatter 开销。异构路径对这种分布变化更敏感，所以它的方差通常比标准路径大。
+
+3. 你的对比脚本固定是先跑 standard 再跑 heterogeneous  
+在 heterogeneous_speed_compare.py 附近可以看到顺序是固定的。第二个 case 可能受 GPU 温度、功耗墙、频率漂移影响，导致“谁后跑谁吃亏”。
+
+4. 运行时和系统层抖动  
+包括 GPU 动态频率、显存碎片状态、后台进程抢占、CPU 调度抖动、首次 kernel autotune/缓存状态差异。这些都会影响秒级测量结果。
+
+为什么你会感觉“明明长度一样还波动很大”
+- 你现在控制住的是长度统计。  
+- 但真正决定耗时的是每个 decode step 的张量形状与路由分布，以及当时硬件频率状态。  
+- 这两个维度目前都在波动。
+
+建议你这样做，波动会明显收敛
+1. 每种模式连续跑 5 到 10 次，取中位数，不看单次。  
+2. 改成交替顺序（ABBA 或 ABAB），消除先后顺序偏差。  
+3. 增加 warmup（至少 3 次）并丢弃首轮。  
+4. 跑 benchmark 时确保机器独占、无其他 GPU 任务。  
+5. 如果环境允许，锁定 GPU 时钟与开启 persistence mode。  
+6. 若你要“严格可重复正确性”，需要增加一个真正贪心模式（argmax），而不是仅靠低温度。
+
+如果你愿意，我可以直接把 heterogeneous_speed_compare.py 改成“自动多次重复 + 交替顺序 + 输出 median/p90/std”的稳定基准版本，这样你后面看优化收益会更可靠。
+
+[prompt]
+好的，请修改脚本;但是由于这样会增加测试时间，所以这个设置请使用一个开关控制
+[response]
+已压缩对话我会先检查当前对比脚本的参数和执行流程，然后加一个“稳健评测开关”：默认保持现在的快速模式，打开开关后才启用多次重复和统计聚合，避免默认测试时间变长。正在优化工具选择...
+
+读取 [](file:///memories/)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py)
+
+读取内存 nano-vllm-moe-facts.md
+
+我已经定位到脚本入口了，接下来会加一个默认关闭的“稳健评测”开关：不开时保持你现在的一次对比速度，打开后才做多轮+交替顺序+统计汇总。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py) 中的修补程序(165 行)
+
+
+```
+
+```
+开关已经加好了，我现在做一次静态检查确保脚本没有语法问题，并确认默认路径行为不变。
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py)，未发现问题
+
+已按你的要求改好：增加了“稳健评测开关”，默认关闭，不会增加现有测试时长。修改在 examples/heterogeneous_speed_compare.py。
+
+这次改动：
+1. 新增开关 `--enable-robust-benchmark`（默认 `false`）
+2. 新增参数 `--robust-repeat`（默认 `5`，仅在开关打开时生效）
+3. 开关关闭时：保持原来单次 Standard vs Heterogeneous 的快速流程
+4. 开关打开时：执行多轮对比，并采用交替顺序（ABAB/BABA）降低顺序偏置
+5. 输出稳健统计：`median/mean/std/p90/min/max/n`
+6. 结果 JSON 里新增 `robust_benchmark` 字段，包含 summary 和每轮 runs 详情
+
+用法示例：
+1. 快速模式（默认，不加开关）
+```bash
+python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0
+```
+
+2. 稳健模式（会更慢）
+```bash
+python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
+```
+
+我也做了文件级错误检查，当前无语法/诊断错误。
+
+Made changes.
+
+
+
 
 # skills
 - nano-vllm-moe环境为moe_spec（conda run -n moe_spec/conda activate moe_spec）

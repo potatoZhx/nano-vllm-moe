@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -15,6 +16,8 @@ python examples/heterogeneous_benchmark_case.py --model-path /zx_data1/models/Qw
 
 自动对比并输出统计
 python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+
+python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
 '''
 
 
@@ -73,6 +76,96 @@ def run_one_case(case_script: Path, args: argparse.Namespace, enable_heterogeneo
     if not lines:
         raise RuntimeError("No output from case script")
     return json.loads(lines[-1])
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    if len(values) == 1:
+        return values[0]
+    sorted_values = sorted(values)
+    pos = (len(sorted_values) - 1) * q
+    left = int(math.floor(pos))
+    right = int(math.ceil(pos))
+    if left == right:
+        return sorted_values[left]
+    weight = pos - left
+    return sorted_values[left] * (1.0 - weight) + sorted_values[right] * weight
+
+
+def _build_metrics(values: list[float]) -> dict:
+    if not values:
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "median": float("nan"),
+            "std": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "p90": float("nan"),
+        }
+    count = len(values)
+    mean = sum(values) / count
+    median = _percentile(values, 0.5)
+    variance = sum((x - mean) ** 2 for x in values) / count
+    std = variance ** 0.5
+    return {
+        "count": count,
+        "mean": mean,
+        "median": median,
+        "std": std,
+        "min": min(values),
+        "max": max(values),
+        "p90": _percentile(values, 0.9),
+    }
+
+
+def run_robust_compare(case_script: Path, args: argparse.Namespace) -> tuple[dict, dict, dict]:
+    pairs = []
+    for i in range(args.robust_repeat):
+        # Alternate execution order (ABAB/BABA) to reduce warm-up and order bias.
+        run_standard_first = (i % 2 == 0)
+        if run_standard_first:
+            standard = run_one_case(case_script, args, enable_heterogeneous=False)
+            heterogeneous = run_one_case(case_script, args, enable_heterogeneous=True)
+            order = "standard_then_heterogeneous"
+        else:
+            heterogeneous = run_one_case(case_script, args, enable_heterogeneous=True)
+            standard = run_one_case(case_script, args, enable_heterogeneous=False)
+            order = "heterogeneous_then_standard"
+
+        ratio_output = heterogeneous["throughput_output_tok_s"] / standard["throughput_output_tok_s"]
+        ratio_total = heterogeneous["throughput_total_tok_s"] / standard["throughput_total_tok_s"]
+        pairs.append(
+            {
+                "iter": i,
+                "order": order,
+                "standard": standard,
+                "heterogeneous": heterogeneous,
+                "ratio_output_tok_s_hetero_vs_standard": ratio_output,
+                "ratio_total_tok_s_hetero_vs_standard": ratio_total,
+                "delta_output_tok_s_percent": (ratio_output - 1.0) * 100.0,
+                "delta_total_tok_s_percent": (ratio_total - 1.0) * 100.0,
+            }
+        )
+
+    ratio_output_values = [pair["ratio_output_tok_s_hetero_vs_standard"] for pair in pairs]
+    ratio_total_values = [pair["ratio_total_tok_s_hetero_vs_standard"] for pair in pairs]
+    robust_summary = {
+        "enabled": True,
+        "repeat": args.robust_repeat,
+        "ratio_output_tok_s_hetero_vs_standard": _build_metrics(ratio_output_values),
+        "ratio_total_tok_s_hetero_vs_standard": _build_metrics(ratio_total_values),
+        "delta_output_tok_s_percent": _build_metrics([(x - 1.0) * 100.0 for x in ratio_output_values]),
+        "delta_total_tok_s_percent": _build_metrics([(x - 1.0) * 100.0 for x in ratio_total_values]),
+    }
+
+    # Keep one representative run for correctness/text outputs and top-level compatibility.
+    representative = pairs[0]
+    return representative["standard"], representative["heterogeneous"], {
+        "summary": robust_summary,
+        "runs": pairs,
+    }
 
 
 def summarize_correctness(standard: dict, heterogeneous: dict, max_mismatches: int) -> dict:
@@ -186,6 +279,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-mismatches", type=int, default=5)
     parser.add_argument("--show-text-outputs", type=str2bool, default=True)
     parser.add_argument("--max-text-examples", type=int, default=3)
+    parser.add_argument("--enable-robust-benchmark", type=str2bool, default=False)
+    parser.add_argument("--robust-repeat", type=int, default=5)
     parser.add_argument("--result-json", default="")
     return parser.parse_args()
 
@@ -194,8 +289,15 @@ def main() -> None:
     args = parse_args()
     case_script = Path(__file__).with_name("heterogeneous_benchmark_case.py")
 
-    standard = run_one_case(case_script, args, enable_heterogeneous=False)
-    heterogeneous = run_one_case(case_script, args, enable_heterogeneous=True)
+    if args.robust_repeat < 1:
+        raise ValueError("--robust-repeat must be >= 1")
+
+    robust_detail = {"summary": {"enabled": False}}
+    if args.enable_robust_benchmark:
+        standard, heterogeneous, robust_detail = run_robust_compare(case_script, args)
+    else:
+        standard = run_one_case(case_script, args, enable_heterogeneous=False)
+        heterogeneous = run_one_case(case_script, args, enable_heterogeneous=True)
 
     ratio_output = heterogeneous["throughput_output_tok_s"] / standard["throughput_output_tok_s"]
     ratio_total = heterogeneous["throughput_total_tok_s"] / standard["throughput_total_tok_s"]
@@ -213,6 +315,7 @@ def main() -> None:
         "delta_total_tok_s_percent": delta_total_percent,
         "correctness": correctness,
         "qualitative_samples": qualitative_samples,
+        "robust_benchmark": robust_detail,
     }
 
     print("=== Standard Path ===")
@@ -232,6 +335,23 @@ def main() -> None:
         f"output_tps_ratio={ratio_output:.4f} ({delta_output_percent:+.2f}%), "
         f"total_tps_ratio={ratio_total:.4f} ({delta_total_percent:+.2f}%)"
     )
+    if args.enable_robust_benchmark:
+        robust_summary = robust_detail["summary"]
+        out_stat = robust_summary["ratio_output_tok_s_hetero_vs_standard"]
+        tot_stat = robust_summary["ratio_total_tok_s_hetero_vs_standard"]
+        print("=== Robust Summary ===")
+        print(
+            "output_tps_ratio "
+            f"median={out_stat['median']:.4f}, mean={out_stat['mean']:.4f}, "
+            f"std={out_stat['std']:.4f}, p90={out_stat['p90']:.4f}, "
+            f"min={out_stat['min']:.4f}, max={out_stat['max']:.4f}, n={out_stat['count']}"
+        )
+        print(
+            "total_tps_ratio "
+            f"median={tot_stat['median']:.4f}, mean={tot_stat['mean']:.4f}, "
+            f"std={tot_stat['std']:.4f}, p90={tot_stat['p90']:.4f}, "
+            f"min={tot_stat['min']:.4f}, max={tot_stat['max']:.4f}, n={tot_stat['count']}"
+        )
     if args.check_correctness:
         print("=== Correctness ===")
         print(

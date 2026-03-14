@@ -75,14 +75,13 @@ def patch_heterogeneous(stats: dict):
         return out
 
     def hetero_wrapped(hidden_states, selected_experts, routing_weights, expert_cache, cpu_expert_pool, act_fn):
-        M, _ = hidden_states.shape
+        _, _ = hidden_states.shape
         top_k = routing_weights.size(1)
 
         flat_selected = selected_experts.reshape(-1)
         flat_weights = routing_weights.reshape(-1)
         stats["hetero_total_routed_tokens"] += int(flat_selected.numel())
 
-        token_indices = torch.arange(M, device=hidden_states.device, dtype=torch.int64).repeat_interleave(top_k)
         output = torch.zeros_like(hidden_states)
 
         plan = _record_cuda_time(
@@ -92,7 +91,7 @@ def patch_heterogeneous(stats: dict):
 
         if plan.gpu_slots.numel() > 0:
             gpu_route_indices = plan.gpu_indices[plan.sort_idx]
-            gpu_token_indices = token_indices[gpu_route_indices]
+            gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
             gpu_weights = flat_weights[gpu_route_indices]
             gpu_hidden = _record_cuda_time(
                 "hetero_gpu_gather_ms",
@@ -124,7 +123,7 @@ def patch_heterogeneous(stats: dict):
             # Keep fallback path behavior identical to implementation.
             if cpu_expert_pool is None:
                 raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
-            cpu_token_indices = token_indices[cpu_indices]
+            cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
             cpu_hidden = hidden_states[cpu_token_indices]
             cpu_experts = flat_selected[cpu_indices]
             cpu_weights = flat_weights[cpu_indices]
