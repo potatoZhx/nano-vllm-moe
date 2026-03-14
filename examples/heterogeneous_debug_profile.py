@@ -8,6 +8,8 @@ import torch
 
 from nanovllm import LLM, SamplingParams
 
+# cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+
 
 GREEDY_LIKE_TEMPERATURE = 1e-5
 
@@ -80,10 +82,6 @@ def patch_heterogeneous(stats: dict):
         flat_weights = routing_weights.reshape(-1)
         stats["hetero_total_routed_tokens"] += int(flat_selected.numel())
 
-        expanded_hidden = _record_cuda_time(
-            "hetero_expand_ms",
-            lambda: hidden_states.repeat_interleave(top_k, dim=0),
-        )
         token_indices = torch.arange(M, device=hidden_states.device, dtype=torch.int64).repeat_interleave(top_k)
         output = torch.zeros_like(hidden_states)
 
@@ -93,13 +91,13 @@ def patch_heterogeneous(stats: dict):
         )
 
         if plan.gpu_slots.numel() > 0:
-            gpu_mask = plan.gpu_mask
+            gpu_route_indices = plan.gpu_indices[plan.sort_idx]
+            gpu_token_indices = token_indices[gpu_route_indices]
+            gpu_weights = flat_weights[gpu_route_indices]
             gpu_hidden = _record_cuda_time(
                 "hetero_gpu_gather_ms",
-                lambda: expanded_hidden[gpu_mask][plan.sort_idx],
+                lambda: hidden_states[gpu_token_indices],
             )
-            gpu_token_indices = token_indices[gpu_mask][plan.sort_idx]
-            gpu_weights = flat_weights[gpu_mask][plan.sort_idx]
             gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
 
             gate_up = _record_cuda_time(
@@ -126,9 +124,9 @@ def patch_heterogeneous(stats: dict):
             # Keep fallback path behavior identical to implementation.
             if cpu_expert_pool is None:
                 raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
-            cpu_hidden = expanded_hidden[cpu_indices]
-            cpu_experts = flat_selected[cpu_indices]
             cpu_token_indices = token_indices[cpu_indices]
+            cpu_hidden = hidden_states[cpu_token_indices]
+            cpu_experts = flat_selected[cpu_indices]
             cpu_weights = flat_weights[cpu_indices]
             for expert_idx in cpu_experts.unique().tolist():
                 expert_mask = cpu_experts == expert_idx
