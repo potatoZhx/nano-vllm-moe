@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -50,8 +51,16 @@ def run_one_case(case_script: Path, args: argparse.Namespace, enable_heterogeneo
         str(args.max_model_len),
         "--seed",
         str(args.seed),
+        "--temperature",
+        str(args.temperature),
         "--enforce-eager",
         str(args.enforce_eager).lower(),
+        "--return-token-ids",
+        str(args.check_correctness).lower(),
+        "--return-text",
+        str(args.show_text_outputs).lower(),
+        "--return-prompts",
+        str(args.show_text_outputs).lower(),
     ]
 
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
@@ -66,6 +75,100 @@ def run_one_case(case_script: Path, args: argparse.Namespace, enable_heterogeneo
     return json.loads(lines[-1])
 
 
+def summarize_correctness(standard: dict, heterogeneous: dict, max_mismatches: int) -> dict:
+    std_ids = standard.get("generated_token_ids") or []
+    het_ids = heterogeneous.get("generated_token_ids") or []
+
+    if len(std_ids) != len(het_ids):
+        return {
+            "checked": True,
+            "num_sequences": len(std_ids),
+            "num_heterogeneous_sequences": len(het_ids),
+            "exact_match": False,
+            "exact_match_rate": 0.0,
+            "mismatches": [
+                {
+                    "seq_idx": -1,
+                    "reason": "sequence_count_mismatch",
+                }
+            ],
+        }
+
+    mismatches = []
+    matched = 0
+    for seq_idx, (std_seq, het_seq) in enumerate(zip(std_ids, het_ids)):
+        if std_seq == het_seq:
+            matched += 1
+            continue
+
+        first_diff = -1
+        std_tok_at_diff = None
+        het_tok_at_diff = None
+        for token_pos, (std_tok, het_tok) in enumerate(zip(std_seq, het_seq)):
+            if std_tok != het_tok:
+                first_diff = token_pos
+                std_tok_at_diff = std_tok
+                het_tok_at_diff = het_tok
+                break
+        if first_diff < 0 and len(std_seq) != len(het_seq):
+            first_diff = min(len(std_seq), len(het_seq))
+
+        std_seq_digest = hashlib.sha256(",".join(str(token) for token in std_seq).encode("utf-8")).hexdigest()
+        het_seq_digest = hashlib.sha256(",".join(str(token) for token in het_seq).encode("utf-8")).hexdigest()
+
+        if len(mismatches) < max_mismatches:
+            mismatches.append(
+                {
+                    "seq_idx": seq_idx,
+                    "std_len": len(std_seq),
+                    "het_len": len(het_seq),
+                    "first_diff_token_pos": first_diff,
+                    "std_token_at_diff": std_tok_at_diff,
+                    "het_token_at_diff": het_tok_at_diff,
+                    "std_seq_digest": std_seq_digest,
+                    "het_seq_digest": het_seq_digest,
+                }
+            )
+
+    total = len(std_ids)
+    exact_rate = (matched / total) if total > 0 else 1.0
+    return {
+        "checked": True,
+        "num_sequences": total,
+        "exact_match": matched == total,
+        "exact_match_rate": exact_rate,
+        "matched_sequences": matched,
+        "mismatched_sequences": total - matched,
+        "mismatches": mismatches,
+    }
+
+
+def _short_text(text: str, max_len: int = 180) -> str:
+    flat = " ".join(text.strip().split())
+    if len(flat) <= max_len:
+        return flat
+    return flat[: max_len - 3] + "..."
+
+
+def build_qualitative_samples(standard: dict, heterogeneous: dict, max_examples: int) -> list[dict]:
+    prompts = standard.get("prompts") or []
+    std_texts = standard.get("generated_texts") or []
+    het_texts = heterogeneous.get("generated_texts") or []
+    count = min(len(prompts), len(std_texts), len(het_texts), max_examples)
+    samples = []
+    for i in range(count):
+        samples.append(
+            {
+                "seq_idx": i,
+                "prompt": prompts[i],
+                "standard_text": std_texts[i],
+                "heterogeneous_text": het_texts[i],
+                "text_exact_match": std_texts[i] == het_texts[i],
+            }
+        )
+    return samples
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run standard vs heterogeneous benchmark in isolated processes.")
     parser.add_argument("--model-path", default=os.path.expanduser("/zx_data1/models/Qwen--Qwen3-30B-A3B-Base"))
@@ -77,7 +180,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-len", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=1e-5)
     parser.add_argument("--enforce-eager", type=str2bool, default=True)
+    parser.add_argument("--check-correctness", type=str2bool, default=True)
+    parser.add_argument("--max-mismatches", type=int, default=5)
+    parser.add_argument("--show-text-outputs", type=str2bool, default=True)
+    parser.add_argument("--max-text-examples", type=int, default=3)
     parser.add_argument("--result-json", default="")
     return parser.parse_args()
 
@@ -89,28 +197,56 @@ def main() -> None:
     standard = run_one_case(case_script, args, enable_heterogeneous=False)
     heterogeneous = run_one_case(case_script, args, enable_heterogeneous=True)
 
-    ratio = heterogeneous["throughput_tok_s"] / standard["throughput_tok_s"]
-    delta_percent = (ratio - 1.0) * 100.0
+    ratio_output = heterogeneous["throughput_output_tok_s"] / standard["throughput_output_tok_s"]
+    ratio_total = heterogeneous["throughput_total_tok_s"] / standard["throughput_total_tok_s"]
+    delta_output_percent = (ratio_output - 1.0) * 100.0
+    delta_total_percent = (ratio_total - 1.0) * 100.0
+    correctness = summarize_correctness(standard, heterogeneous, max_mismatches=args.max_mismatches) if args.check_correctness else {"checked": False}
+    qualitative_samples = build_qualitative_samples(standard, heterogeneous, max_examples=args.max_text_examples) if args.show_text_outputs else []
 
     report = {
         "standard": standard,
         "heterogeneous": heterogeneous,
-        "ratio_hetero_vs_standard": ratio,
-        "delta_percent": delta_percent,
+        "ratio_output_tok_s_hetero_vs_standard": ratio_output,
+        "delta_output_tok_s_percent": delta_output_percent,
+        "ratio_total_tok_s_hetero_vs_standard": ratio_total,
+        "delta_total_tok_s_percent": delta_total_percent,
+        "correctness": correctness,
+        "qualitative_samples": qualitative_samples,
     }
 
     print("=== Standard Path ===")
     print(
-        f"tokens={standard['total_tokens']}, time={standard['elapsed_sec']:.3f}s, "
-        f"throughput={standard['throughput_tok_s']:.2f} tok/s"
+        f"input={standard['input_tokens']}, output={standard['generated_output_tokens']}, "
+        f"processed={standard['processed_tokens']}, time={standard['elapsed_sec']:.3f}s, "
+        f"output_tps={standard['throughput_output_tok_s']:.2f}, total_tps={standard['throughput_total_tok_s']:.2f}"
     )
     print("=== Heterogeneous Path (S=N by default when slots=0) ===")
     print(
-        f"tokens={heterogeneous['total_tokens']}, time={heterogeneous['elapsed_sec']:.3f}s, "
-        f"throughput={heterogeneous['throughput_tok_s']:.2f} tok/s"
+        f"input={heterogeneous['input_tokens']}, output={heterogeneous['generated_output_tokens']}, "
+        f"processed={heterogeneous['processed_tokens']}, time={heterogeneous['elapsed_sec']:.3f}s, "
+        f"output_tps={heterogeneous['throughput_output_tok_s']:.2f}, total_tps={heterogeneous['throughput_total_tok_s']:.2f}"
     )
     print("=== Delta ===")
-    print(f"ratio(hetero/standard)={ratio:.4f}, delta={delta_percent:+.2f}%")
+    print(
+        f"output_tps_ratio={ratio_output:.4f} ({delta_output_percent:+.2f}%), "
+        f"total_tps_ratio={ratio_total:.4f} ({delta_total_percent:+.2f}%)"
+    )
+    if args.check_correctness:
+        print("=== Correctness ===")
+        print(
+            f"exact_match={correctness['exact_match']}, "
+            f"exact_match_rate={correctness['exact_match_rate']:.4f}, "
+            f"matched={correctness['matched_sequences']}/{correctness['num_sequences']}"
+        )
+
+    if args.show_text_outputs and qualitative_samples:
+        print("=== Text Samples ===")
+        for sample in qualitative_samples:
+            print(f"[seq {sample['seq_idx']}] match={sample['text_exact_match']}")
+            print(f"prompt: {_short_text(sample['prompt'])}")
+            print(f"standard: {_short_text(sample['standard_text'])}")
+            print(f"heterogeneous: {_short_text(sample['heterogeneous_text'])}")
 
     if args.result_json:
         with open(args.result_json, "w", encoding="utf-8") as f:
