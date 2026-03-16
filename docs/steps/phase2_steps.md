@@ -1,4 +1,5 @@
 # 0
+## 0.1 d
 [prompt]
 请仔细阅读demo_analysis.md和migration_design.md文档理解设计意图和实现的架构细节等；phase1_cpu_gpu_basic_heterogeneous_report.md中是Phase 1：基础异构推理的实现情况；现在请你思考Phase 2：投机解码的实现方案，包含实现目标、修改的具体内容、需要新增或修改的接口及其功能与设计、测试方案等，越详细越好；现在，如果有任何疑问，请先和我交流
 [response]
@@ -274,3 +275,173 @@
 
 ## 0.1
 [prompt]
+请先仔细阅读demo_analysis.md和migration_design.md文档理解设计意图和实现的架构细节等；phase1_cpu_gpu_basic_heterogeneous_report.md中是Phase 1：基础异构推理的实现情况；现在请你思考Phase 2：投机解码，再次仔细阅读migration_design文档相关章节（比如4.6，4.7，4.8，4.9，4.10等;ps,4.10仅需要实现最简单的方案即可，会在之后的phase重新优化），设计实现方案，包含实现目标、修改的具体内容、需要新增或修改的接口及其功能与设计（包含简洁的伪代码）、测试方案等，越详细越好；设计实现优先考虑正确性；设计文档写入nano-vllm-moe/docs/phase2_design.md；现在，如果有任何疑问，请先和我交流
+[response]
+我会先完整读取你提到的三份文档，重点核对 migration_design 中 4.6 到 4.10 的细节，然后基于现有 Phase 1 状态输出一份偏正确性优先、可直接落地的 Phase 2 设计文档到目标路径。接下来我先收集原文上下文并整理约束清单。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/demo_analysis.md#1-1)，行 1 到 260
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#1-1)，行 1 到 320
+
+读取内存 nano-vllm-moe-facts.md
+
+我已经拿到核心背景和仓库事实了，接下来会继续读取 migration_design 的后半部分（尤其 4.6~4.10 与测试章节）以及 Phase 1 报告原文，确保新文档和当前实现状态严格对齐。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#321-321)，行 321 到 760
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#761-761)，行 761 到 1260
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md#1-1)，行 1 到 260
+
+我已经拿到迁移文档的关键章节原文。下一步我会快速扫描 nano-vllm-moe 当前代码里是否已有 speculative 相关骨架，确保 Phase 2 设计里的接口名与实际代码结构一致、可直接对接。
+
+搜索与 `**/nano-vllm-moe/nanovllm/engine/**` 匹配的文件，5 匹配项
+
+搜索正则表达式 `speculative|draft|accept_draft|run_draft|run_verify|AcceptanceStrategy|start_draft|rollback_draft` (`**/nano-vllm-moe/nanovllm/**/*.py`)，无结果
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm)
+
+搜索正则表达式 `speculative|draft|accept_draft|run_draft|run_verify|AcceptanceStrategy|start_draft|rollback_draft` (`**/nanovllm/**/*.py`)，无结果
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/scheduling)
+
+我发现当前仓库里还没有明显的 speculative 代码命名痕迹，下一步会直接读现有核心实现文件（llm_engine、model_runner、sequence、block_manager、placement 等），用真实代码结构来约束 Phase 2 设计接口。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/sequence.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/block_manager.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/scheduler.py)
+
+我已经确认当前代码尚未接入 Phase 2 的 speculative 主链路。现在我会读取异构相关的现有实现（cache、placement、heterogeneous forward、qwen3_moe），让 Phase 2 文档中的接口定义完全贴合现状。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/cache.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py#1-1)，行 1 到 460
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py#461-461)，行 461 到 505
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md)
+
+我已经完成架构对齐，确认当前代码只有 Phase 1 异构执行能力，Phase 2 仍是空白状态。接下来我会直接写入一份可落地的 Phase 2 设计文档，按“正确性优先”给出分文件改动、接口定义、伪代码和测试矩阵。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md) 中的修补程序(576 行)
+
+
+```
+
+```
+
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#1-1)，行 1 到 260
+
+已完成阅读与设计，并将 Phase 2 方案写入：
+[ phase2_design.md ](nano-vllm-moe/docs/phase2_design.md)
+
+本次文档内容覆盖了你要求的重点，且按“正确性优先”展开，包含：
+
+1. 实现目标与非目标  
+2. 与当前 Phase 1 实现的差距分析  
+3. Phase 2 总体架构（Draft-Verify-Accept）  
+4. 分文件改造清单（新增与修改）  
+5. 配置项设计与约束  
+6. 关键接口与功能设计（Sequence、BlockManager、ModelRunner、SpeculativeEngine、DraftScheduler、AcceptanceStrategy、Placement），并附简洁伪代码  
+7. 与 LLMEngine/Scheduler 的集成方式  
+8. 正确性约束与状态一致性要求  
+9. 测试方案（单元、集成、回归、指标）  
+10. 分步落地计划、风险与规避  
+11. 与 migration_design 4.6-4.10 的逐点映射  
+12. Phase 2 完成判定标准
+
+当前没有阻塞性疑问；如果你愿意，我下一步可以直接按这份文档开始 Phase 2 代码实现，并先从最关键的状态机与 KV 回滚原语落地。
+
+Made changes.
+
+## 0.2
+#### [prompt]
+为了对比效果（推理速度以及内容正确性等），需要保留standard（原始nano-vllm实现），heter（异构推理基础推理路径），spec（异构路径基础上实现的speculative）三种mode；为了对比纯路径实现带来的差异，当前所有的对比实验都采用S=N的全量expert在GPU上的配置，但heter和spec不可以为S=N做任何特殊优化；heter和spec下，若没有激活的expert落在cpu，默认跳过相关操作；请先写好单元测试，在实现的过程中每一步都运行测试确保正确性；实现基本路径后先写好benchmark测试，对比三种模式的速度和输出正确性（对齐standard）；在文档中添加优化部分作为本阶段的最后实现步骤（比如kv cache管理引入“Ghost Block / 软释放” 机制。Draft 回滚时，不真正 free_block，而是将其标记为当前 Sequence 的复用池。Verify 阶段直接覆盖写入这些现成的 Block，省去分配开销。）；batch draft时，先实现所有序列相同draft长度，在优化章节补充批次内序列使用不同draft停止长度/策略的设计；请先根据以上建议修改phase2_design；如有任何问题或目前设计有不合理的地方，请先提出
+
+#### [response]
+我会先在设计文档中增补你提到的关键约束与流程顺序，重点覆盖三种模式并存、S=N 对比口径、先单测后实现再基准、以及优化章节中的 Ghost Block 与可变 draft 长度设计。接下来直接修改文档并回读确认。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md) 中的修补程序(321 行)
+
+
+```
+
+```
+
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#1-1)，行 1 到 340
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#341-341)，行 341 到 725
+
+我再做一次小修订，把文档里的编号重复和一处优先级冲突点写得更严谨，避免后续按文档执行时出现歧义。随后我会把需要你确认的两个设计问题列出来。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md) 中的修补程序(37 行)
+
+
+```
+
+```
+已按你的建议完成文档更新，主要新增了这些关键点：
+
+1. 明确三种模式并存与对比目标  
+   - standard / heter / spec 三模式统一纳入设计与评测。  
+2. 明确 S=N 对比口径与约束  
+   - 当前对比统一使用 S=N。  
+   - heter/spec 不允许为了 S=N 增加任何特判优化路径。  
+3. 明确 CPU 路径空任务处理  
+   - heter/spec 下若无 expert 落到 CPU，CPU 相关操作直接跳过。  
+4. 调整实施顺序为测试优先  
+   - 先写单元测试，再实现，每一步实现后立即跑测试。  
+5. 增加三模式 benchmark 章节  
+   - 明确速度对比与输出对齐 standard 的要求。  
+6. 增加优化章节并作为最后步骤  
+   - 补充 Ghost Block / 软释放方案。  
+   - 补充 batch 内不同 draft 停止长度策略设计（先设计后续实现，主路径先统一 draft 长度）。
+
+已更新文件：  
+[ phase2_design.md ](nano-vllm-moe/docs/phase2_design.md)
+
+需要你先确认的两点（避免后续实现歧义）：
+
+1. 模式配置优先级  
+   - 我在文档里定义为 inference_mode 优先，旧字段只做兼容校验与自动推导。  
+   - 你是否同意这个优先级策略？
+
+2. 输出对齐口径  
+   - 目前文档写的是 greedy 下 heter/spec 都要 token 级对齐 standard。  
+   - 你是否希望把 heter 在 greedy 下也要求严格逐 token 对齐（和 spec 同级），还是只要求 spec 对齐 standard、heter 只要求“无明显语义偏差”？
+
+你确认后，我就按这版文档进入“先写测试”的实现阶段。
+
+Made changes.
+
+## 1
+#### [prompt]
+确认：1.同意 2.目前的nano-vllm-moe中sampling_params似乎不支持确定性推理（temperature=0.0），如果能实现完全确定性推理的话就要求token级对齐，否则只要求无明显语义偏差即可
+另外，CPU 直接跳过暂不实现，推迟到优化的step中
+以上没有其他疑问的话，请开始实现，注意nano-vllm-moe环境为moe_spec（conda run -n moe_spec/conda activate moe_spec）
+
+#### [response]
+
+
+
+# skills
+- nano-vllm-moe环境为moe_spec（conda run -n moe_spec/conda activate moe_spec）
+- 实现时为了优化推理速度，尽量考虑不使用Python循环的实现

@@ -480,3 +480,136 @@ Phase 1 已完成“基础 CPU-GPU 异构推理”的核心闭环：
 4. 当前性能差距已可量化，下一阶段重点应转向融合内核与流水并行，以进一步逼近标准路径吞吐。
 
 该阶段为后续 speculative、预取与高级调度策略提供了稳定底座。
+
+---
+
+## 13. 与 migration_design 的对照实现状态（4.1 / 4.2 / 4.3 / 4.9）
+
+本章针对 `docs/migration_design.md` 中的关键设计段落，给出三类结论：
+
+1. 已实现的内容。
+2. 已实现且在 Phase 1 中重构优化后的内容（与原设计存在实现差异，但目标一致）。
+3. 未实现内容（保留到后续 Phase）。
+
+### 13.1 4.1 Config 扩展 对照
+
+已实现：
+
+1. `enable_heterogeneous`（已接入配置与运行入口）。
+2. `heterogeneous_slots_per_layer`（已用于层级 slot 数控制；`<=0` 走 S=N）。
+3. `cpu_expert_pin_memory`（已用于 CPU expert 权重 pin memory 开关）。
+
+重构优化实现：
+
+1. Phase 1 采用“最小配置闭包”，只保留异构基础运行所需字段，避免在未落地 speculative/策略模块时引入过多配置噪声。
+2. slot 计算不走 `gpu_memory_limit_gb` 自动估算，而是直接由 `heterogeneous_slots_per_layer` 驱动，便于 S=N 基线验证。
+
+未实现：
+
+1. `gpu_memory_limit_gb`、`expert_gpu_memory_gb`（自动显存预算与 slot 自动规划未落地）。
+2. `expert_placement_config`（YAML 初始放置策略未落地）。
+3. speculative 与策略相关配置：`enable_speculative`、`max_draft_tokens`、`draft_top_c`、`acceptance_threshold`、`acceptance_strategy`、`cache_strategy`、`prefetch_strategy`、`draft_scheduler`。
+
+### 13.2 4.2 异构参数加载器 对照
+
+已实现：
+
+1. 异构加载器 `HeterogeneousModelLoader` 已落地，并由 `ModelRunner` 调用。
+2. 非 expert 权重与 expert 权重分流加载：
+  - 非 expert 权重加载到模型参数（GPU）。
+  - expert 权重加载到 CPU pool（支持 pin memory）。
+3. 已实现 gate/up 合并为 `gate_up` 的存储形态，并为每层构建 cache。
+4. 已实现初始 slot 填充流程并在加载后同步。
+
+重构优化实现：
+
+1. 设计文档中的“全局 ExpertCacheManager”在 Phase 1 实现为“每层一个 `LayerExpertCache`”：
+  - 返回值为 `dict[layer_idx, LayerExpertCache] + nested cpu_pool`。
+  - 该结构更贴合当前模型层级注入方式，减少跨层调度复杂度。
+2. 初始放置策略采用“按 expert id 排序后顺序写 slot”，而不是 YAML/随机混合策略：
+  - 可重复性更好。
+  - 便于做 S=N 公平基线。
+3. `slots_per_layer <= 0` 直接映射为 S=N，优先保证“先跑通 + 先测准”。
+
+未实现：
+
+1. `compute_slots_per_layer` 的显存预算推导链路未落地。
+2. YAML placement 解析与按层随机补齐未落地。
+3. `cache_expert(layer_idx, expert_idx)` 这种“按需装载 + 替换策略驱动”的运行期加载在 Phase 1 基线中未启用（当前更偏静态 S=N 预装载）。
+
+### 13.3 4.3 Expert Cache Manager 对照
+
+已实现：
+
+1. 分层固定 slot buffer 的核心思想已实现。
+2. 每层维护 `slot_to_expert / expert_to_slot` 映射。
+3. 已实现 remap 功能，且采用 LUT 张量索引优化（`expert_to_slot_lut + index_select`）。
+4. 已实现 buffer 获取接口并与 fused MoE 执行路径打通。
+
+重构优化实现：
+
+1. 文档中的 `ExpertCacheManager`（含跨层策略、异步传输队列）在 Phase 1 落地为轻量 `LayerExpertCache`：
+  - 把关注点聚焦到“单层缓存 + remap + fused 执行必需接口”。
+  - 先消除路径复杂性，再迭代策略层。
+2. remap 从字典/循环思路演进为 LUT 张量化，复杂度保持 O(N) 但常数显著下降。
+3. 与 placement 联动时，plan 已简化为 `gpu_route_indices + cpu_route_indices + m_sizes`，避免冗余索引链。
+
+未实现：
+
+1. 缓存替换策略框架（LRU/LFU/Adaptive）未落地。
+2. 异步 `cache_expert_async`、`transfer_stream`、`complete_transfers` 未落地。
+3. `get_cached_experts`、`evict_from_slot`、`build_m_sizes(layer_idx, ...)` 等策略化接口未完整落地。
+4. S<E 运行期动态换入换出尚未进入 Phase 1 基线。
+
+### 13.4 4.9 ModelRunner 扩展 对照
+
+已实现：
+
+1. `ModelRunner` 已支持异构模式初始化：
+  - `enable_heterogeneous` 下走异构加载器。
+  - 将 layer cache 与 cpu pool 注入模型。
+2. 标准运行主循环 (`run`) 保持兼容，异构路径通过模型内部 MoE block forward 生效。
+
+重构优化实现：
+
+1. 文档中的 `run_draft / run_verify / run_standard` 三分路径，在 Phase 1 被有意延后。
+2. 当前采用“Runner 不扩散、MoE block 内聚”的改造策略：
+  - 优点：对原引擎侵入更小，回归风险更低。
+  - 代价：speculative 相关控制点尚未在 Runner 层展开。
+3. CUDA Graph 相关行为维持原逻辑，异构基线主要在 eager 配置下评估。
+
+未实现：
+
+1. `run_draft`、`run_verify`、`run_standard` 专用接口未落地。
+2. Runner 层逐层显式构建 draft/prefill placement 的流程未落地。
+3. 与 speculative engine 的完整集成（accept/verify 循环）未落地。
+
+### 13.5 补充：4.4/4.5（与本次对照主题强相关）
+
+虽然本节重点要求 4.1/4.2/4.3/4.9，但 Phase 1 的性能收敛主要发生在 4.4/4.5 对应实现，补充如下：
+
+已实现：
+
+1. `MoEExecutionPlan` 已落地（当前字段为 `gpu_route_indices`、`cpu_route_indices`、`m_sizes`）。
+2. 异构 forward 的 GPU 路径与 CPU fallback 路径均已落地并可跑通。
+
+重构优化实现：
+
+1. 相比设计中的 `gpu_sort_idx/gpu_inv_sort_idx/gpu_token_map` 全字段方案，Phase 1 改为更轻量 route-index 驱动方案。
+2. 去掉 inv-sort 回排与重复索引构造，减少 O(Ng) 额外内存重排。
+
+未实现：
+
+1. 设计中的 CPU ThreadPool 并行执行框架在 S=N 基线场景下未作为主要路径落地。
+2. plan/gather/scatter 融合内核与深度流水并行仍属于后续优化项。
+
+### 13.6 对照结论
+
+1. Phase 1 已完整实现“基础异构推理闭环”（配置开关、异构加载、层级 cache、placement、异构 forward、benchmark）。
+2. 与 migration_design 相比，当前实现是“收敛版最小可行子集”：
+  - 保留核心主干。
+  - 延后 speculative、策略框架、动态换入换出。
+3. 已完成的“重新修改优化”主要集中在两条主线：
+  - 数据结构轻量化（layer cache + route index plan）。
+  - 路径张量化（LUT remap、减少回排和重复索引）。
+4. 未实现内容与后续 Phase 目标一致，不属于偏离设计，而是分阶段落地取舍。

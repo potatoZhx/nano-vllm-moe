@@ -209,10 +209,6 @@ class Config:
 
 ### 4.2 异构参数加载器 (`utils/heterogeneous_loader.py`)
 
-#### 为什么不放在 `expert/` 下
-
-`expert/` 包聚焦**运行时** Expert 管理（cache、placement、prefetch），而参数加载是**初始化阶段**的一次性操作，与 `ModelRunner.__init__()` 的流程紧密耦合。nano-vllm-moe 现有的加载入口在 `utils/loader.py`，异构加载器作为其扩展放在 `utils/heterogeneous_loader.py` 更自然。
-
 #### 职责
 
 在原有 `load_model()` 基础上，实现分层加载：
@@ -1500,7 +1496,7 @@ def step(self):
     ...
 ```
 
-### 6.2 Verify 跳过优化
+### 6.2 Verify 跳过优化（暂不实现）
 
 当所有条件满足时可跳过 verify：
 1. 所有 routed expert 都在 GPU cache 中（无替换发生）
@@ -1531,11 +1527,11 @@ def step(self):
 | 步骤 | 内容 | 涉及文件 |
 |------|------|---------|
 | 2.1 | Sequence draft 状态扩展 | `engine/sequence.py` |
-| 2.2 | BlockManager draft/verify 支持 | `engine/block_manager.py` |
+| 2.2 | BlockManager draft/verify 支持（支持增量更新） | `engine/block_manager.py` |
 | 2.3 | AcceptanceStrategy 框架 | `engine/speculative/acceptance.py` |
 | 2.4 | SpeculativeEngine 核心循环 | `engine/speculative/spec_engine.py` |
 | 2.5 | LLMEngine 集成 | `engine/llm_engine.py` |
-| 2.6 | Verify 跳过优化 | `engine/speculative/spec_engine.py` |
+| 2.6 | Verify 跳过优化（暂不实现） | `engine/speculative/spec_engine.py` |
 | 2.7 | 端到端测试 | `examples/` |
 
 ### Phase 3：预取与高级策略
@@ -1553,7 +1549,9 @@ def step(self):
 | 步骤 | 内容 |
 |------|------|
 | 4.1 | CPU Expert 执行优化（torch.compile、NUMA affinity） |
-| 4.2 | Draft-Verify KV Cache 增量更新（避免全量回滚） |
+| 4.2 | 异构路径的 CUDA Graph（如果可行） |
+
+
 
 ---
 
@@ -1639,7 +1637,6 @@ else:
 ### 10.3 性能基准
 
 - vs nano-vllm-moe 原生全 GPU decode（tokens/s）
-- vs on_device_sd/demo 同配置（tokens/s）
 - Expert cache hit rate
 - CPU/GPU 执行时间占比
 - 投机解码接受率

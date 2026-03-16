@@ -2322,10 +2322,10 @@ Made changes.
 4. 最后做策略层实验和收益量化（M4）。
 
 # 8
-[prompt]
+#### [prompt]
 请重新回顾设计文档，在nano-vllm-moe/docs/summary添加phase1 cpu-gpu基础异构推理的实现报告，详细总结本阶段的设计、架构、流程、优化（解释每个优化点的功能、优化思路、优化实现的算法 和 复杂度分析）、具体实现等，越详细越好，最后需要分析cpu-gpu基础异构进一步可能的优化点（比如融合内核等），详细说明优化设计
 - patch: +修改内容（比如修改文件、实现的api的功能算法等）
-[response]
+#### [response]
 我先回顾现有设计文档和 docs/summary 的内容风格，然后直接新增一份 phase1 实现报告，覆盖你要求的设计、架构、流程、优化算法复杂度和后续优化设计。
 
 读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs)
@@ -2396,6 +2396,71 @@ Made changes.
 如果你愿意，我可以继续在同目录补一份 Phase 1.1 技术落地计划，把上述后续优化拆成可执行任务清单（按改动文件、预估收益、验证指标和回滚策略组织）。
 
 Made changes.
+
+
+
+
+
+## 8.1
+#### [prompt]
+请对比phase1的目前的实现和migration_design文档设计中的相关设计（比如4.1 4.2 4.3 4.9等），分别报告已实现的内容、重新修改优化的实现以及未实现的内容，并将报告写入phase1_cpu_gpu_basic_heterogeneous_report.md总结文档的一个新的章节
+
+#### [response]
+我会先精确抽取 migration_design 里 4.1/4.2/4.3/4.9 的设计点，再逐条对照当前代码实现状态，最后把“已实现 / 重构优化实现 / 未实现”新增成报告的新章节写入文档。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#160-160)，行 160 到 760
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#980-980)，行 980 到 1260
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md#220-220)，行 220 到 482
+
+搜索正则表达式 `def run_draft|def run_verify|def run_standard|enable_speculative|speculative` (`**/nanovllm/**/*.py`)，无结果
+
+搜索文本 `gpu_memory_limit_gb|expert_gpu_memory_gb|expert_placement_config|cache_strategy|prefetch_strategy|draft_scheduler` (`**/nanovllm/**/*.py`)，无结果
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/cache.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py)
+
+搜索正则表达式 `run_draft|run_verify|run_standard|enable_speculative|gpu_memory_limit_gb|expert_gpu_memory_gb|expert_placement_config|cache_strategy|prefetch_strategy|draft_scheduler` (`**/nanovllm/**`)，无结果
+
+我已拿到 `cache/placement` 实现细节。现在补用 `rg` 做一次全仓匹配，确认哪些设计字段和接口在当前代码中确实不存在，避免误判。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && rg -n "run_draft|run_verify|run_standard|enable_speculative|gpu_memory_limit_gb|expert_gpu_memory_gb|expert_placement_config|cache_strategy|prefetch_strategy|draft_scheduler" nanovllm || true
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -RIn "run_draft\|run_verify\|run_standard\|enable_speculative\|gpu_memory_limit_gb\|expert_gpu_memory_gb\|expert_placement_config\|cache_strategy\|prefetch_strategy\|draft_scheduler" nanovllm || true
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md#480-480)，行 480 到 482
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md) 中的修补程序(140 行)
+
+
+```
+
+```
+
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md#500-500)，行 500 到 615
+
+已完成对照并写入新章节，位置如下：
+
+- docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md
+
+本次新增章节为“13. 与 migration_design 的对照实现状态（4.1 / 4.2 / 4.3 / 4.9）”，按你的要求逐项给出了三类结论：
+
+1. 已实现内容  
+2. 重新修改优化后的实现（与原设计差异及原因）  
+3. 未实现内容（明确归入后续 Phase）
+
+章节中还补充了与性能收敛强相关的 4.4/4.5 对照，避免只做静态功能对齐而遗漏当前优化主线。
+
+如果你希望，我可以继续在同一文档追加“13.7 逐项任务化清单”，把未实现项拆成可执行计划（改动文件、依赖关系、验收指标、风险与回滚策略）。
+
+Made changes.
+
+## 8.2 todo
+[prompt]
+下一步需要优化cpu的expert推理，包括与gpu计算并行、如果可行且有优化效果的话采用expert并行推理等；然后需要写一个测试（单层推理即可）比较cpu上推理的expert数量为0/1/2/3/4时的耗时，观察cpu推理什么时候会成为瓶颈
 
 
 
