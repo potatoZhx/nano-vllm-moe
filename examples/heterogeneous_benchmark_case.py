@@ -77,11 +77,25 @@ def run_case(args: argparse.Namespace) -> dict:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    mode = args.mode.strip().lower()
+    if mode not in {"standard", "heter", "spec"}:
+        raise ValueError(f"Invalid mode: {args.mode}")
+
+    if args.enable_heterogeneous == "":
+        enable_heterogeneous = mode in {"heter", "spec"}
+    else:
+        enable_heterogeneous = str2bool(args.enable_heterogeneous)
+
     llm = LLM(
         args.model_path,
+        dist_port=args.dist_port,
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
-        enable_heterogeneous=args.enable_heterogeneous,
+        inference_mode=mode,
+        enable_heterogeneous=enable_heterogeneous,
+        enable_speculative=(mode == "spec"),
+        spec_profile=args.spec_profile,
+        max_draft_tokens=args.max_draft_tokens,
         heterogeneous_slots_per_layer=args.slots_per_layer,
     )
 
@@ -110,8 +124,10 @@ def run_case(args: argparse.Namespace) -> dict:
     processed_tokens = input_tokens + generated_output_tokens
 
     result = {
-        "enable_heterogeneous": args.enable_heterogeneous,
+        "mode": mode,
+        "enable_heterogeneous": enable_heterogeneous,
         "slots_per_layer": args.slots_per_layer,
+        "max_draft_tokens": args.max_draft_tokens,
         "num_seqs": args.num_seqs,
         "min_input_len": args.min_input_len,
         "max_input_len": args.max_input_len,
@@ -128,6 +144,9 @@ def run_case(args: argparse.Namespace) -> dict:
         "outputs_digest": _hash_many_token_ids(generated_token_ids),
     }
 
+    if mode == "spec" and hasattr(llm, "spec_engine") and hasattr(llm.spec_engine, "get_profile"):
+        result["spec_profile"] = llm.spec_engine.get_profile(reset=True)
+
     if args.return_token_ids:
         result["generated_token_ids"] = generated_token_ids
     if args.return_text:
@@ -141,7 +160,8 @@ def run_case(args: argparse.Namespace) -> dict:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a single benchmark case for standard or heterogeneous path.")
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--enable-heterogeneous", type=str2bool, required=True)
+    parser.add_argument("--mode", type=str, default="heter")
+    parser.add_argument("--enable-heterogeneous", type=str, default="")
     parser.add_argument("--slots-per-layer", type=int, default=0)
     parser.add_argument("--num-seqs", type=int, default=64)
     parser.add_argument("--min-input-len", type=int, default=64)
@@ -149,9 +169,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-output-len", type=int, default=32)
     parser.add_argument("--max-output-len", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-draft-tokens", type=int, default=8)
+    parser.add_argument("--dist-port", type=int, default=2333)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--temperature", type=float, default=1e-5)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--enforce-eager", type=str2bool, default=True)
+    parser.add_argument("--spec-profile", type=str2bool, default=False)
     parser.add_argument("--return-token-ids", type=str2bool, default=False)
     parser.add_argument("--return-text", type=str2bool, default=True)
     parser.add_argument("--return-prompts", type=str2bool, default=True)

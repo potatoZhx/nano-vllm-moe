@@ -110,3 +110,32 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def start_draft(self, seq: Sequence):
+        seq._draft_start_num_tokens = seq.num_tokens
+        seq._draft_start_num_blocks = len(seq.block_table)
+
+    def append_draft_token(self, seq: Sequence):
+        self.may_append(seq)
+
+    def rollback_draft(self, seq: Sequence):
+        target_tokens = seq._draft_start_num_tokens
+        target_num_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > target_num_blocks:
+            freed_block = seq.block_table.pop()
+            block = self.blocks[freed_block]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(freed_block)
+        seq.num_tokens = target_tokens
+
+    def accept_draft(self, seq: Sequence, num_accepted: int):
+        target_tokens = seq._draft_start_num_tokens + num_accepted
+        target_num_blocks = (target_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > target_num_blocks:
+            freed_block = seq.block_table.pop()
+            block = self.blocks[freed_block]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(freed_block)
+        seq.num_tokens = target_tokens

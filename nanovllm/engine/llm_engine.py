@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.speculative.spec_engine import SpeculativeEngine
 
 
 class LLMEngine:
@@ -18,6 +19,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -31,6 +33,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.spec_engine = SpeculativeEngine(self.model_runner, self.scheduler, config)
         atexit.register(self.exit)
 
     def exit(self):
@@ -52,7 +55,19 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill:
+            token_ids = self.model_runner.call("run", seqs, True)
+            self.scheduler.postprocess(seqs, token_ids)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = sum(len(seq) for seq in seqs)
+            return outputs, num_tokens
+        elif self.config.inference_mode == "spec":
+            token_ids = self.spec_engine.speculative_step(seqs)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = -len(seqs)
+            return outputs, num_tokens
+        else:
+            token_ids = self.model_runner.call("run", seqs, False)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)

@@ -69,3 +69,15 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def start_draft_kv(self, seq: Sequence):
+        self.block_manager.start_draft(seq)
+
+    def append_draft_kv(self, seq: Sequence):
+        self.block_manager.append_draft_token(seq)
+
+    def rollback_draft_kv(self, seq: Sequence):
+        self.block_manager.rollback_draft(seq)
+
+    def accept_draft_kv(self, seq: Sequence, num_accepted: int):
+        self.block_manager.accept_draft(seq, num_accepted)

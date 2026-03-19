@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -28,7 +29,8 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist_url = f"tcp://localhost:{config.dist_port}"
+        dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -154,13 +156,14 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+
+            # Build slot mapping token-by-token so non-block-aligned cached prefixes
+            # (used by speculative verify) remain consistent with Q token count.
+            for token_pos in range(seq.num_cached_tokens, seqlen):
+                block_idx = token_pos // self.block_size
+                offset_in_block = token_pos % self.block_size
+                slot = seq.block_table[block_idx] * self.block_size + offset_in_block
+                slot_mapping.append(slot)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -222,6 +225,41 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], list]:
+        """Phase 2 baseline draft path using existing decode forward semantics."""
+        token_ids = self.run(seqs, False)
+        return token_ids, []
+
+    @torch.inference_mode()
+    def run_verify(self, seqs: list[Sequence], verify_lengths: list[int]) -> list[list[int]]:
+        """Run one-shot verify in prefill-like mode and return per-sequence argmax traces."""
+        input_ids, positions = self.prepare_prefill(seqs)
+
+        # compute_logits() slices prefill outputs to last token per sequence.
+        # Verify needs logits for every queried token position.
+        hidden_states = self.model(input_ids, positions)
+        logits = F.linear(hidden_states, self.model.lm_head.weight)
+        if self.world_size > 1:
+            if self.rank == 0:
+                all_logits = [torch.empty_like(logits) for _ in range(self.world_size)]
+                dist.gather(logits, all_logits, 0)
+                logits = torch.cat(all_logits, dim=-1)
+            else:
+                dist.gather(logits, None, 0)
+
+        reset_context()
+
+        if self.rank != 0:
+            return None
+
+        verify_tokens_per_seq: list[list[int]] = []
+        offset = 0
+        for length in verify_lengths:
+            seq_logits = logits[offset:offset + length]
+            offset += length
+            verify_tokens_per_seq.append(seq_logits.argmax(dim=-1).tolist())
+        return verify_tokens_per_seq
 
     @torch.inference_mode()
     def capture_cudagraph(self):

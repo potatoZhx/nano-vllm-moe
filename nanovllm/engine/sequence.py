@@ -27,6 +27,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.draft_token_ids: list[int] = []
+        self._draft_start_num_tokens = self.num_tokens
+        self.is_drafting = False
 
     def __len__(self):
         return self.num_tokens
@@ -71,13 +74,51 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def start_draft(self):
+        self.draft_token_ids = []
+        self._draft_start_num_tokens = self.num_tokens
+        self.is_drafting = True
+
+    def append_draft_token(self, token_id: int):
+        self.draft_token_ids.append(token_id)
+        self.append_token(token_id)
+
+    def finish_draft(self):
+        self.is_drafting = False
+
+    def rollback_tokens_to_draft_start(self):
+        self.token_ids = self.token_ids[:self._draft_start_num_tokens]
+        self.num_tokens = self._draft_start_num_tokens
+        self.last_token = self.token_ids[-1]
+        self.draft_token_ids = []
+        self.is_drafting = False
+
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.draft_token_ids,
+            self._draft_start_num_tokens,
+            self.is_drafting,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:4]
+        payload = state[4]
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = payload
+            self.last_token = self.token_ids[-1]
         else:
-            self.last_token = state[-1]
+            self.last_token = payload
+            self.token_ids = []
+        if len(state) >= 8:
+            self.draft_token_ids = state[5]
+            self._draft_start_num_tokens = state[6]
+            self.is_drafting = state[7]
+        else:
+            self.draft_token_ids = []
+            self._draft_start_num_tokens = self.num_tokens
+            self.is_drafting = False
