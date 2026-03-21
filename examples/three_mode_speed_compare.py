@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# CUDA_VISIBLE_DEVICES=2 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --max-draft-tokens 4 --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_profile_avg.json
+# CUDA_VISIBLE_DEVICES=2 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --max-draft-tokens 4 --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_profile_avg.json
 
 
 def str2bool(value: str) -> bool:
@@ -32,14 +32,10 @@ def run_case(case_script: Path, args: argparse.Namespace, mode: str) -> dict:
         str(args.slots_per_layer),
         "--num-seqs",
         str(args.num_seqs),
-        "--min-input-len",
-        str(args.min_input_len),
-        "--max-input-len",
-        str(args.max_input_len),
-        "--min-output-len",
-        str(args.min_output_len),
-        "--max-output-len",
-        str(args.max_output_len),
+        "--input-len",
+        str(args.input_len),
+        "--output-len",
+        str(args.output_len),
         "--max-model-len",
         str(args.max_model_len),
         "--max-draft-tokens",
@@ -54,6 +50,10 @@ def run_case(case_script: Path, args: argparse.Namespace, mode: str) -> dict:
         str(args.enforce_eager).lower(),
         "--spec-profile",
         str(args.spec_profile).lower(),
+        "--engine-profile",
+        str(args.engine_profile).lower(),
+        "--engine-profile-cuda-sync",
+        str(args.engine_profile_cuda_sync).lower(),
         "--return-token-ids",
         str(args.check_correctness).lower(),
         "--return-text",
@@ -134,10 +134,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=os.path.expanduser("/zx_data1/models/Qwen--Qwen3-30B-A3B-Base"))
     parser.add_argument("--slots-per-layer", type=int, default=0)
     parser.add_argument("--num-seqs", type=int, default=8)
-    parser.add_argument("--min-input-len", type=int, default=32)
-    parser.add_argument("--max-input-len", type=int, default=96)
-    parser.add_argument("--min-output-len", type=int, default=16)
-    parser.add_argument("--max-output-len", type=int, default=32)
+    parser.add_argument("--input-len", type=int, default=64)
+    parser.add_argument("--output-len", type=int, default=24)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--dist-port-base", type=int, default=26000)
@@ -145,6 +143,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--enforce-eager", type=str2bool, default=True)
     parser.add_argument("--spec-profile", type=str2bool, default=True)
+    parser.add_argument("--engine-profile", type=str2bool, default=False)
+    parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--check-correctness", type=str2bool, default=True)
     parser.add_argument("--return-text", type=str2bool, default=False)
     parser.add_argument("--result-json", default="")
@@ -212,6 +212,21 @@ def main() -> None:
         print(f"draft_tokens_total={int(draft_total)}")
         print(f"accepted_tokens_total={int(accepted_total)}")
         print(f"accept_rate={accept_rate:.4f}")
+
+    if args.engine_profile:
+        print("=== Engine Profile (ms) ===")
+        for mode_name in ("standard", "heter", "spec"):
+            profile = report[mode_name].get("engine_profile") or {}
+            step_count = float(profile.get("step_count", 0.0))
+            step_ms = float(profile.get("step_ms", 0.0))
+            model_run_ms = float(profile.get("model_run_model_ms", 0.0))
+            prepare_decode_ms = float(profile.get("model_prepare_decode_ms", 0.0))
+            prepare_prefill_ms = float(profile.get("model_prepare_prefill_ms", 0.0))
+            mode_step_ms = (step_ms / step_count) if step_count > 0 else 0.0
+            print(
+                f"{mode_name}: step_total={step_ms:.2f}, step_count={int(step_count)}, step_avg={mode_step_ms:.2f}, "
+                f"model_run={model_run_ms:.2f}, prepare_decode={prepare_decode_ms:.2f}, prepare_prefill={prepare_prefill_ms:.2f}"
+            )
 
     if args.result_json:
         with open(args.result_json, "w", encoding="utf-8") as f:

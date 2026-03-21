@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from nanovllm.expert.cache import LayerExpertCache
-from nanovllm.expert.placement import build_moe_execution_plan
+from nanovllm.expert.placement import MoEExecutionPlan, build_moe_execution_plan
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.fuse_moe.functional import fused_moe_linear
 
@@ -16,6 +16,7 @@ def heterogeneous_moe_forward(
     expert_cache: LayerExpertCache,
     cpu_expert_pool: dict[int, dict[str, torch.Tensor]] | None,
     act_fn: SiluAndMul,
+    plan: MoEExecutionPlan | None = None,
 ) -> torch.Tensor:
     """Run MoE with GPU cached experts + fallback path for uncached experts."""
     M, _ = hidden_states.shape
@@ -24,10 +25,11 @@ def heterogeneous_moe_forward(
     flat_weights = routing_weights.reshape(-1)
 
     output = torch.zeros_like(hidden_states)
-    plan = build_moe_execution_plan(flat_selected, expert_cache)
+    if plan is None: # heter mode
+        plan = build_moe_execution_plan(flat_selected, expert_cache)
 
     # GPU path: cached experts are remapped to contiguous slot buffers.
-    if plan.gpu_route_indices.numel() > 0:
+    if plan.gpu_route_indices.numel() > 0 and plan.m_sizes is not None:
         gpu_token_indices = torch.div(plan.gpu_route_indices, top_k, rounding_mode="floor")
         gpu_hidden = hidden_states[gpu_token_indices]
         gpu_weights = flat_weights.index_select(0, plan.gpu_route_indices)
@@ -46,7 +48,10 @@ def heterogeneous_moe_forward(
             raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
         cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
         cpu_hidden = hidden_states[cpu_token_indices]
-        cpu_experts = flat_selected.index_select(0, cpu_indices)
+        if plan.flat_selected_original is not None:
+            cpu_experts = plan.flat_selected_original.index_select(0, cpu_indices)
+        else:
+            cpu_experts = flat_selected.index_select(0, cpu_indices)
         cpu_weights = flat_weights.index_select(0, cpu_indices)
 
         for expert_idx in cpu_experts.unique().tolist():

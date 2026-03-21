@@ -1,4 +1,6 @@
 import pickle
+from collections import defaultdict
+from time import perf_counter
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -9,6 +11,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
@@ -28,6 +31,9 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.profile_enabled = bool(getattr(config, "engine_profile", False))
+        self.profile_cuda_sync = bool(getattr(config, "engine_profile_cuda_sync", True))
+        self._profile = defaultdict(float)
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -41,8 +47,10 @@ class ModelRunner:
             loader = HeterogeneousModelLoader(config)
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
             self.model.enable_heterogeneous_mode(layer_caches, cpu_expert_pool)
+            self.draft_scheduler = SimpleDraftScheduler()
         else:
             load_model(self.model, config.model)
+            self.draft_scheduler = None
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -100,6 +108,18 @@ class ModelRunner:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
+
+    def _record_profile(self, key: str, dt_sec: float) -> None:
+        if self.profile_enabled and self.rank == 0:
+            self._profile[key] += dt_sec * 1000.0
+
+    def get_profile(self, reset: bool = False) -> dict:
+        if self.rank != 0:
+            return {}
+        out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+        if reset:
+            self._profile.clear()
+        return out
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -219,39 +239,94 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        self._record_profile("prepare_prefill_ms" if is_prefill else "prepare_decode_ms", perf_counter() - t0)
+        if self.profile_enabled and self.rank == 0:
+            self._profile["prepare_count"] += 1
+            self._profile["prefill_count"] += int(is_prefill)
+            self._profile["decode_count"] += int(not is_prefill)
+
+        t0 = perf_counter()
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        self._record_profile("prepare_sample_ms", perf_counter() - t0)
+
+        t0 = perf_counter()
         logits = self.run_model(input_ids, positions, is_prefill)
+        if self.profile_enabled and self.profile_cuda_sync:
+            torch.cuda.synchronize()
+        self._record_profile("run_model_ms", perf_counter() - t0)
+
+        t0 = perf_counter()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.profile_enabled and self.profile_cuda_sync:
+            torch.cuda.synchronize()
+        self._record_profile("sample_ms", perf_counter() - t0)
+
+        if self.profile_enabled and self.rank == 0:
+            self._profile["tokens_in_total"] += int(input_ids.numel())
+            self._profile["run_count"] += 1
         reset_context()
         return token_ids
 
+    def _set_speculative_execution_mode(self, mode: str):
+        if hasattr(self.model, "set_speculative_execution_mode"):
+            draft_top_c = getattr(self.config, "draft_top_c", 0)
+            self.model.set_speculative_execution_mode(mode, self.draft_scheduler, draft_top_c)
+
     def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], list]:
-        """Phase 2 baseline draft path using existing decode forward semantics."""
-        token_ids = self.run(seqs, False)
-        return token_ids, []
+        """Draft decode path with explicit draft plan execution inside MoE blocks."""
+        t0 = perf_counter()
+        self._set_speculative_execution_mode("draft")
+        try:
+            token_ids = self.run(seqs, False)
+            return token_ids, []
+        finally:
+            self._set_speculative_execution_mode("normal")
+            if self.profile_enabled:
+                if self.profile_cuda_sync:
+                    torch.cuda.synchronize()
+                self._record_profile("run_draft_total_ms", perf_counter() - t0)
+                if self.rank == 0:
+                    self._profile["run_draft_count"] += 1
 
     @torch.inference_mode()
     def run_verify(self, seqs: list[Sequence], verify_lengths: list[int]) -> list[list[int]]:
         """Run one-shot verify in prefill-like mode and return per-sequence argmax traces."""
+        total_t0 = perf_counter()
+        self._set_speculative_execution_mode("verify")
+        t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs)
+        self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
 
         # compute_logits() slices prefill outputs to last token per sequence.
         # Verify needs logits for every queried token position.
-        hidden_states = self.model(input_ids, positions)
-        logits = F.linear(hidden_states, self.model.lm_head.weight)
-        if self.world_size > 1:
-            if self.rank == 0:
-                all_logits = [torch.empty_like(logits) for _ in range(self.world_size)]
-                dist.gather(logits, all_logits, 0)
-                logits = torch.cat(all_logits, dim=-1)
-            else:
-                dist.gather(logits, None, 0)
+        try:
+            t0 = perf_counter()
+            hidden_states = self.model(input_ids, positions)
+            logits = F.linear(hidden_states, self.model.lm_head.weight)
+            if self.world_size > 1:
+                if self.rank == 0:
+                    all_logits = [torch.empty_like(logits) for _ in range(self.world_size)]
+                    dist.gather(logits, all_logits, 0)
+                    logits = torch.cat(all_logits, dim=-1)
+                else:
+                    dist.gather(logits, None, 0)
+            if self.profile_enabled and self.profile_cuda_sync:
+                torch.cuda.synchronize()
+            self._record_profile("verify_forward_ms", perf_counter() - t0)
+        finally:
+            self._set_speculative_execution_mode("normal")
 
         reset_context()
 
         if self.rank != 0:
             return None
+
+        if self.profile_enabled:
+            self._record_profile("run_verify_total_ms", perf_counter() - total_t0)
+            self._profile["run_verify_count"] += 1
+            self._profile["verify_tokens_in_total"] += int(input_ids.numel())
 
         verify_tokens_per_seq: list[list[int]] = []
         offset = 0

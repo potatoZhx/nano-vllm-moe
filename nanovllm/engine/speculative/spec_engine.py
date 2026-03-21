@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from time import perf_counter
 
 from nanovllm.engine.sequence import SequenceStatus
@@ -17,14 +18,20 @@ class SpeculativeEngine:
         self.model_runner = model_runner
         self.scheduler = scheduler
         self.config = config
-        self.max_draft_tokens = getattr(config, "max_draft_tokens", 1)
+        self.max_draft_tokens = getattr(config, "max_draft_tokens", 5)
         self.profile_enabled = getattr(config, "spec_profile", False)
         self._profile = defaultdict(float)
+        self._draft_steps_per_step: list[int] = []
+        self._step_traces: list[dict] = []
 
     def get_profile(self, reset: bool = False) -> dict:
         out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+        out["draft_steps_per_step"] = list(self._draft_steps_per_step)
+        out["step_traces"] = deepcopy(self._step_traces)
         if reset:
             self._profile.clear()
+            self._draft_steps_per_step.clear()
+            self._step_traces.clear()
         return out
 
     def _budget_draft_steps(self, seqs) -> int:
@@ -49,9 +56,32 @@ class SpeculativeEngine:
 
         step_t0 = perf_counter()
         self._profile["spec_step_count"] += 1
+        step_index = int(self._profile["spec_step_count"])
 
         draft_steps = self._budget_draft_steps(seqs)
         self._profile["draft_steps_total"] += draft_steps
+        self._draft_steps_per_step.append(int(draft_steps))
+
+        step_trace = {
+            "step_index": step_index,
+            "draft_steps": int(draft_steps),
+            "seq_count": len(seqs),
+            "sequences": [],
+        }
+        for seq in seqs:
+            max_tokens = getattr(seq, "max_tokens", None)
+            completion_before = seq.num_tokens - seq.num_prompt_tokens
+            remaining_before = (max_tokens - completion_before) if max_tokens is not None else None
+            step_trace["sequences"].append({
+                "seq_id": int(seq.seq_id),
+                "completion_before": int(completion_before),
+                "max_tokens": int(max_tokens) if max_tokens is not None else None,
+                "remaining_before": int(remaining_before) if remaining_before is not None else None,
+                "drafted_tokens": 0,
+                "verify_trace_len": 0,
+                "accepted_draft_tokens": 0,
+                "next_token": None,
+            })
 
         t0 = perf_counter()
         for seq in seqs:
@@ -140,6 +170,14 @@ class SpeculativeEngine:
             next_pos = min(keep_after_start, len(verify_tokens) - 1)
             next_token = verify_tokens[next_pos]
 
+            for seq_trace in step_trace["sequences"]:
+                if seq_trace["seq_id"] == int(seq.seq_id):
+                    seq_trace["drafted_tokens"] = int(len(draft_tokens))
+                    seq_trace["verify_trace_len"] = int(len(verify_tokens))
+                    seq_trace["accepted_draft_tokens"] = int(keep_after_start)
+                    seq_trace["next_token"] = int(next_token)
+                    break
+
             self.scheduler.accept_draft_kv(seq, keep_after_start)
             base_tokens = base_tokens_map[seq.seq_id]
             accepted_draft = draft_tokens[:keep_after_start]
@@ -155,7 +193,10 @@ class SpeculativeEngine:
             self._profile["draft_tokens_total"] += len(draft_tokens)
 
         self._profile["accept_ms"] += (perf_counter() - t0) * 1000.0
-        self._profile["spec_step_ms"] += (perf_counter() - step_t0) * 1000.0
+        step_dt_ms = (perf_counter() - step_t0) * 1000.0
+        self._profile["spec_step_ms"] += step_dt_ms
+        step_trace["step_ms"] = step_dt_ms
+        self._step_traces.append(step_trace)
 
         return final_token_ids
 

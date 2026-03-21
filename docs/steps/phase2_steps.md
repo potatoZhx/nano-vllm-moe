@@ -1239,14 +1239,14 @@ Awaited terminal completion
 Made changes.
 
 # 5
-[prompt]
+### [prompt]
 1."spec 的 verify/accept 语义实现仍有逻辑偏差"是什么，请修复；
 2.请增加spec的打点计时，分析spec模式过于慢的原因，并解决
 3.请深入分析当前在 S=N 场景下 spec 与 standard deterministic token 级对齐语义不对齐的根本原因，并修复
 需要复测发现速度和语义对齐才算完成
 请先重新阅读phase2_design文档确认实现，如有任何不确定或疑问请立即询问我
 
-[response]
+### [response]
 我会先重新通读 docs/phase2_design.md 并对照当前代码，先把“verify/accept 语义偏差”的具体差距列清，再按文档实现修复；之后加 spec 分阶段计时打点，最后以三模式复测验证“速度+deterministic 对齐”。先开始做差距审计。
 
 读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#1-1)，行 1 到 360
@@ -1491,17 +1491,887 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 Made changes.
 
+# 6
+### [prompt]
+请再次阅读phase2_design和migration_design文档，确认spec模式的流程、调度和实现细节；然后总结现阶段的实现情况，并分析与设计文档的差距，最后规划下一步实现；
+比如我注意到你目前的实现中run_draft和run_verify还没有实现设计中的逻辑；如有任何不确定或疑问请立即询问我
+
+### [response]
+我会先重新对照两份设计文档和当前核心代码（spec_engine、model_runner、placement、heterogeneous forward），输出一份“设计要求 vs 当前实现”的逐项差距清单，再给出下一步可执行实现计划。先做快速核对读取。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#1-1)，行 1 到 260
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#1-1)，行 1 到 320
+
+我已重新读完两份设计文档，下一步会逐文件核对当前实现是否真的落到“Draft/Verify 异构分流、placement 注入、算子层 plan 复用”这些关键点。核对后我会给你一份差距矩阵。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py#180-180)，行 180 到 360
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/scheduler.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/block_manager.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/sequence.py)
+
+搜索与 `**/nano-vllm-moe/nanovllm/expert/*.py` 匹配的文件，3 匹配项
+
+搜索与 `**/nano-vllm-moe/nanovllm/engine/speculative/*.py` 匹配的文件，3 匹配项
+
+搜索匹配 `**/nano-vllm-moe/nanovllm/scheduling/*.py` 的文件，1 个匹配项
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/utils/heterogeneous_loader.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/acceptance.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v6_fix.json)
+
+已重新通读并对照了两份文档与当前代码实现，结论是：你指出的问题是准确的，当前 spec 已经“语义可跑通 + deterministic 可对齐”，但还没有落到设计文档里强调的“Draft/Verify 在 MoE 层面分流执行计划”的实现深度。
+
+**一、当前 spec 实际流程（代码现状）**
+1. decode 分流已接入。  
+spec 分流入口 已按 mode 进入 speculative_step。
+
+2. SpeculativeEngine 主循环已具备 Draft -> Rollback -> Verify -> Accept 结构。  
+主循环实现
+
+3. KV 生命周期接口已接入 scheduler/block manager。  
+scheduler draft kv 包装  
+block manager draft 生命周期  
+sequence draft 状态
+
+4. run_verify 已修成“一次性 verify 轨迹”语义，并绕开 prefill last-token 裁剪问题。  
+run_verify 当前实现
+
+5. 三模式 benchmark 和 spec profile 已可输出。  
+three mode benchmark  
+single case benchmark  
+最近结果样例
+
+**二、与设计文档的一致性（已完成）**
+1. 三模式标准入口和兼容配置：已完成。  
+config  
+engine 分流
+
+2. Draft/Rollback/Accept 状态机骨架：已完成。  
+spec engine
+
+3. deterministic token 对齐目标：当前 smoke 已达成。  
+结果文件
+
+4. 打点计时和慢因定位能力：已完成第一版。  
+spec profile 字段来源
+
+**三、与你设计文档的关键差距（核心）**
+你提到的 run_draft/run_verify 差距，确实是当前最大缺口。
+
+1. run_draft 仍是“复用普通 decode”的 baseline，没有实现设计中的 draft path。  
+现状：run_draft 直接调用 run(seqs, False)。  
+run_draft baseline
+
+2. run_verify 还没有按“层内 placement + 异构 MoE 执行计划”完整落地。  
+现状：虽然语义上已支持一次性 verify logits，但仍是 model forward 直跑，不经过 build_prefill_plan 的显式执行链。  
+run_verify 当前实现
+
+3. placement 模块已实现 build_draft_plan/build_prefill_plan，但没有被 run_draft/run_verify 主路径消费。  
+placement
+
+4. heterogeneous_moe_forward 还在内部 build plan，未实现“外部传 plan 直接执行”的设计目标。  
+heterogeneous forward 当前接口
+
+5. qwen3_moe 还没有“外部注入 routing/plan”的入口，仍在 block 内部自行 route + forward。  
+qwen3_moe 当前 MoE block
+
+6. migration_design 里的 prefetcher/spec_scheduler/cache_strategy/prefetch_strategy 仍未落地。  
+当前文件搜索仅有 draft_scheduler，其他模块不存在。  
+expert 目录现状  
+scheduling 目录现状
+
+**四、现阶段实现状态总结**
+1. Phase2 的“可运行基线”已经成立：功能通、对齐可测、速度可测、错误已修。  
+2. 但实现深度仍偏“engine 控制层修正”，尚未进入设计里的“模型层 MoE 执行路径重构”。  
+3. 因此现在的 spec 正确性更依赖“流程控制和 logits 比对”，而不是“draft/verify 执行后端真正分流”。
+
+**五、下一步实现规划（建议按这个顺序）**
+1. 打通真正的 run_draft 执行链。  
+目标：run_draft 内部显式走 route -> build_draft_plan -> heterogeneous_moe_forward(plan)。  
+改动点：  
+model_runner  
+qwen3_moe  
+heterogeneous forward
+
+2. 打通真正的 run_verify 执行链。  
+目标：run_verify 显式走 build_prefill_plan（无替换）并产出完整 verify 轨迹。  
+改动点：  
+model_runner  
+placement
+
+3. 重构 heterogeneous_moe_forward 接口为“支持外部 plan 注入，内部 build 仅保留兼容分支”。  
+改动点：  
+heterogeneous forward
+
+4. 增补测试矩阵。  
+新增：S=N 下“spec 仍调用 draft/prefill plan 构建”的调用计数断言；run_draft/run_verify 分流行为断言；多序列 verify offset 对齐断言。  
+目录：  
+tests
+
+5. 跑三模式复测并出对比报告。  
+输出速度、对齐、spec_profile 三类结果，保存到 benchmarks/results 新文件。
+
+**六、需要你立即确认的两点（避免误实现）**
+1. 下一步你希望我直接按 migration_design 的方向，把 run_draft/run_verify 改成“显式 MoE 分层执行链”，即使这会明显增加改动面，是否确认？  
+2. 在这个阶段是否继续坚持 S=N 作为唯一验收场景，还是同步加一个 S<N 的小场景做功能验证（不做性能结论）？
+
+你确认后我就按上面的顺序直接开始实现，不再停留在分析层。
+
+# 7
+### [prompt]
+确认：1.是的 2.目前暂时不加S<N；请开始实现所有规划
+
+### [response]
+收到，我会直接按确认后的完整规划开始落地：优先打通 run_draft/run_verify 的真实异构执行链（含 plan 注入），再补测试并复测三模式。先读取并定位要改的关键代码段。
+
+搜索正则表达式 `run_draft\(|run_verify\(|speculative_step\(` (`**/nano-vllm-moe/tests/**`)，5 个结果
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/scheduling/draft_scheduler.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/cache.py)
+
+搜索正则表达式 `Qwen3MoeHeterogeneousSparseMoeBlock\(` (`**/nano-vllm-moe/**`)，2 个结果
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py) 中的修补程序(56 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py) 中的修补程序(121 行)
+
+
+```
+
+```
+第一批核心改造已完成：模型侧现在支持 draft/verify 两种执行模式并会显式构建 placement plan。接下来我会把 ModelRunner 的 run_draft/run_verify 接到这个新模式上，并补单测验证模式切换。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py) 中的修补程序(76 行)
+
+
+```
+
+```
+
+
+已创建 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_model_runner_spec_modes.py)
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python -m unittest tests/test_model_runner_spec_modes.py tests/test_spec_engine_flow.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python -m unittest discover -s tests
+
+代码链路已打通并通过 20 个单测。下一步我会按你当前验收口径（仅 S=N）跑三模式 deterministic benchmark，确认改动后仍保持对齐与速度表现。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_v7_plan_wired.json
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_v7_plan_wired.json
+
+遇到外部进程占满显存导致 benchmark OOM，不是本次代码逻辑错误。我会先查询空闲 GPU，然后在空闲卡上重跑同一条三模式命令完成验收。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader,nounits
+
+Made changes.
+
+### [results]
+python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_v7_plan_wired.json
+=== Throughput (output tok/s) ===
+standard=11.16
+heter=7.16
+spec=6.94
+=== Ratios vs standard ===
+heter_output_ratio=0.6422
+spec_output_ratio=0.6224
+=== Deterministic Token Alignment ===
+heter exact=True rate=1.0000
+spec exact=False rate=0.0000
+=== Spec Profile (ms) ===
+spec_step_ms=2384.38
+draft_loop_ms=1691.42
+draft_single_infer_ms=338.27
+run_draft_infer_ms_total=1691.34
+prepare_verify_ms=0.01
+verify_ms=692.72
+verify_single_infer_ms=346.36
+run_verify_infer_ms_total=692.72
+accept_ms=0.10
+draft_tokens_total=5
+accepted_tokens_total=5
+accept_rate=1.0000
+Saved report to: benchmarks/results/three_mode_smoke_v7_plan_wired.json
+
+
+# 8
+### [prompt]
+之前没有实现run_verify和run_draft真实逻辑的时候，heter和spec的吞吐和standard非常接近（standard output tok/s = 11.63；heter output tok/s = 10.79；spec output tok/s = 10.32），为什么实现后吞吐所有都会下降，这些修改应该并不影响heter模式；请增加计时/log分析性能下降的原因，并分析可能的解决方案
+### [response]
+你这个观察很关键：按设计新增的真实 run_draft/run_verify 逻辑不应拖慢普通 heter 路径。下一步我先快速定位最近改动是否把额外开销“泄漏”到了所有模式（尤其是数据准备、同步、日志、计划构建），然后我会加一组可控计时日志并跑一次对比来给出结论和优化方案。正在优化工具选择...
+
+读取内存
+
+读取内存 nano-vllm-moe-facts.md
+
+我先读取关键路径（engine/model_runner/spec_engine/heterogeneous/qwen3_moe/config）确认计时点和模式分支是否有“全局生效”的重开销，再决定把计时插在哪里最有信息量。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py#1-1)，行 1 到 420
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py#420-420)，行 420 到 557
+
+我发现标准模式也显著下降，这通常不是 run_verify 本身，而是 benchmark 配置或共享参数在三模式间“串扰”。我先检查基准脚本是否让 standard 也打开了某些重路径（如 heterogeneous loader/额外同步/日志）。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/__init__.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/llm.py)
+
+我准备直接加一套“按模式统一”的内部剖析：在 engine/model_runner 里记录 prepare、model forward、sample、verify 各阶段耗时与调用次数，并把它接到 benchmark 输出里，这样能明确是代码路径回归还是环境因素（比如频率/占用）导致。随后我会给你基于新日志的定位思路和可落地优化项。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py) 中的修补程序(11 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py) 中的修补程序(119 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py) 中的修补程序(82 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py) 中的修补程序(32 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py) 中的修补程序(29 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py) 中的修补程序(40 行)
+
+
+```
+
+```
+已完成第一轮埋点接线：现在可以对 standard/heter/spec 同时输出统一 engine profile（step、prepare、model forward、sample、draft/verify）。接下来我会先跑一次轻量测试确认无语法问题，再给你一条建议命令生成对比日志，并据现有 v7 数据先做根因分析。
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py)，未发现问题
+
+Configuring a Python Environment
+Completed with input: {
+  "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
+}
+
+Ran terminal command:  conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27440 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+Completed with input:  conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27440 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27440 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27440 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+
+Ran terminal command:  nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v7_plan_wired.json)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v6_fix.json)
+
+搜索正则表达式 `11.63|10.79|10.32` (`**/benchmarks/results/*.json`)，无结果
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && rg -n "11\.63|10\.79|10\.32|throughput_output_tok_s" benchmarks/results -g "*.json" | head -n 80
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -RIn "11\.63\|10\.79\|10\.32\|throughput_output_tok_s" benchmarks/results --include='*.json' | head -n 120
+
+我已经定位到历史结果：你说的“11.x / 10.x”属于更早的 smoke/profile 文件，和现在 v7 的运行条件不完全一致。下一步我会读取这些 JSON 的配置项与阶段耗时，给出“可比/不可比”的精确结论。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke.json)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_profile_avg.json)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v5.json)
+
+进展更新：埋点代码已经加好并通过静态错误检查；我尝试直接跑了带新埋点的三模式对比，但当前 GPU 被其他进程大量占用导致 OOM，所以这轮无法产出新的实测分解。基于你给的 v7 数据和历史 JSON，我已经能先给出“为什么三种模式一起掉速”的主要判断，并给出下一步可执行的验证与优化清单。
+
+读取活动 git 存储库中已更改的文件
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py) 中的修补程序(11 行)
+
+
+```
+
+```
+
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)，未发现问题
+
+找到一个直接导致“三模式一起掉速”的高概率主因：benchmark 主路径里把 generate 改成了 use_tqdm=true，这会给每一步都引入 Python 侧进度条开销，且对 standard/heter/spec 全部生效。我已经改回 use_tqdm=false，避免把 UI 开销算进吞吐。接下来我给你完整原因拆解和优化建议，并附上新埋点如何使用。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py#100-100)，行 100 到 170
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py#220-220)，行 220 到 360
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py#20-20)，行 20 到 160
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py#40-40)，行 40 到 245
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && nl -ba examples/heterogeneous_benchmark_case.py | sed -n '108,170p' && nl -ba nanovllm/config.py | sed -n '20,45p' && nl -ba nanovllm/engine/llm_engine.py | sed -n '30,130p' && nl -ba nanovllm/engine/model_runner.py | sed -n '24,360p' && nl -ba examples/three_mode_speed_compare.py | sed -n '44,260p'
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_Xkm43P1jpDTv2CRGzSbleruO__vscode-1773909342353/content.txt#1-1)，行 1 到 260
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_Xkm43P1jpDTv2CRGzSbleruO__vscode-1773909342353/content.txt#261-261)，行 261 到 520
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_Xkm43P1jpDTv2CRGzSbleruO__vscode-1773909342353/content.txt#520-520)，行 520 到 730
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py)，未发现问题
+
+结论先说：你这次看到“standard/heter/spec 一起掉速”，主因很可能不是 run_draft/run_verify 本身，而是基准脚本把主生成路径改成了带进度条，导致三种模式都被同一个 Python 侧开销拖慢。我已经把这个测量噪声修掉，并补了一套统一计时日志，便于继续精确定位。
+
+我做了两类改动：
+
+1. 修复基准测量噪声  
+- 已把主计时路径恢复为无进度条：
+- examples/heterogeneous_benchmark_case.py
+
+2. 增加统一性能剖析（standard/heter/spec 都可用）  
+- 新增 profiling 开关：
+- nanovllm/config.py
+- 在 engine 侧汇总 step/scheduler/model/spec 统计：
+- nanovllm/engine/llm_engine.py
+- 在 model_runner 侧细分 prepare/run_model/sample/draft/verify 耗时：
+- nanovllm/engine/model_runner.py
+- benchmark 脚本新增参数并输出三模式 profile 摘要：
+- examples/three_mode_speed_compare.py
+- examples/three_mode_speed_compare.py
+- case 脚本支持回传 engine_profile：
+- examples/heterogeneous_benchmark_case.py
+
+基于你给的结果，我的分析如下：
+
+1. “全模式同步下降”非常像公共路径开销，不像 spec 独有逻辑回归  
+- 你的 v7 中 standard 也明显下降到 8.02 tok/s，说明不是 only spec/heter 逻辑问题。  
+- 这类现象最常见就是 benchmark 包装层改动（例如进度条、额外同步、日志 IO、环境占用）。
+
+2. spec 实现真实化后，spec 本身变慢是预期的一部分  
+- 你给的 v7 里 spec_profile 显示：
+- draft_loop_ms = 1524.86
+- verify_ms = 1121.44
+- accept_ms 近似可忽略
+- 也就是大头都在真实推理（draft + verify），不是控制逻辑。  
+- 这说明“spec 不再是假快”，而是在做真实工作；但它不该导致 standard 跟着掉，这就回到第 1 点的公共开销。
+
+3. 另一个次要因素：参数和环境可比性  
+- 你引用的旧数据接近 benchmarks/results/three_mode_smoke_profile_avg.json 与 benchmarks/results/three_mode_smoke.json。  
+- 新旧 run 之间如果有 max_draft_tokens、GPU 占用、频率状态、并发进程差异，也会有整体漂移。  
+- 我尝试跑新埋点时遇到外部进程占满显存 OOM（这次无法完成复测），所以当前先给你代码与方法，等 GPU 空闲后即可一键定位。
+
+建议你下一步直接这样跑（同一张空闲卡、同一参数，先关掉多余进程）：
+
+conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27460 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+
+看结果时重点关注：
+
+1. standard/heter 的 model_run_model_ms 是否和旧版接近  
+2. 若 step_ms 变大但 model_run_model_ms 不变，说明是调度/后处理/包装层开销  
+3. spec 的 run_draft_total_ms 与 run_verify_total_ms 占比，判断该先优化 draft 还是 verify
+
+可落地优化方案（按优先级）：
+
+1. 先确保测量纯净  
+- 固定 use_tqdm=False（已改）
+- 固定 GPU 空闲与温度状态
+- 每组至少重复 3 次取中位数
+
+2. spec 计算侧优化  
+- 减少 verify 的无效 token（严格按最小必要长度）
+- draft path 尽量走纯 GPU 连续路径，减少 host 侧调度参与
+- 对 verify 路径评估可否引入 cudagraph（你之前也提到这个方向）
+
+3. 调度与数据准备优化  
+- 检查 prepare_prefill/prepare_decode 的 CPU tensor 构建与拷贝次数
+- 尽量减少小 batch 高频调用中的 Python 循环和对象操作
+
+如果你愿意，我下一步可以直接在你机器上继续做两件事：  
+1. 在空闲 GPU 上跑一轮 v8 engine_profile，给出逐项耗时归因表。  
+2. 基于归因结果先做第一轮优化补丁（优先不改语义，只降开销）。
+
+Made changes.
+
+### [results]
+CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27460 --result-json benchmarks/results/three_mode_smoke_v8_engine_profile.json
+=== Throughput (output tok/s) ===
+standard=11.66
+heter=10.20
+spec=10.14
+=== Ratios vs standard ===
+heter_output_ratio=0.8748
+spec_output_ratio=0.8698
+=== Deterministic Token Alignment ===
+heter exact=True rate=1.0000
+spec exact=True rate=1.0000
+=== Engine Profile (ms) ===
+standard: step_total=2509.16, step_count=9, step_avg=278.80, model_run=0.00, prepare_decode=0.00, prepare_prefill=0.00
+heter: step_total=2667.94, step_count=9, step_avg=296.44, model_run=0.00, prepare_decode=0.00, prepare_prefill=0.00
+spec: step_total=2958.36, step_count=5, step_avg=591.67, model_run=0.00, prepare_decode=0.00, prepare_prefill=0.00
+Saved report to: benchmarks/results/three_mode_smoke_v8_engine_profile.json
+
+# 9
+## 9.1
+### [prompt]
+虽然速度看起来正常了，但是profile好像没有正常工作；另外draft的步数是如何设置的？结果中"max_draft_tokens": 8，生成了5个token,却运行了"spec_run_verify_calls": 3.0
+
+### [response]
+正在优化工具选择...已压缩对话你这个判断是对的：当前 profile 输出里 `model_run/prepare_*` 全是 0，说明采样到了 `step` 总时间，但细分项没有被正确汇总出来。我先快速检查 `engine_profile` 在 `model_runner` 到 `llm_engine` 再到 benchmark JSON 的汇总链路，并同时确认 `draft/verify` 调度计数逻辑，给你一个明确结论和必要修复。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py)
+
+我已经定位到一个直接原因：打印逻辑读取的是 `model_run_model_ms` 这类键，而实际 `ModelRunner` 里记录的是 `run_model_ms`，两者前缀拼接后变成 `model_run_model_ms` 才对，理论上应有值；但你的 JSON 里这些键根本没出现，说明计数器本身可能没被写入或被覆盖。我再看 case 脚本里 profile 合并逻辑和 spec step实现，确认是采样缺失还是键名错配。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py)
+
+已经找到 profile 不完整的根因了：在 case 脚本里先 `llm.exit()`，再 `llm.get_profile()`，导致 `ModelRunner` 已被清空，`model_*` 明细自然全丢了。  
+我先做一个小修复：在退出前抓取 profile（并保留现有行为不变），这样你下一次跑出来就能看到真实的 `model_run/prepare/sample` 分解。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py) 中的修补程序(29 行)
+
+
+```
+
+```
+
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)，未发现问题
+
+我已完成修复并过了语法检查。接下来给你把两个问题讲透：1）为什么 profile 看起来“不工作”；2）为什么只生成 5 个 token 却出现 3 次 verify。为了引用准确位置，我先抓一下关键代码行号。
+
+Ran terminal command:  nl -ba examples/heterogeneous_benchmark_case.py | sed -n '90,190p'
+
+Ran terminal command:  nl -ba nanovllm/engine/speculative/spec_engine.py | sed -n '1,220p'
+
+Ran terminal command:  nl -ba nanovllm/engine/llm_engine.py | sed -n '30,120p'
+
+刚才终端当前目录不在 nano-vllm-moe 下，我用绝对路径重新取行号，马上给你精确定位。
+
+Ran terminal command:  nl -ba /zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py | sed -n '90,210p'
+
+Ran terminal command:  nl -ba /zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py | sed -n '1,240p'
+
+Ran terminal command:  nl -ba /zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py | sed -n '30,130p'
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_DBpGa1shISyO9WJ4kJARgY31__vscode-1774077615241/content.txt)
+
+你说得很准，这里有两个点：
+
+1. profile 看起来“不正常”的原因  
+2. spec 中 draft/verify 计数语义
+
+已经做了修复：把 profile 采集提前到 exit 之前。之前是先退出再读 profile，导致 model_runner 的细分计时丢失，所以你看到 model_run/prepare 都是 0（其实是键不存在，被打印逻辑按 0 显示）。
+
+修复位置：
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+
+关键机制参考：
+- 合并 profile 的入口在 nanovllm/engine/llm_engine.py
+- exit 会把 model_runner 置空在 nanovllm/engine/llm_engine.py
+
+关于你问的 draft 步数和 verify 次数：
+
+- max_draft_tokens=8 只是单次 speculative step 的上限，不是整条请求固定要 draft 8 个。
+- 实际 draft 步数由预算函数裁剪：还要给“verify 选出的 next token”留 1 个位置，所以每轮上限是 remaining-1。实现见 nanovllm/engine/speculative/spec_engine.py 和 nanovllm/engine/speculative/spec_engine.py。
+- 每个 speculative step 都会调用一次 verify（固定 +1 次），见 nanovllm/engine/speculative/spec_engine.py。
+- 所以你这次结果里：
+  - spec_step_count=3
+  - spec_run_verify_calls=3
+  - 完全一致，是正确行为。
+- 同时 run_draft_calls=5，表示 3 个 spec step 里累计做了 5 次 draft 前向（每轮 draft_steps 可变）。
+- 你的 verify_trace_tokens_total=8 也和逻辑一致：每轮 verify 长度是 draft_len+1，见 nanovllm/engine/speculative/spec_engine.py。因此总量满足：
+  - verify_trace_tokens_total = draft_tokens_total + run_verify_calls
+  - 8 = 5 + 3
+
+结论：  
+- 你指出的 profile 问题确实存在，已修复。  
+- spec_run_verify_calls=3 在这组数据下是合理且符合当前算法设计的，不是异常。
+
+下一步建议：
+1. 用你同一条命令再跑一次，确认新 JSON 里出现 model_run_ms、model_prepare_prefill_ms、model_prepare_decode_ms 等字段。  
+2. 如果你愿意，我可以再加一个“每个 spec step 的 draft_steps 明细数组”（比如 [2,2,1]），这样一眼就能解释为什么是 5 次 draft、3 次 verify。
+
+Made changes.
+
+### [results]
+CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27460 --result-json benchmarks/results/three_mode_smoke_test_engine_profile.json
+=== Throughput (output tok/s) ===
+standard=11.87
+heter=10.79
+spec=10.13
+=== Ratios vs standard ===
+heter_output_ratio=0.9090
+spec_output_ratio=0.8536
+=== Deterministic Token Alignment ===
+heter exact=True rate=1.0000
+spec exact=True rate=1.0000
+=== Engine Profile (ms) ===
+standard: step_total=3511.26, step_count=9, step_avg=390.14, model_run=40020.56, prepare_decode=1.18, prepare_prefill=4.84
+heter: step_total=2363.80, step_count=9, step_avg=262.64, model_run=41650.28, prepare_decode=1.03, prepare_prefill=7.66
+spec: step_total=2956.62, step_count=4, step_avg=739.16, model_run=41671.35, prepare_decode=0.95, prepare_prefill=5.26
+Saved report to: benchmarks/results/three_mode_smoke_test_engine_profile.json
+
+## 9.2
+### [prompt]
+请详细说明--min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true这些参数是做什么的;#sym:_budget_draft_steps使用的计算数据是怎么来的，就算要给verify-next留一个token，那当max_draft_token>max_output的时候不是也只需要spec一轮吗
+### [response]
+你这个追问非常关键：你现在看到的 `spec_run_verify_calls` 很可能把 warmup 也算进去了，所以会和“本次只生成 5 token”直觉对不上。我先做一个小修复，把 warmup 后的 profile 计数清零，再解释每个参数和 `_budget_draft_steps` 的数据来源与“是否一轮结束”的条件。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py) 中的修补程序(11 行)
+
+
+```
+
+```
+
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)，未发现问题
+
+我已把 warmup 污染 profile 的问题修好。接下来我抓参数定义与使用位置的行号，给你按“定义-生效路径-对结果影响”逐项说明，并回答为什么不一定一轮 spec 结束。
+
+Ran terminal command:  nl -ba /zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py | sed -n '1,260p'
+
+Ran terminal command:  nl -ba /zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py | sed -n '1,260p'
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_Iir8QubdsEHLgts2FaWpGlTb__vscode-1774077615246/content.txt)
+
+读取 [](file:///root/.vscode-server/data/User/workspaceStorage/49c6edc5cc059dfb090b1ce446ab6644/GitHub.copilot-chat/chat-session-resources/6068a48a-e9ae-47bd-be75-990fc42cb1ab/call_lfTElyPsBsCDRWNe7XzlxbUm__vscode-1774077615247/content.txt)
+
+我再做一步验证：用同一命令复跑一次，确认 warmup 清零后 profile 计数和你看到的生成 token 数对齐，避免只停留在代码层解释。
+
+Configuring a Python Environment
+Completed with input: {
+  "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
+}
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27480 --result-json benchmarks/results/three_mode_smoke_v9_engine_profile.json
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v9_engine_profile.json)
+
+你这个问题非常到位，核心有两层：
+
+1. 这些参数各自控制什么。  
+2. 为什么在 max_draft_tokens 大于 max_output 的时候，不一定总是一轮 spec 结束。
+
+另外我先同步结论：profile 计数污染已修复，并已复跑验证成功。修复在 examples/heterogeneous_benchmark_case.py 到 examples/heterogeneous_benchmark_case.py。
+
+**参数说明**
+- --min-input-len 8, --max-input-len 12  
+  作用：控制每条测试 prompt 的目标词数范围。case 脚本用这个范围随机生成 prompt 长度，见 examples/heterogeneous_benchmark_case.py。  
+  影响：主要影响 prefill 负载和 prefill 时间。
+
+- --min-output-len 4, --max-output-len 6  
+  作用：给每条请求随机采样 max_tokens 范围（即每条请求最多生成多少 completion token），见 examples/heterogeneous_benchmark_case.py。  
+  影响：直接决定 decode/spec 阶段需要走多少步。
+
+- --temperature 0.0  
+  作用：贪心确定性采样。  
+  影响：用于 correctness 对齐检查时，结果可严格逐 token 对比。three_mode 会据此判定 deterministic，见 examples/three_mode_speed_compare.py。
+
+- --enforce-eager true  
+  作用：禁用 decode cudagraph 路径，统一走 eager 前向。  
+  影响：减少图捕获/重放差异对行为和调试的干扰，通常更稳定但不一定最快。相关逻辑在 nanovllm/engine/model_runner.py 附近的非 eager 分支。
+
+- --check-correctness true  
+  作用：要求 case 返回 token ids，然后在三模式脚本里做对齐比较，见 examples/three_mode_speed_compare.py 和 examples/three_mode_speed_compare.py。  
+  影响：会输出 exact match/rate，不改变推理算法本身。
+
+- --spec-profile true  
+  作用：开启 speculative 细分计时和计数，如 run_draft_calls、run_verify_calls、accepted_tokens_total 等，见 nanovllm/engine/speculative/spec_engine.py。
+
+- --engine-profile true  
+  作用：开启 engine + model_runner + spec 合并 profile，见 nanovllm/engine/llm_engine.py。  
+  影响：输出 step/prefill/decode/spec 以及 model_prepare/model_run 等明细。
+
+**_budget_draft_steps 的计算数据来自哪里**
+- 入口函数：_budget_draft_steps。  
+- 用到的关键数据：
+  - self.max_draft_tokens：来自 CLI 的 --max-draft-tokens，经配置进入 SpeculativeEngine。  
+  - seq.max_tokens：每条请求在 case 里由 randint(min_output_len, max_output_len) 采样得到。  
+  - completion = seq.num_tokens - seq.num_prompt_tokens：当前已生成 completion 数。  
+  - remaining = max_tokens - completion：当前剩余预算。  
+- 最终每步 draft 上限：
+  - draft_steps = min(max_draft_tokens, remaining - 1, 其他序列约束)  
+  - 这里 remaining-1 是为了给 verify 选出的 next token 留 1 个位置。
+
+**你问的关键点：max_draft_tokens > max_output 时，是否只需一轮 spec**
+不一定总是“一轮就结束”，但在很多情况下会是一轮。原因有三点：
+
+- 原因1：spec 往往不是从 completion=0 开始  
+  在当前流程里，先有 prefill step，再进入 spec step。prefill 通常已经产出第一个 token。  
+  所以 spec 计算预算时，remaining 已经变小。  
+  你最新复跑里就是这样：总共生成 5 个 token，但 spec 阶段只剩 4 个预算，于是 draft_steps=3（因为还要留 1 个 verify-next）。
+
+- 原因2：一轮 spec 能推进的 token 数受接受率影响  
+  每轮会 draft K 个，再 verify；最终保留 keep_after_start 个 draft token，并追加 1 个 verify token。  
+  单轮推进量大约是 keep_after_start + 1。  
+  如果中间出现不匹配，keep 变小，就可能需要下一轮 spec。
+
+- 原因3：多序列时取最小预算  
+  _budget_draft_steps 对 batch 是取最小限制。某条序列预算小会拖低全 batch 的 draft_steps，可能增加轮数。
+
+**为什么你之前看到 spec_run_verify_calls=3（看起来不合理）**
+这是你观察很敏锐的地方。之前 profile 把 warmup 也统计进去了，所以 verify 调用次数会偏大。  
+我已修复为：warmup 后先 reset profile，再进入计时主跑。见 examples/heterogeneous_benchmark_case.py。
+
+修复后复跑结果（v9）已经对齐直觉：  
+- 文件：benchmarks/results/three_mode_smoke_v9_engine_profile.json  
+- spec_run_verify_calls = 1.0  
+- spec_draft_steps_total = 3.0  
+- generated_output_tokens = 5  
+- 推理路径一致且 deterministic exact match = true
+
+如果你愿意，我下一步可以加一个更直观的 per-step 轨迹字段（例如每轮的 remaining、draft_steps、accepted、next），直接写入结果 JSON，后续看一眼就能解释每次为什么是 1 轮或多轮。
+
+Made changes.
+
+## 9.3 
+### [prompt]
+请删除--min-input-len 8, --max-input-len 12，--min-output-len 4, --max-output-len 6参数，改成input-len和output-len；然后加一个“每个 spec step 的 draft_steps 明细数组”（比如 [2,2,1]）和per-step 轨迹字段
+### 【response】
+明白，你要的是两类改动同时落地：参数接口从区间改成定长，以及 spec profile 增加每步 draft 明细和 step 级轨迹。我会直接改 examples/three_mode_speed_compare.py、examples/heterogeneous_benchmark_case.py 和 nanovllm/engine/speculative/spec_engine.py，然后做一次快速校验。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py) 中的修补程序(28 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py) 中的修补程序(41 行)
+
+
+```
+
+```
+参数切换已经完成，我现在补 spec 的 step 明细和轨迹字段，结果里会直接给出类似 `draft_steps_per_step: [2,2,1]` 以及每步每序列的 remaining/drafted/accepted/next_token。
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py) 中的修补程序(74 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py) 中的修补程序(27 行)
+
+
+```
+
+```
+
+
+正在生成 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py) 中的修补程序(6 行)
+
+
+```
+
+```
+改动已完成，我现在做三件快速验证：1) 静态错误检查；2) 用新参数跑一次；3) 读取新 JSON 确认 `draft_steps_per_step` 和 `step_traces` 已落盘。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27490 --result-json benchmarks/results/three_mode_smoke_v10_step_trace.json
+
+已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py)，未发现问题
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/three_mode_smoke_v10_step_trace.json)
+
+已按你的要求完成改造，并做了实跑验证。
+
+完成内容
+1. 参数接口改为定长
+- 删除了区间参数 min-input-len/max-input-len、min-output-len/max-output-len
+- 新增并生效 input-len、output-len
+
+修改位置
+- examples/three_mode_speed_compare.py
+- examples/three_mode_speed_compare.py
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+
+2. 新增每个 spec step 的 draft_steps 明细数组
+- 新字段：spec_draft_steps_per_step
+- 示例实跑结果：spec_draft_steps_per_step 为 [4]
+
+修改位置
+- nanovllm/engine/speculative/spec_engine.py
+- nanovllm/engine/speculative/spec_engine.py
+- nanovllm/engine/speculative/spec_engine.py
+
+3. 新增 per-step 轨迹字段
+- 新字段：spec_step_traces
+- 每个 step 记录：
+  - step_index
+  - draft_steps
+  - seq_count
+  - sequences（每条序列含 completion_before、max_tokens、remaining_before、drafted_tokens、verify_trace_len、accepted_draft_tokens、next_token）
+  - step_ms
+
+修改位置
+- nanovllm/engine/speculative/spec_engine.py
+- nanovllm/engine/speculative/spec_engine.py
+- nanovllm/engine/speculative/spec_engine.py
+
+4. 顺手修复了你前面指出的 profile 污染
+- warmup 后先 reset profile，再开始计时主跑
+- 避免 warmup 把 run_verify_calls/run_draft_calls 混进来
+
+修改位置
+- examples/heterogeneous_benchmark_case.py
+- examples/heterogeneous_benchmark_case.py
+
+验证结果
+- 新命令已可直接使用 input-len/output-len，并成功输出 JSON：
+  - benchmarks/results/three_mode_smoke_v10_step_trace.json
+- 你要的两个新字段已落盘：
+  - spec_draft_steps_per_step
+  - spec_step_traces
+- 本次样例中可见：
+  - spec_draft_steps_per_step = [4]
+  - step_traces 里 remaining_before=5，draft_steps=4，verify_trace_len=5，accepted_draft_tokens=4
+
+补充说明
+- 这次 v10 里 heter_vs_standard 出现 exact_match=false（spec_vs_standard 仍为 true）。这不是本次参数/trace改动直接目标，但它是一个需要单独跟进的信号，建议下一步针对 heter 路径做一次独立 deterministic 排查。
+
+如果你同意，我可以下一步把 step_traces 再补两个字段，便于更直观看收敛过程：
+1. verify_calls_this_step（通常为 1）
+2. generated_tokens_this_step（该 step 净推进 token 数）
+
+Made changes.
+
+### [results]
+cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27490 --result-json benchmarks/results/three_mode_smoke_v10_step_trace.json
+=== Throughput (output tok/s) ===
+standard=11.08
+heter=10.46
+spec=9.82
+=== Ratios vs standard ===
+heter_output_ratio=0.9433
+spec_output_ratio=0.8856
+=== Deterministic Token Alignment ===
+heter exact=False rate=0.0000
+spec exact=True rate=1.0000
+=== Engine Profile (ms) ===
+standard: step_total=540.17, step_count=6, step_avg=90.03, model_run=536.03, prepare_decode=0.76, prepare_prefill=0.28
+heter: step_total=573.25, step_count=6, step_avg=95.54, model_run=569.29, prepare_decode=0.73, prepare_prefill=0.30
+spec: step_total=610.43, step_count=2, step_avg=305.22, model_run=509.34, prepare_decode=0.60, prepare_prefill=0.31
+Saved report to: benchmarks/results/three_mode_smoke_v10_step_trace.json
+
+# 0
+### [prompt]
+请仔细阅读设计文档nano-vllm-moe/docs/migration_design.md
+
+
+# 10
+### [prompt]
+请重新回顾设计文档migration_design.md和phase2_design.md，仔细review现在的所有实现内容，首先检查是否存在事实或逻辑错误，然后检查是否存在不合理的设计
+
+# 11
+### [prompt]
+请重新回顾设计文档migration_design.md和phase2_design.md，在nano-vllm-moe/docs/summary添加phase2 投机解码框架的实现报告，详细总结本阶段的设计、架构、流程、算法、优化、具体实现等，越详细越好，需要有个修改内容章节，说明修改的文件、实现的api的功能算法等；然后对比migration_design.md文档添加一个对比章节，说明现有实现完成了设计文档中的那些实现以及和设计文档的差距，然后规划下一步需要实现的内容；
+
+
+
+# nexts
+## others
+- logs
+
+
+## step 1
+- cpu
+  - cpu并行+测速
+  - verify加上cpu
+
+- draft纯gpu & cuda graph
+  - draft调度实现纯gpu版本
+  - 测试draft + cuda graph 吞吐
+  - 添加 无top-2跳过机制
+
+## step 2
+
+## step N
+- 仿照KT verify实现cuda graph?
+
+
 
 
 
 # skills
 - nano-vllm-moe环境为moe_spec（conda run -n moe_spec/conda activate moe_spec）
 - 实现时为了优化推理速度，尽量考虑不使用Python循环的实现
+- CUDA_VISIBLE_DEVICES=3
 
 # others
 - CUDA graph：decode throughput影响巨大
   - single: 11.03 tok/s vs 57.56 tok/s
   - bs=3: 29.94 tok/s vs 97.90 tok/s
 
-
-CUDA_VISIBLE_DEVICES=1 python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --min-input-len 8 --max-input-len 12 --min-output-len 4 --max-output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --dist-port-base 27390 --result-json benchmarks/results/three_mode_smoke_v6_fix.json

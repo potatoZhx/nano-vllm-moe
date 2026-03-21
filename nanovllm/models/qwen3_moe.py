@@ -17,6 +17,8 @@ from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowPara
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
+from nanovllm.expert.placement import build_draft_plan, build_prefill_plan
+from nanovllm.scheduling.draft_scheduler import DraftScheduler
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -269,12 +271,14 @@ class Qwen3MoeFusedSparseMoeBlock(nn.Module):
 class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
     def __init__(
         self,
+        layer_idx: int,
         num_experts: int,
         hidden_size: int,
         num_experts_per_tok: int,
         norm_topk_prob: bool,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.num_selected = num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
@@ -283,6 +287,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.act_fn = SiluAndMul()
         self.expert_cache: LayerExpertCache | None = None
         self.cpu_expert_pool: dict[int, dict[str, torch.Tensor]] | None = None
+        self.execution_mode = "normal"
+        self.draft_scheduler: DraftScheduler | None = None
+        self.draft_top_c = 0
 
     def enable_heterogeneous(
         self,
@@ -291,6 +298,16 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
+
+    def set_speculative_execution(
+        self,
+        mode: str,
+        draft_scheduler: DraftScheduler | None = None,
+        draft_top_c: int = 0,
+    ) -> None:
+        self.execution_mode = mode
+        self.draft_scheduler = draft_scheduler
+        self.draft_top_c = draft_top_c
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.expert_cache is None:
@@ -303,6 +320,29 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+        if self.execution_mode == "draft":
+            if self.draft_scheduler is None:
+                raise RuntimeError("Draft execution requires a draft scheduler.")
+            plan = build_draft_plan(
+                layer_idx=self.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                expert_cache=self.expert_cache,
+                draft_scheduler=self.draft_scheduler,
+                num_experts=self.num_experts,
+                top_c=self.draft_top_c,
+            )
+        elif self.execution_mode == "verify":
+            plan = build_prefill_plan(
+                layer_idx=self.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                expert_cache=self.expert_cache,
+                num_experts=self.num_experts,
+            )
+        else:
+            plan = None
+
         return heterogeneous_moe_forward(
             hidden_states=hidden_states,
             selected_experts=selected_experts,
@@ -310,6 +350,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             expert_cache=self.expert_cache,
             cpu_expert_pool=self.cpu_expert_pool,
             act_fn=self.act_fn,
+            plan=plan,
         )
 
 
@@ -347,6 +388,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         ):
             if getattr(config, "enable_heterogeneous", False):
                 self.mlp = Qwen3MoeHeterogeneousSparseMoeBlock(
+                    layer_idx=layer_idx,
                     num_experts=config.num_experts,
                     hidden_size=config.hidden_size,
                     num_experts_per_tok=config.num_experts_per_tok,
@@ -458,6 +500,16 @@ class Qwen3MoeForCausalLM(nn.Module):
                 assert layer_idx in layer_caches, f"No cache for layer {layer_idx}"
                 assert layer_idx in cpu_expert_pool, f"No cpu expert pool for layer {layer_idx}"
                 layer.mlp.enable_heterogeneous(layer_caches[layer_idx], cpu_expert_pool[layer_idx])
+
+    def set_speculative_execution_mode(
+        self,
+        mode: str,
+        draft_scheduler: DraftScheduler | None = None,
+        draft_top_c: int = 0,
+    ) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                layer.mlp.set_speculative_execution(mode, draft_scheduler, draft_top_c)
 
     def load_model(
         self,

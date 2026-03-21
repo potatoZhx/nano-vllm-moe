@@ -28,6 +28,8 @@ class Config:
     spec_verify_eager: bool = True
     spec_enable_prefetch: bool = False
     spec_profile: bool = False
+    engine_profile: bool = False
+    engine_profile_cuda_sync: bool = True
     heterogeneous_slots_per_layer: int = 0
     cpu_expert_pin_memory: bool = True
 

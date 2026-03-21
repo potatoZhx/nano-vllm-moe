@@ -24,7 +24,7 @@ BASE_PROMPTS = [
 def _build_meaningful_prompts(args: argparse.Namespace, rng: Random) -> list[str]:
     prompts: list[str] = []
     for i in range(args.num_seqs):
-        target_words = rng.randint(args.min_input_len, args.max_input_len)
+        target_words = args.input_len
         base = BASE_PROMPTS[i % len(BASE_PROMPTS)]
         context_lines = []
         context_words = 0
@@ -95,6 +95,8 @@ def run_case(args: argparse.Namespace) -> dict:
         enable_heterogeneous=enable_heterogeneous,
         enable_speculative=(mode == "spec"),
         spec_profile=args.spec_profile,
+        engine_profile=args.engine_profile,
+        engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         max_draft_tokens=args.max_draft_tokens,
         heterogeneous_slots_per_layer=args.slots_per_layer,
     )
@@ -104,16 +106,29 @@ def run_case(args: argparse.Namespace) -> dict:
         SamplingParams(
             temperature=args.temperature,
             ignore_eos=True,
-            max_tokens=rng.randint(args.min_output_len, args.max_output_len),
+            max_tokens=args.output_len,
         )
         for _ in range(args.num_seqs)
     ]
 
     llm.generate(["Warmup request for benchmark."], SamplingParams(temperature=args.temperature, max_tokens=4), use_tqdm=False)
+    # Drop warmup counters so profile reflects only the timed benchmark run.
+    if args.engine_profile and hasattr(llm, "get_profile"):
+        llm.get_profile(reset=True)
+    elif mode == "spec" and hasattr(llm, "spec_engine") and hasattr(llm.spec_engine, "get_profile"):
+        llm.spec_engine.get_profile(reset=True)
 
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     elapsed = time.time() - t0
+
+    engine_profile = None
+    spec_profile = None
+    if args.engine_profile and hasattr(llm, "get_profile"):
+        engine_profile = llm.get_profile(reset=True)
+    elif mode == "spec" and hasattr(llm, "spec_engine") and hasattr(llm.spec_engine, "get_profile"):
+        spec_profile = llm.spec_engine.get_profile(reset=True)
+
     llm.exit()
 
     input_tokens = _count_prompt_tokens(llm, prompts)
@@ -129,10 +144,8 @@ def run_case(args: argparse.Namespace) -> dict:
         "slots_per_layer": args.slots_per_layer,
         "max_draft_tokens": args.max_draft_tokens,
         "num_seqs": args.num_seqs,
-        "min_input_len": args.min_input_len,
-        "max_input_len": args.max_input_len,
-        "min_output_len": args.min_output_len,
-        "max_output_len": args.max_output_len,
+        "input_len": args.input_len,
+        "output_len": args.output_len,
         "seed": args.seed,
         "input_tokens": input_tokens,
         "target_output_tokens": target_output_tokens,
@@ -144,8 +157,10 @@ def run_case(args: argparse.Namespace) -> dict:
         "outputs_digest": _hash_many_token_ids(generated_token_ids),
     }
 
-    if mode == "spec" and hasattr(llm, "spec_engine") and hasattr(llm.spec_engine, "get_profile"):
-        result["spec_profile"] = llm.spec_engine.get_profile(reset=True)
+    if engine_profile is not None:
+        result["engine_profile"] = engine_profile
+    elif spec_profile is not None:
+        result["spec_profile"] = spec_profile
 
     if args.return_token_ids:
         result["generated_token_ids"] = generated_token_ids
@@ -164,10 +179,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-heterogeneous", type=str, default="")
     parser.add_argument("--slots-per-layer", type=int, default=0)
     parser.add_argument("--num-seqs", type=int, default=64)
-    parser.add_argument("--min-input-len", type=int, default=64)
-    parser.add_argument("--max-input-len", type=int, default=512)
-    parser.add_argument("--min-output-len", type=int, default=32)
-    parser.add_argument("--max-output-len", type=int, default=128)
+    parser.add_argument("--input-len", type=int, default=128)
+    parser.add_argument("--output-len", type=int, default=64)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--dist-port", type=int, default=2333)
@@ -175,6 +188,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--enforce-eager", type=str2bool, default=True)
     parser.add_argument("--spec-profile", type=str2bool, default=False)
+    parser.add_argument("--engine-profile", type=str2bool, default=False)
+    parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--return-token-ids", type=str2bool, default=False)
     parser.add_argument("--return-text", type=str2bool, default=True)
     parser.add_argument("--return-prompts", type=str2bool, default=True)

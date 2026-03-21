@@ -1,5 +1,6 @@
 import atexit
 from dataclasses import fields
+from collections import defaultdict
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -34,7 +35,27 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.spec_engine = SpeculativeEngine(self.model_runner, self.scheduler, config)
+        self.profile_enabled = bool(getattr(config, "engine_profile", False))
+        self._profile = defaultdict(float)
         atexit.register(self.exit)
+
+    def get_profile(self, reset: bool = False) -> dict:
+        """Return merged engine/model/spec profile counters on rank-0 process."""
+        out = {}
+        if self.profile_enabled:
+            out.update({
+                k: (int(v) if k.endswith("_count") else float(v))
+                for k, v in self._profile.items()
+            })
+        if hasattr(self.model_runner, "get_profile"):
+            model_profile = self.model_runner.get_profile(reset=reset)
+            out.update({f"model_{k}": v for k, v in model_profile.items()})
+        if hasattr(self.spec_engine, "get_profile"):
+            spec_profile = self.spec_engine.get_profile(reset=reset)
+            out.update({f"spec_{k}": v for k, v in spec_profile.items()})
+        if reset and self.profile_enabled:
+            self._profile.clear()
+        return out
 
     def exit(self):
         model_runner = getattr(self, "model_runner", None)
@@ -54,23 +75,53 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        step_t0 = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
+        if self.profile_enabled:
+            self._profile["step_count"] += 1
+            self._profile["scheduled_seqs_total"] += len(seqs)
+            if is_prefill:
+                self._profile["prefill_step_count"] += 1
+            elif self.config.inference_mode == "spec":
+                self._profile["spec_step_count"] += 1
+            else:
+                self._profile["decode_step_count"] += 1
+
         if is_prefill:
+            t0 = perf_counter()
             token_ids = self.model_runner.call("run", seqs, True)
+            if self.profile_enabled:
+                self._profile["prefill_runner_ms"] += (perf_counter() - t0) * 1000.0
+            t1 = perf_counter()
             self.scheduler.postprocess(seqs, token_ids)
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             num_tokens = sum(len(seq) for seq in seqs)
+            if self.profile_enabled:
+                self._profile["postprocess_ms"] += (perf_counter() - t1) * 1000.0
+                self._profile["step_ms"] += (perf_counter() - step_t0) * 1000.0
             return outputs, num_tokens
         elif self.config.inference_mode == "spec":
+            t0 = perf_counter()
             token_ids = self.spec_engine.speculative_step(seqs)
+            if self.profile_enabled:
+                self._profile["spec_engine_ms"] += (perf_counter() - t0) * 1000.0
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             num_tokens = -len(seqs)
+            if self.profile_enabled:
+                self._profile["step_ms"] += (perf_counter() - step_t0) * 1000.0
             return outputs, num_tokens
         else:
+            t0 = perf_counter()
             token_ids = self.model_runner.call("run", seqs, False)
+            if self.profile_enabled:
+                self._profile["decode_runner_ms"] += (perf_counter() - t0) * 1000.0
+        t1 = perf_counter()
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        if self.profile_enabled:
+            self._profile["postprocess_ms"] += (perf_counter() - t1) * 1000.0
+            self._profile["step_ms"] += (perf_counter() - step_t0) * 1000.0
         return outputs, num_tokens
 
     def is_finished(self):
