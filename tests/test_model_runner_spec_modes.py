@@ -25,6 +25,10 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr.model = _DummyModel()
         mr.config = SimpleNamespace(draft_top_c=2)
         mr.draft_scheduler = object()
+        mr.profile_enabled = False
+        mr.profile_cuda_sync = False
+        mr.rank = 0
+        mr._profile = {}
         mr.run = lambda seqs, is_prefill: [7 for _ in seqs]
 
         out, aux = ModelRunner.run_draft(mr, [SimpleNamespace(seq_id=1)])
@@ -39,8 +43,11 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr.model = _DummyModel()
         mr.config = SimpleNamespace(draft_top_c=1)
         mr.draft_scheduler = object()
+        mr.profile_enabled = False
+        mr.profile_cuda_sync = False
         mr.world_size = 1
         mr.rank = 0
+        mr._profile = {}
         mr.prepare_prefill = lambda seqs: (torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
 
         traces = ModelRunner.run_verify(mr, [SimpleNamespace(seq_id=1)], [3])

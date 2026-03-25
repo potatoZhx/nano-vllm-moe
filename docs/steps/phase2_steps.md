@@ -2309,7 +2309,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVIC
 Made changes.
 
 ### [results]
-cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27490 --result-json benchmarks/results/three_mode_smoke_v10_step_trace.json
+cd /zx_data1/sparsity/nano-vllm-moe && CUDA_VISIBLE_DEVICES=3 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27490 --result-json benchmarks/results/three_mode_smoke_test_step_trace.json
 === Throughput (output tok/s) ===
 standard=11.08
 heter=10.46
@@ -2326,18 +2326,228 @@ heter: step_total=573.25, step_count=6, step_avg=95.54, model_run=569.29, prepar
 spec: step_total=610.43, step_count=2, step_avg=305.22, model_run=509.34, prepare_decode=0.60, prepare_prefill=0.31
 Saved report to: benchmarks/results/three_mode_smoke_v10_step_trace.json
 
-# 0
-### [prompt]
-请仔细阅读设计文档nano-vllm-moe/docs/migration_design.md
 
 
 # 10
 ### [prompt]
-请重新回顾设计文档migration_design.md和phase2_design.md，仔细review现在的所有实现内容，首先检查是否存在事实或逻辑错误，然后检查是否存在不合理的设计
+请仔细review现在的所有实现内容，首先检查是否存在事实或逻辑错误，审查代码的正确性和实现质量（比如是否遵循设计模式等），检查是否存在不合理的设计；
+然后请重新回顾设计文档migration_design.md和phase2_design.md，在nano-vllm-moe/docs/summary添加phase2 投机解码框架的实现报告，详细总结本阶段的设计、架构、流程、算法、优化、具体实现等，越详细越好，需要有个修改内容章节，说明修改的文件、实现的api的功能算法等；
+然后添加一个对比章节，说明现有实现完成了设计文档中的那些实现以及和设计文档的差距：
+  - 提炼设计文档中的关键约束和验收点
+  - 将每个验收点映射到具体代码位置
+  - 判断哪些已实现、哪些未实现、哪些实现偏离设计
+  - 识别边界条件、异常处理、兼容性、性能、权限、并发方面的问题
+  - 标记设计未覆盖但代码新增的行为
+  - 输出明确的整改建议和优先级
+  对于每个设计点，使用下面格式：
+    - 设计点：
+    - 文档要求：
+    - 代码实现位置：
+    - 实现说明：
+    - 结论：符合 / 不符合 / 部分符合 / 无法判断
+    - 依据：
+  每个问题使用下面格式：
+    - 问题：
+    - 对应设计要求：
+    - 代码位置：
+    - 风险说明：
+    - 建议修改：
+
+### [response]
+我将先做两步并行核查：一是对照 migration_design 与 phase2_design 提炼验收点，二是逐文件审查当前 spec 主链实现与测试覆盖，先产出问题清单，再把完整实现报告写入 docs/summary。接下来我先读取设计文档和当前核心代码。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#1-1)，行 1 到 420
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#1-1)，行 1 到 420
+
+我已经拿到两份设计文档的上半部分和 summary 目录现状，下一步会继续读完设计文档后半段，并审查当前实现与测试，重点找逻辑错误、设计偏差和验收点覆盖缺口。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/migration_design.md#421-421)，行 421 到 900
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/phase2_design.md#421-421)，行 421 到 733
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/spec_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/model_runner.py)
+
+接下来我会继续做代码审查补全证据链，重点检查 Sequence/BlockManager/Scheduler 的 KV 生命周期一致性、qwen3_moe 的 draft/verify 分流是否符合设计，以及测试是否覆盖关键边界。
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/sequence.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/block_manager.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/scheduler.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/models/qwen3_moe.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/speculative/acceptance.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/scheduling/draft_scheduler.py)
+
+搜索与 `sparsity` · `nano-vllm-moe/tests/**/*.py` 匹配的文件，12 匹配项
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/three_mode_speed_compare.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/cache.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/utils/heterogeneous_loader.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_model_runner_spec_modes.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_block_manager_draft.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_scheduler_draft_kv.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_placement_spec.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_spec_engine_flow.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_mode_config.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_acceptance.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_draft_scheduler.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_spec_engine_basic.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/tests/test_llm_engine_mode_dispatch.py)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase1_cpu_gpu_basic_heterogeneous_report.md#1-1)，行 1 到 320
+
+我已经完成主体代码与测试的审读，下一步会固化为两份输出：先列出高优先级问题与设计偏差证据，再把完整 Phase2 实现报告写入 docs/summary。为保证可追溯，我先抓取关键函数行号。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && rg -n "class SpeculativeEngine|def _budget_draft_steps|def speculative_step|def _maybe_mark_finished|acceptance_strategy|spec_verify_eager|spec_enable_prefetch|draft_scheduler" nanovllm/engine/speculative/spec_engine.py nanovllm/config.py
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && rg -n "class SpeculativeEngine|def _budget_draft_steps|def speculative_step|def _maybe_mark_finished|acceptance_strategy|spec_verify_eager|spec_enable_prefetch|draft_scheduler" nanovllm/engine/speculative/spec_engine.py nanovllm/config.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -nE "class SpeculativeEngine|def _budget_draft_steps|def speculative_step|def _maybe_mark_finished|acceptance_strategy|spec_verify_eager|spec_enable_prefetch|draft_scheduler" nanovllm/engine/speculative/spec_engine.py nanovllm/config.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -nE "def run_draft|def run_verify|def _set_speculative_execution_mode|def run\(|prepare_prefill|set_speculative_execution_mode|set_speculative_execution" nanovllm/engine/model_runner.py nanovllm/models/qwen3_moe.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -nE "def build_prefill_plan|def build_draft_plan|def build_moe_execution_plan|class MoEExecutionPlan|def heterogeneous_moe_forward" nanovllm/expert/placement.py nanovllm/layers/fuse_moe/heterogeneous.py
+
+我拿到了关键实现点行号，接下来会补抓测试覆盖和 benchmark 入口行号，然后直接生成完整报告文档。之后我会在回复里先给你“审查发现清单（按严重度）”，再给报告落地路径和主要结论。
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -nE "def run_case|def parse_args|input-len|output-len|engine_profile|spec_profile|def step\(|elif self.config.inference_mode == \"spec\"|def get_profile" examples/three_mode_speed_compare.py examples/heterogeneous_benchmark_case.py nanovllm/engine/llm_engine.py tests/test_spec_engine_flow.py tests/test_model_runner_spec_modes.py tests/test_placement_spec.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -RIn "GreedyAcceptance\|StandardAcceptance\|create_acceptance\|acceptance_strategy" nanovllm tests | head -n 80
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -RIn "SimpleDraftScheduler\|draft_scheduler" nanovllm/engine/model_runner.py nanovllm/config.py nanovllm/scheduling/draft_scheduler.py
+
+搜索匹配 `sparsity` · `nano-vllm-moe/nanovllm/**/*spec_scheduler*.py` 的文件，无匹配项
+
+搜索匹配 `sparsity` · `nano-vllm-moe/nanovllm/**/*prefetcher*.py` 的文件，无匹配项
+
+搜索匹配 `sparsity` · `nano-vllm-moe/nanovllm/**/*cache_strategy*.py` 的文件，无匹配项
+
+搜索匹配 `sparsity` · `nano-vllm-moe/nanovllm/**/*prefetch_strategy*.py` 的文件，无匹配项
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -nE "for expert_idx in cpu_experts.unique|to\(device=hidden_states.device|ThreadPool|cpu_route_indices" nanovllm/layers/fuse_moe/heterogeneous.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -n "num_tokens = -len(seqs)" nanovllm/engine/llm_engine.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -n "Sampling mode fallback" -n nanovllm/engine/speculative/spec_engine.py
+
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && grep -n "return token_ids, \[\]" nanovllm/engine/model_runner.py
+
+我已完成审查证据收集，接下来直接落地你要的文档产物：在 docs/summary 新增一份 Phase2 投机解码实现报告，包含实现细节、修改清单、逐设计点对照、差距与整改优先级。写完后我会再做一次自检，确保格式满足你给的模板。
+
+已创建 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase2_speculative_decoding_report.md)
+
+读取 [](file:///zx_data1/sparsity/nano-vllm-moe/docs/summary/phase2_speculative_decoding_report.md#1-1)，行 1 到 120
+
+已完成你要求的全量审查，并新增了 Phase2 实现报告文档。
+
+先给审查发现（按严重度）：
+
+1. P0：接受策略接口已实现但未接入运行主链  
+- 现象：配置有 acceptance_strategy，但 speculative 过程仍是内联 greedy 比对，没有使用策略对象。  
+- 证据：  
+  - 配置字段在 nanovllm/config.py  
+  - 策略类在 nanovllm/engine/speculative/acceptance.py  
+  - 主流程在 nanovllm/engine/speculative/spec_engine.py  
+- 风险：配置与真实行为不一致，后续标准接受策略实验不可用。
+
+2. P0：draft_scheduler 配置未生效（当前硬编码 simple）  
+- 现象：虽然有配置字段，但运行时直接实例化 SimpleDraftScheduler。  
+- 证据：  
+  - 配置字段在 nanovllm/config.py  
+  - 硬编码实例化在 nanovllm/engine/model_runner.py  
+- 风险：策略可插拔能力未真正落地，后续扩展会反复改主链。
+
+3. P1：CPU fallback 路径与设计并行模型有偏差，且热路径存在 Python 循环与重复搬运  
+- 现象：当前 CPU expert 逐个循环执行，并在每轮将权重 to(device)。  
+- 证据：  
+  - CPU route 分支在 nanovllm/layers/fuse_moe/heterogeneous.py  
+  - 逐 expert 循环在 nanovllm/layers/fuse_moe/heterogeneous.py  
+  - 重复搬运在 nanovllm/layers/fuse_moe/heterogeneous.py  
+- 风险：S<N/uncached 场景吞吐会明显退化，不利于后续性能目标。
+
+4. P1：spec 分支 token 统计口径偏保守，吞吐展示可能失真  
+- 现象：spec 分支固定 num_tokens=-len(seqs)，无法反映每轮多 token 接受。  
+- 证据： nanovllm/engine/llm_engine.py  
+- 风险：decode 吞吐与阶段分析可能被低估或误判。
+
+5. P1：sampling 场景在 spec 模式下当前是回退普通 decode，不走 draft-verify-accept  
+- 现象：temperature>0 直接 fallback。  
+- 证据： nanovllm/engine/speculative/spec_engine.py  
+- 风险：用户在 sampling 下选择 spec 时，行为与“spec 模式”直觉不一致（建议文档明确或补策略）。
+
+6. P1：migration 设计中的若干模块尚未落地  
+- 现象：spec_scheduler、prefetcher、cache_strategy、prefetch_strategy 文件与接线缺失。  
+- 风险：后续优化路径虽有方向但承载模块不完整，改造成本上升。
+
+已新增报告文档：
+- docs/summary/phase2_speculative_decoding_report.md
+
+这份报告已包含你要求的全部内容：
+1. 事实/逻辑正确性与实现质量审查  
+2. phase2 与 migration 设计回顾  
+3. 详细实现总结（设计、架构、流程、算法、优化、具体实现）  
+4. 修改内容章节（逐文件、逐 API、算法说明）  
+5. 对比章节（关键约束与验收点提炼、代码映射、符合性结论、依据）  
+6. 问题章节（按你指定格式：问题/对应设计要求/代码位置/风险说明/建议修改）  
+7. 设计未覆盖但代码新增行为  
+8. 明确整改建议与优先级，以及下一步计划
+
+如果你希望，我可以下一步直接按报告中的 P0 清单提交一组最小改动补丁：先把 acceptance_strategy 与 draft_scheduler 工厂化接入主链，并补对应参数化测试。
+
+Made changes.
 
 # 11
 ### [prompt]
-请重新回顾设计文档migration_design.md和phase2_design.md，在nano-vllm-moe/docs/summary添加phase2 投机解码框架的实现报告，详细总结本阶段的设计、架构、流程、算法、优化、具体实现等，越详细越好，需要有个修改内容章节，说明修改的文件、实现的api的功能算法等；然后对比migration_design.md文档添加一个对比章节，说明现有实现完成了设计文档中的那些实现以及和设计文档的差距，然后规划下一步需要实现的内容；
+好的，请先把 acceptance_strategy 与 draft_scheduler 工厂化接入主链并补齐测试，但不要修改当前使用的策略；修改完后更新文档，补充相关实现，删除相关问题
+
+### [response]
+
+
+
+# 0
+### [prompt]
+请仔细阅读设计文档nano-vllm-moe/docs/migration_design.md，现在，我需要在投机解码的实现之后添加：
+1.cpu专家计算并行：
+  - 实现CPU专家计算的算子优化
+  - 实现CPU专家计算和GPU专家计算的并行
+  - 增加一个测速：测试对于单层moe的推理，比如总激活8个专家，测试其中有0～10个专家由CPU计算时分别的推理延迟
+  - 测试verify真正加上cpu专家计算的推理性能：测试有25%，50%，75%的专家在CPU上不在GPU时的推理，记录延迟、CPU计算专家比例等数据
+
+2.调度纯gpu & draft支持cuda graph
+  - 请仔细阅读现有的heter, draft, verify阶段的调度的实现，评估能否实现纯GPU上的调度，即不需要将激活信息传输到CPU上做调度；如果不能的话请和我讨论，可以的话请设计实现方案和具体算法
+  - 请设计功能：draft_top_c=0时，draft支持cuda graph
+  - 测试draft + cuda graph 吞吐
+
+  Draft CUDA Graph 还是需要覆盖多序列；另外由于draft阶段需要记录路由激活信息并行传输，我不确定会不会影响到cuda graph，如果会的话，我的设想是：
 
 
 
@@ -2374,4 +2584,8 @@ Saved report to: benchmarks/results/three_mode_smoke_v10_step_trace.json
 - CUDA graph：decode throughput影响巨大
   - single: 11.03 tok/s vs 57.56 tok/s
   - bs=3: 29.94 tok/s vs 97.90 tok/s
+
+CUDA_VISIBLE_DEVICES=3 python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --spec-profile true --engine-profile true --engine-profile-cuda-sync true --dist-port-base 27490 --result-json benchmarks/results/three_mode_smoke_test_step_trace.json
+
+
 

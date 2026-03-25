@@ -2,10 +2,17 @@ import unittest
 
 import torch
 
-from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler
+from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler, create_draft_scheduler
 
 
 class TestSimpleDraftScheduler(unittest.TestCase):
+    def test_factory_returns_simple_scheduler(self):
+        self.assertIsInstance(create_draft_scheduler("simple"), SimpleDraftScheduler)
+
+    def test_factory_rejects_unknown_scheduler(self):
+        with self.assertRaises(ValueError):
+            create_draft_scheduler("unknown")
+
     def test_select_cpu_experts(self):
         scheduler = SimpleDraftScheduler()
         uncached = [3, 5, 7]

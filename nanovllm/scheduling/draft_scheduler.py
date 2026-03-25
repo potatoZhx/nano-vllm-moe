@@ -79,3 +79,10 @@ class SimpleDraftScheduler(DraftScheduler):
         cache_capacity: int,
     ) -> list[tuple[int, int]]:
         return []
+
+
+def create_draft_scheduler(name: str) -> DraftScheduler:
+    normalized = name.strip().lower()
+    if normalized == "simple":
+        return SimpleDraftScheduler()
+    raise ValueError(f"Unsupported draft scheduler: {name}")

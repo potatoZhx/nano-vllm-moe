@@ -11,7 +11,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler
+from nanovllm.scheduling.draft_scheduler import create_draft_scheduler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
@@ -47,7 +47,7 @@ class ModelRunner:
             loader = HeterogeneousModelLoader(config)
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
             self.model.enable_heterogeneous_mode(layer_caches, cpu_expert_pool)
-            self.draft_scheduler = SimpleDraftScheduler()
+            self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None

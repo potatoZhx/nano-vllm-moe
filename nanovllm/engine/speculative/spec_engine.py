@@ -5,6 +5,7 @@ from copy import deepcopy
 from time import perf_counter
 
 from nanovllm.engine.sequence import SequenceStatus
+from nanovllm.engine.speculative.acceptance import create_acceptance_strategy
 
 
 class SpeculativeEngine:
@@ -19,6 +20,9 @@ class SpeculativeEngine:
         self.scheduler = scheduler
         self.config = config
         self.max_draft_tokens = getattr(config, "max_draft_tokens", 5)
+        strategy_name = getattr(config, "acceptance_strategy", "greedy")
+        threshold = getattr(config, "acceptance_threshold", 0.7)
+        self.acceptance_strategy = create_acceptance_strategy(strategy_name, threshold=threshold)
         self.profile_enabled = getattr(config, "spec_profile", False)
         self._profile = defaultdict(float)
         self._draft_steps_per_step: list[int] = []
@@ -145,11 +149,8 @@ class SpeculativeEngine:
         for seq in seqs:
             draft_tokens = draft_tokens_map[seq.seq_id]
             verify_tokens = verify_tokens_map[seq.seq_id]
-            num_accepted = 0
-            for draft_tok, verify_tok in zip(draft_tokens, verify_tokens):
-                if draft_tok != verify_tok:
-                    break
-                num_accepted += 1
+            accept_result = self.acceptance_strategy.accept(draft_tokens, verify_tokens, seq.temperature)
+            num_accepted = int(accept_result["num_accepted"])
 
             # Keep accepted draft prefix in KV, then append one verify token in token list.
             keep_after_start = num_accepted

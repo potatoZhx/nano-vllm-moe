@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from nanovllm.engine.speculative.acceptance import GreedyAcceptance
 from nanovllm.engine.speculative.spec_engine import SpeculativeEngine
 
 
@@ -18,9 +19,15 @@ class _DummyScheduler:
 
 
 class TestSpecEngineBasic(unittest.TestCase):
+    def test_acceptance_strategy_is_wired_from_config(self):
+        mr = _DummyModelRunner()
+        config = SimpleNamespace(max_draft_tokens=4, acceptance_strategy="greedy", acceptance_threshold=0.7)
+        engine = SpeculativeEngine(model_runner=mr, scheduler=_DummyScheduler(), config=config)
+        self.assertIsInstance(engine.acceptance_strategy, GreedyAcceptance)
+
     def test_spec_engine_returns_token_ids(self):
         mr = _DummyModelRunner()
-        config = SimpleNamespace(max_draft_tokens=4)
+        config = SimpleNamespace(max_draft_tokens=4, acceptance_strategy="greedy", acceptance_threshold=0.7)
         engine = SpeculativeEngine(model_runner=mr, scheduler=_DummyScheduler(), config=config)
         seqs = [SimpleNamespace(seq_id=1), SimpleNamespace(seq_id=2)]
 
