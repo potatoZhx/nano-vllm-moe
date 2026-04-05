@@ -38,6 +38,8 @@ def run_case(case_script: Path, args: argparse.Namespace, mode: str) -> dict:
         str(args.output_len),
         "--max-model-len",
         str(args.max_model_len),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
         "--max-draft-tokens",
         str(args.max_draft_tokens),
         "--dist-port",
@@ -137,6 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-len", type=int, default=64)
     parser.add_argument("--output-len", type=int, default=24)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--dist-port-base", type=int, default=26000)
     parser.add_argument("--seed", type=int, default=0)

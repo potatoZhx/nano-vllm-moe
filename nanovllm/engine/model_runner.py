@@ -46,16 +46,24 @@ class ModelRunner:
         if config.enable_heterogeneous and hasattr(self.model, "enable_heterogeneous_mode"):
             loader = HeterogeneousModelLoader(config)
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
-            self.model.enable_heterogeneous_mode(layer_caches, cpu_expert_pool)
+            self.model.enable_heterogeneous_mode(
+                layer_caches,
+                cpu_expert_pool,
+                cpu_expert_execution_enabled=getattr(config, "cpu_expert_execution_enabled", False),
+                cpu_expert_parallel_mode=getattr(config, "cpu_expert_parallel_mode", "serial"),
+                cpu_expert_num_threads=getattr(config, "cpu_expert_num_threads", 4),
+            )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None
+        self._decode_graph_policy = "standard"
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+            self.capture_draft_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -76,6 +84,10 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "draft_graphs"):
+                del self.draft_graphs
+            if hasattr(self, "draft_graph_pool"):
+                del self.draft_graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -117,9 +129,31 @@ class ModelRunner:
         if self.rank != 0:
             return {}
         out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+        decode_count = int(self._profile.get("decode_count", 0))
+        graph_hit_count = int(self._profile.get("graph_hit_count", 0))
+        out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
+        profile_count = float(self._profile.get("moe_profile_count", 0.0))
+        if profile_count > 0:
+            out["cpu_route_ratio"] = float(self._profile.get("cpu_route_ratio_sum", 0.0) / profile_count)
+            out["cpu_weight_mass_ratio"] = float(self._profile.get("cpu_weight_mass_ratio_sum", 0.0) / profile_count)
+            out["activated_expert_set_size"] = float(self._profile.get("activated_expert_set_size_sum", 0.0) / profile_count)
+            out["realized_cpu_expert_count"] = float(self._profile.get("realized_cpu_expert_count_sum", 0.0) / profile_count)
+        else:
+            out["cpu_route_ratio"] = 0.0
+            out["cpu_weight_mass_ratio"] = 0.0
+            out["activated_expert_set_size"] = 0.0
+            out["realized_cpu_expert_count"] = 0.0
         if reset:
             self._profile.clear()
         return out
+
+    def _run_model_eager(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        logits = self.model.compute_logits(self.model(input_ids, positions))
+        if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
+            prof = self.model.get_and_reset_heterogeneous_profile()
+            for key, value in prof.items():
+                self._profile[key] = float(self._profile.get(key, 0.0) + value)
+        return logits
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -222,21 +256,66 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self._run_model_eager(input_ids, positions)
+
+        if self._decode_graph_policy == "draft":
+            if self._can_use_draft_cudagraph(input_ids.size(0)):
+                return self._replay_draft_graph(input_ids, positions)
+            # Correctness-first: draft mode must not replay standard decode graph.
+            return self._run_model_eager(input_ids, positions)
+
+        return self._replay_standard_graph(input_ids, positions)
+
+    def _replay_standard_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        if self.profile_enabled and self.rank == 0:
+            self._profile["graph_replay_count"] += 1
+            self._profile["graph_hit_count"] += 1
+            self._profile["standard_graph_replay_count"] += 1
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    def _replay_draft_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.draft_graphs[next(x for x in self.draft_graph_bs if x >= bs)]
+        graph_vars = self.draft_graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        if self.profile_enabled and self.rank == 0:
+            self._profile["graph_replay_count"] += 1
+            self._profile["graph_hit_count"] += 1
+            self._profile["draft_graph_replay_count"] += 1
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    def _can_use_draft_cudagraph(self, bs: int) -> bool:
+        if not getattr(self.config, "draft_cuda_graph_enabled", True):
+            return False
+        if self.enforce_eager:
+            return False
+        if getattr(self.config, "draft_top_c", 0) != 0:
+            return False
+        if bs > getattr(self.config, "draft_cuda_graph_max_bs", 512):
+            return False
+        if not hasattr(self, "draft_graphs") or not self.draft_graphs:
+            return False
+        return any(bucket >= bs for bucket in self.draft_graph_bs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         t0 = perf_counter()
@@ -278,10 +357,12 @@ class ModelRunner:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
         t0 = perf_counter()
         self._set_speculative_execution_mode("draft")
+        self._decode_graph_policy = "draft"
         try:
             token_ids = self.run(seqs, False)
             return token_ids, []
         finally:
+            self._decode_graph_policy = "standard"
             self._set_speculative_execution_mode("normal")
             if self.profile_enabled:
                 if self.profile_cuda_sync:
@@ -304,6 +385,10 @@ class ModelRunner:
         try:
             t0 = perf_counter()
             hidden_states = self.model(input_ids, positions)
+            if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
+                prof = self.model.get_and_reset_heterogeneous_profile()
+                for key, value in prof.items():
+                    self._profile[key] = float(self._profile.get(key, 0.0) + value)
             logits = F.linear(hidden_states, self.model.lm_head.weight)
             if self.world_size > 1:
                 if self.rank == 0:
@@ -365,6 +450,63 @@ class ModelRunner:
             reset_context()
 
         self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_draft_cudagraph(self):
+        self.draft_graphs = {}
+        self.draft_graph_pool = None
+        self.draft_graph_bs = []
+
+        if not getattr(self.config, "draft_cuda_graph_enabled", True):
+            return
+        if getattr(self.config, "draft_top_c", 0) != 0:
+            # Graph-safe subset: draft graph capture is only enabled for top_c == 0.
+            return
+
+        config = self.config
+        hf_config = config.hf_config
+        max_bs = min(self.config.max_num_seqs, getattr(config, "draft_cuda_graph_max_bs", 512))
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+
+        bucket_steps = sorted(set(int(x) for x in getattr(config, "draft_cuda_graph_bucket_steps", [1, 2, 4, 8]) if int(x) >= 1))
+        self.draft_graph_bs = [x for x in bucket_steps if x <= max_bs]
+        if max_bs >= 16:
+            self.draft_graph_bs += list(range(16, max_bs + 1, 16))
+        self.draft_graph_bs = sorted(set(self.draft_graph_bs))
+
+        if not self.draft_graph_bs:
+            return
+
+        self._set_speculative_execution_mode("draft")
+        try:
+            for bs in reversed(self.draft_graph_bs):
+                graph = torch.cuda.CUDAGraph()
+                set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                with torch.cuda.graph(graph, self.draft_graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                if self.draft_graph_pool is None:
+                    self.draft_graph_pool = graph.pool()
+                self.draft_graphs[bs] = graph
+                torch.cuda.synchronize()
+                reset_context()
+        finally:
+            self._set_speculative_execution_mode("normal")
+
+        self.draft_graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,

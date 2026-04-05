@@ -109,6 +109,8 @@ class TestSpecEngineFlow(unittest.TestCase):
         self.assertIn(("start", 1), scheduler.ops)
         self.assertIn(("rollback", 1), scheduler.ops)
         self.assertIn(("accept", 1, 2), scheduler.ops)
+        append_ops = [x for x in scheduler.ops if x[0] == "append"]
+        self.assertEqual(len(append_ops), 2)
 
     def test_accept_next_token_uses_clamped_keep_prefix(self):
         seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0, max_tokens=2)

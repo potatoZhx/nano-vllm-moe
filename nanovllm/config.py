@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
@@ -32,6 +32,15 @@ class Config:
     engine_profile_cuda_sync: bool = True
     heterogeneous_slots_per_layer: int = 0
     cpu_expert_pin_memory: bool = True
+    cpu_expert_execution_enabled: bool = False
+    cpu_expert_num_threads: int = 4
+    cpu_expert_parallel_mode: str = "serial"
+    gpu_plan_builder_enabled: bool = False
+    gpu_plan_builder_fallback: bool = True
+    draft_cuda_graph_enabled: bool = True
+    draft_cuda_graph_max_bs: int = 512
+    draft_cuda_graph_bucket_steps: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    perf_profile_level: str = "basic"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -64,6 +73,12 @@ class Config:
 
         assert self.max_draft_tokens >= 1
         assert self.draft_top_c >= 0
+        assert self.cpu_expert_num_threads >= 1
+        assert self.cpu_expert_parallel_mode in {"serial", "expert_parallel"}
+        assert self.perf_profile_level in {"basic", "detailed"}
+        assert self.draft_cuda_graph_max_bs >= 1
+        assert len(self.draft_cuda_graph_bucket_steps) > 0
+        assert all(x >= 1 for x in self.draft_cuda_graph_bucket_steps)
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

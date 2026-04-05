@@ -95,7 +95,7 @@ class SpeculativeEngine:
 
         draft_tokens_map = {seq.seq_id: [] for seq in seqs}
         t0 = perf_counter()
-        for _ in range(draft_steps):
+        for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
             draft_result = self.model_runner.call("run_draft", seqs)
             self._profile["run_draft_infer_ms_total"] += (perf_counter() - infer_t0) * 1000.0
@@ -107,7 +107,12 @@ class SpeculativeEngine:
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_draft_token(token_id)
                 draft_tokens_map[seq.seq_id].append(token_id)
-                self.scheduler.append_draft_kv(seq)
+
+            # schedule() already reserved the first decode append slot.
+            # For multi-draft decoding, reserve the next slot between iterations.
+            if step_idx + 1 < draft_steps:
+                for seq in seqs:
+                    self.scheduler.append_draft_kv(seq)
         self._profile["draft_loop_ms"] += (perf_counter() - t0) * 1000.0
         self._profile["run_draft_calls"] += draft_steps
 
@@ -124,9 +129,12 @@ class SpeculativeEngine:
         t0 = perf_counter()
         for seq in seqs:
             draft_tokens = draft_tokens_map[seq.seq_id]
-            for token_id in draft_tokens:
+            for i, token_id in enumerate(draft_tokens):
+                # Reuse the slot reserved by schedule() for the first token,
+                # then reserve one extra slot before each subsequent token.
+                if i > 0:
+                    self.scheduler.append_draft_kv(seq)
                 seq.append_token(token_id)
-                self.scheduler.append_draft_kv(seq)
             # Recompute from last accepted token (num_tokens before draft) and drafts.
             seq.num_cached_tokens = seq._draft_start_num_tokens - 1
             verify_lengths.append(len(draft_tokens) + 1)

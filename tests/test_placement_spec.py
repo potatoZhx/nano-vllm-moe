@@ -38,6 +38,9 @@ class TestPlacementSpec(unittest.TestCase):
         )
         self.assertEqual(plan.gpu_route_indices.tolist(), [0, 1, 3])
         self.assertEqual(plan.cpu_route_indices.tolist(), [2])
+        self.assertIsNotNone(plan.gpu_m_sizes)
+        self.assertIsNotNone(plan.cpu_task_expert_ids)
+        self.assertIsNotNone(plan.cpu_task_offsets)
 
     def test_draft_plan_applies_substitution(self):
         cache = self._build_cache()
@@ -55,6 +58,29 @@ class TestPlacementSpec(unittest.TestCase):
         )
         self.assertGreaterEqual(len(plan.substitution_map), 1)
         self.assertIsNotNone(plan.m_sizes)
+        self.assertIsNotNone(plan.substitution_lut)
+        self.assertIsNotNone(plan.gpu_route_mask)
+        self.assertIsNotNone(plan.cpu_route_mask)
+        # top_c=1 should keep one uncached expert on CPU and substitute the other.
+        self.assertIsNotNone(plan.cpu_route_indices)
+        self.assertEqual(plan.cpu_route_indices.tolist(), [2])
+
+    def test_draft_plan_topc_zero_prefers_gpu_substitution(self):
+        cache = self._build_cache()
+        selected = torch.tensor([0, 4, 5, 2], dtype=torch.int64)
+        routing_w = torch.tensor([[0.9, 0.1], [0.6, 0.4]], dtype=torch.float32)
+        scheduler = SimpleDraftScheduler()
+        plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=0,
+        )
+        self.assertTrue(plan.cpu_route_indices is None or plan.cpu_route_indices.numel() == 0)
+        self.assertTrue(plan.gpu_route_indices.numel() > 0)
 
 
 if __name__ == "__main__":

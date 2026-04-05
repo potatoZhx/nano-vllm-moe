@@ -28,6 +28,26 @@ class TestSimpleDraftScheduler(unittest.TestCase):
         self.assertEqual(mapping[11], 2)
         self.assertEqual(mapping[12], 1)
 
+    def test_select_cpu_experts_gpu(self):
+        scheduler = SimpleDraftScheduler()
+        uncached_mask = torch.zeros(8, dtype=torch.bool)
+        uncached_mask[torch.tensor([3, 5, 7])] = True
+        selected = torch.tensor([3, 3, 5, 7, 7, 7], dtype=torch.int64)
+        weights = torch.tensor([0.9, 0.1, 0.2, 0.4, 0.3, 0.2], dtype=torch.float32)
+        picked_mask = scheduler.select_cpu_experts_gpu(uncached_mask, weights, selected, top_c=2)
+        self.assertEqual(torch.nonzero(picked_mask, as_tuple=False).flatten().tolist(), [3, 7])
+
+    def test_build_substitution_lut_gpu(self):
+        scheduler = SimpleDraftScheduler()
+        cpu_mask = torch.zeros(8, dtype=torch.bool)
+        cpu_mask[torch.tensor([5, 6, 7])] = True
+        cached_mask = torch.zeros(8, dtype=torch.bool)
+        cached_mask[torch.tensor([1, 2])] = True
+        lut = scheduler.build_substitution_lut_gpu(cpu_mask, cached_mask, num_experts=8, device=torch.device("cpu"))
+        self.assertEqual(int(lut[5].item()), 1)
+        self.assertEqual(int(lut[6].item()), 2)
+        self.assertEqual(int(lut[7].item()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

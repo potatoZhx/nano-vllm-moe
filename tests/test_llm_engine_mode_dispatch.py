@@ -1,4 +1,5 @@
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 
 from nanovllm.engine.llm_engine import LLMEngine
@@ -43,6 +44,8 @@ class TestLLMEngineModeDispatch(unittest.TestCase):
         eng.scheduler = _DummyScheduler(seqs, is_prefill=False)
         eng.model_runner = _DummyRunner()
         eng.spec_engine = _DummySpec()
+        eng.profile_enabled = False
+        eng._profile = defaultdict(float)
 
         outputs, num_tokens = LLMEngine.step(eng)
         self.assertEqual(num_tokens, -1)

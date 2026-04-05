@@ -1,5 +1,6 @@
 import os
 from glob import glob
+from time import perf_counter
 
 import torch
 from torch import nn
@@ -17,7 +18,7 @@ from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowPara
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
-from nanovllm.expert.placement import build_draft_plan, build_prefill_plan
+from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
 
 
@@ -290,14 +291,24 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.execution_mode = "normal"
         self.draft_scheduler: DraftScheduler | None = None
         self.draft_top_c = 0
+        self.cpu_expert_execution_enabled = False
+        self.cpu_expert_parallel_mode = "serial"
+        self.cpu_expert_num_threads = 4
+        self._last_profile: dict[str, float] = {}
 
     def enable_heterogeneous(
         self,
         expert_cache: LayerExpertCache,
         cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
+        cpu_expert_execution_enabled: bool = False,
+        cpu_expert_parallel_mode: str = "serial",
+        cpu_expert_num_threads: int = 4,
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
+        self.cpu_expert_execution_enabled = bool(cpu_expert_execution_enabled)
+        self.cpu_expert_parallel_mode = cpu_expert_parallel_mode
+        self.cpu_expert_num_threads = int(cpu_expert_num_threads)
 
     def set_speculative_execution(
         self,
@@ -313,17 +324,21 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         if self.expert_cache is None:
             raise RuntimeError("Heterogeneous MoE block is not initialized with expert cache.")
 
+        profile: dict[str, float] = {}
+        t_route0 = perf_counter()
         router_logits = self.gate(hidden_states)
         routing_weights = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
         routing_weights, selected_experts = torch.topk(routing_weights, self.num_selected, dim=-1)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
+        profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
 
+        t_plan0 = perf_counter()
         if self.execution_mode == "draft":
             if self.draft_scheduler is None:
                 raise RuntimeError("Draft execution requires a draft scheduler.")
-            plan = build_draft_plan(
+            plan = build_draft_plan_gpu(
                 layer_idx=self.layer_idx,
                 selected_experts=selected_experts,
                 routing_weights=routing_weights,
@@ -333,7 +348,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 top_c=self.draft_top_c,
             )
         elif self.execution_mode == "verify":
-            plan = build_prefill_plan(
+            plan = build_verify_plan_gpu(
                 layer_idx=self.layer_idx,
                 selected_experts=selected_experts,
                 routing_weights=routing_weights,
@@ -342,8 +357,13 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             )
         else:
             plan = None
+        profile["plan_ms"] = (perf_counter() - t_plan0) * 1000.0
 
-        return heterogeneous_moe_forward(
+        flat_selected = selected_experts.reshape(-1).to(torch.int64)
+        profile["moe_profile_count"] = 1.0
+        profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
+
+        out = heterogeneous_moe_forward(
             hidden_states=hidden_states,
             selected_experts=selected_experts,
             routing_weights=routing_weights,
@@ -351,7 +371,37 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_expert_pool=self.cpu_expert_pool,
             act_fn=self.act_fn,
             plan=plan,
+            cpu_expert_execution_enabled=self.cpu_expert_execution_enabled,
+            cpu_expert_parallel_mode=self.cpu_expert_parallel_mode,
+            cpu_expert_num_threads=self.cpu_expert_num_threads,
+            profile=profile,
         )
+        if plan is not None and plan.cpu_route_indices is not None and plan.cpu_route_indices.numel() > 0:
+            total_routes = float(flat_selected.numel())
+            cpu_routes = float(plan.cpu_route_indices.numel())
+            flat_weights = routing_weights.reshape(-1).float()
+            cpu_weight_mass = float(flat_weights.index_select(0, plan.cpu_route_indices).sum().item())
+            total_weight_mass = float(flat_weights.sum().item())
+            profile["cpu_route_ratio_sum"] = cpu_routes / total_routes if total_routes > 0 else 0.0
+            profile["cpu_weight_mass_ratio_sum"] = (
+                cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
+            )
+            if plan.cpu_task_expert_ids is not None:
+                profile["realized_cpu_expert_count_sum"] = float(plan.cpu_task_expert_ids.numel())
+            else:
+                profile["realized_cpu_expert_count_sum"] = 0.0
+        else:
+            profile["cpu_route_ratio_sum"] = 0.0
+            profile["cpu_weight_mass_ratio_sum"] = 0.0
+            profile["realized_cpu_expert_count_sum"] = 0.0
+
+        self._last_profile = profile
+        return out
+
+    def consume_profile(self) -> dict[str, float]:
+        out = self._last_profile
+        self._last_profile = {}
+        return out
 
 
 # Qwen3MoeSparseMoeBlock
@@ -494,12 +544,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         self,
         layer_caches: dict[int, LayerExpertCache],
         cpu_expert_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
+        cpu_expert_execution_enabled: bool = False,
+        cpu_expert_parallel_mode: str = "serial",
+        cpu_expert_num_threads: int = 4,
     ):
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 assert layer_idx in layer_caches, f"No cache for layer {layer_idx}"
                 assert layer_idx in cpu_expert_pool, f"No cpu expert pool for layer {layer_idx}"
-                layer.mlp.enable_heterogeneous(layer_caches[layer_idx], cpu_expert_pool[layer_idx])
+                layer.mlp.enable_heterogeneous(
+                    layer_caches[layer_idx],
+                    cpu_expert_pool[layer_idx],
+                    cpu_expert_execution_enabled=cpu_expert_execution_enabled,
+                    cpu_expert_parallel_mode=cpu_expert_parallel_mode,
+                    cpu_expert_num_threads=cpu_expert_num_threads,
+                )
 
     def set_speculative_execution_mode(
         self,
@@ -510,6 +569,16 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_speculative_execution(mode, draft_scheduler, draft_top_c)
+
+    def get_and_reset_heterogeneous_profile(self) -> dict[str, float]:
+        agg: dict[str, float] = {}
+        for layer in self.model.layers:
+            if not isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                continue
+            prof = layer.mlp.consume_profile()
+            for key, value in prof.items():
+                agg[key] = float(agg.get(key, 0.0) + value)
+        return agg
 
     def load_model(
         self,

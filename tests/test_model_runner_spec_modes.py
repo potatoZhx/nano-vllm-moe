@@ -29,6 +29,7 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr.profile_cuda_sync = False
         mr.rank = 0
         mr._profile = {}
+        mr._decode_graph_policy = "standard"
         mr.run = lambda seqs, is_prefill: [7 for _ in seqs]
 
         out, aux = ModelRunner.run_draft(mr, [SimpleNamespace(seq_id=1)])
@@ -37,6 +38,7 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         self.assertEqual(aux, [])
         self.assertEqual(mr.model.mode_calls[0][0], "draft")
         self.assertEqual(mr.model.mode_calls[-1][0], "normal")
+        self.assertEqual(mr._decode_graph_policy, "standard")
 
     def test_run_verify_switches_mode_and_returns_traces(self):
         mr = object.__new__(ModelRunner)
