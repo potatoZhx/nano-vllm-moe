@@ -148,12 +148,13 @@ def _run_real_cpu_expert_execution(
         route_slice = cpu_indices[start:end]
         token_indices = torch.div(route_slice, top_k, rounding_mode="floor")
 
-        # Keep compute in float32 on CPU for portability and stable numerics.
+        # Match model activation dtype to reduce CPU/GPU numerical drift.
+        compute_dtype = hidden_states.dtype
         t0 = perf_counter()
-        hidden_cpu = hidden_states.index_select(0, token_indices).to("cpu", dtype=torch.float32, non_blocking=True)
-        weights_cpu = flat_weights.index_select(0, route_slice).to("cpu", dtype=torch.float32, non_blocking=True)
-        gate_up_weight = params["gate_up"].to(dtype=torch.float32)
-        down_weight = params["down"].to(dtype=torch.float32)
+        hidden_cpu = hidden_states.index_select(0, token_indices).to("cpu", dtype=compute_dtype, non_blocking=False)
+        weights_cpu = flat_weights.index_select(0, route_slice).to("cpu", dtype=compute_dtype, non_blocking=False)
+        gate_up_weight = params["gate_up"].to(dtype=compute_dtype)
+        down_weight = params["down"].to(dtype=compute_dtype)
         prep_ms += (perf_counter() - t0) * 1000.0
 
         t0 = perf_counter()
@@ -163,7 +164,7 @@ def _run_real_cpu_expert_execution(
         compute_ms += (perf_counter() - t0) * 1000.0
 
         t0 = perf_counter()
-        out = cpu_out.to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
+        out = cpu_out.to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=False)
         output.index_add_(0, token_indices, out)
         merge_ms += (perf_counter() - t0) * 1000.0
 

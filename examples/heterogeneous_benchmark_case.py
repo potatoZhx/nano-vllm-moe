@@ -90,11 +90,14 @@ def run_case(args: argparse.Namespace) -> dict:
         args.model_path,
         dist_port=args.dist_port,
         enforce_eager=args.enforce_eager,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         inference_mode=mode,
         enable_heterogeneous=enable_heterogeneous,
         enable_speculative=(mode == "spec"),
+        draft_top_c=args.draft_top_c,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
         cpu_expert_num_threads=args.cpu_expert_num_threads,
@@ -185,9 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-seqs", type=int, default=64)
     parser.add_argument("--input-len", type=int, default=128)
     parser.add_argument("--output-len", type=int, default=64)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
+    parser.add_argument("--draft-top-c", type=int, default=2)
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)

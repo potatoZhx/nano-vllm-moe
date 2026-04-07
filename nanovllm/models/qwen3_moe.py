@@ -361,7 +361,12 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
 
         flat_selected = selected_experts.reshape(-1).to(torch.int64)
         profile["moe_profile_count"] = 1.0
-        profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
+        is_stream_capturing = bool(flat_selected.is_cuda and torch.cuda.is_current_stream_capturing())
+        if is_stream_capturing:
+            # torch.unique() may not be graph-capture-safe on current runtime.
+            profile["activated_expert_set_size_sum"] = 0.0
+        else:
+            profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
 
         out = heterogeneous_moe_forward(
             hidden_states=hidden_states,

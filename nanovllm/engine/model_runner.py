@@ -62,7 +62,15 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            # Spec mode decode uses draft-specific graph path; capturing standard decode graph
+            # can hit non-capture-safe MoE planning ops and is unnecessary for spec execution.
+            if self.config.inference_mode != "spec":
+                self.capture_cudagraph()
+            else:
+                self.graph_bs = []
+                self.graphs = {}
+                self.graph_vars = {}
+                self.graph_pool = None
             self.capture_draft_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -264,7 +272,9 @@ class ModelRunner:
             # Correctness-first: draft mode must not replay standard decode graph.
             return self._run_model_eager(input_ids, positions)
 
-        return self._replay_standard_graph(input_ids, positions)
+        if self._can_use_standard_cudagraph(input_ids.size(0)):
+            return self._replay_standard_graph(input_ids, positions)
+        return self._run_model_eager(input_ids, positions)
 
     def _replay_standard_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         bs = input_ids.size(0)
@@ -316,6 +326,13 @@ class ModelRunner:
         if not hasattr(self, "draft_graphs") or not self.draft_graphs:
             return False
         return any(bucket >= bs for bucket in self.draft_graph_bs)
+
+    def _can_use_standard_cudagraph(self, bs: int) -> bool:
+        if self.enforce_eager:
+            return False
+        if not hasattr(self, "graphs") or not self.graphs:
+            return False
+        return any(bucket >= bs for bucket in self.graph_bs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         t0 = perf_counter()

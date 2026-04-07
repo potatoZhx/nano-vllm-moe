@@ -48,8 +48,35 @@ def _build_grouped_layout(
     # Group tokens by slot id for grouped GEMM.
     sorted_slots, sort_idx = torch.sort(gpu_slots)
     sorted_gpu_route_indices = gpu_route_indices.index_select(0, sort_idx)
-    m_sizes = torch.bincount(sorted_slots, minlength=num_slots).to(torch.int32)
+    # Use fixed-shape scatter_add to keep graph capture friendly on some runtimes.
+    m_sizes = torch.zeros(num_slots, dtype=torch.int32, device=sorted_slots.device)
+    ones = torch.ones_like(sorted_slots, dtype=torch.int32)
+    m_sizes.scatter_add_(0, sorted_slots.to(torch.int64), ones)
     return m_sizes, sorted_gpu_route_indices
+
+
+def _build_topc0_substitution_lut(
+    num_experts: int,
+    cached_expert_mask: torch.Tensor,
+    slot_to_expert_lut: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a deterministic substitution table for draft top_c=0.
+
+    Strategy:
+    - Cached experts keep identity mapping.
+    - Uncached experts map to cached experts via round-robin over cache slots.
+    - This produces fixed-shape tensors and avoids host-side branching in hot path.
+    """
+    expert_ids = torch.arange(num_experts, dtype=torch.int64, device=device)
+    if slot_to_expert_lut.numel() == 0:
+        return expert_ids
+
+    rr_slot = torch.remainder(expert_ids, int(slot_to_expert_lut.numel()))
+    fallback_experts = slot_to_expert_lut.index_select(0, rr_slot)
+    # Defensive fallback: if a slot is not populated, keep identity for that id.
+    fallback_experts = torch.where(fallback_experts >= 0, fallback_experts, expert_ids)
+    return torch.where(cached_expert_mask, expert_ids, fallback_experts.to(torch.int64))
 
 
 def _build_cpu_task_layout(
@@ -173,15 +200,27 @@ def build_draft_plan_gpu(
     flat_weights = _flatten_weights(routing_weights)
     device = flat_selected.device
 
-    slot_indices, gpu_mask = expert_cache.remap_experts_to_slots(flat_selected)
-    if gpu_mask.all():
+    cached_expert_mask = expert_cache.get_cached_expert_mask()
+
+    # Unified top_c=0 path (no CPU execution): map uncached experts to cached experts
+    # through substitution LUT, then run fully on GPU.
+    if top_c <= 0:
+        substitution_lut = _build_topc0_substitution_lut(
+            num_experts=num_experts,
+            cached_expert_mask=cached_expert_mask,
+            slot_to_expert_lut=expert_cache.get_slot_to_expert_lut(),
+            device=device,
+        )
+        flat_effective = substitution_lut.index_select(0, flat_selected)
+        gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_effective)
         gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
-        gpu_slots = slot_indices
         m_sizes, gpu_route_indices = _build_grouped_layout(
             gpu_slots,
             gpu_route_indices,
             expert_cache.num_slots,
         )
+        gpu_route_mask = torch.ones_like(flat_selected, dtype=torch.bool)
+        cpu_route_mask = torch.zeros_like(flat_selected, dtype=torch.bool)
         return MoEExecutionPlan(
             layer_idx=layer_idx,
             gpu_route_indices=gpu_route_indices,
@@ -190,13 +229,13 @@ def build_draft_plan_gpu(
             cpu_task_expert_ids=None,
             cpu_task_offsets=None,
             flat_selected_original=flat_selected,
-            flat_selected_effective=flat_selected,
-            substitution_lut=None,
-            gpu_route_mask=gpu_mask,
-            cpu_route_mask=~gpu_mask,
+            flat_selected_effective=flat_effective,
+            substitution_lut=substitution_lut,
+            gpu_route_mask=gpu_route_mask,
+            cpu_route_mask=cpu_route_mask,
         )
 
-    cached_expert_mask = expert_cache.get_cached_expert_mask()
+    slot_indices, gpu_mask = expert_cache.remap_experts_to_slots(flat_selected)
     uncached_expert_mask = torch.zeros((num_experts,), dtype=torch.bool, device=device)
     uncached_expert_ids = torch.unique(flat_selected[~gpu_mask])
     uncached_expert_mask[uncached_expert_ids] = True

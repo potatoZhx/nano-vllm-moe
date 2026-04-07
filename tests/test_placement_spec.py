@@ -81,6 +81,53 @@ class TestPlacementSpec(unittest.TestCase):
         )
         self.assertTrue(plan.cpu_route_indices is None or plan.cpu_route_indices.numel() == 0)
         self.assertTrue(plan.gpu_route_indices.numel() > 0)
+        self.assertIsNotNone(plan.substitution_lut)
+
+        # Experts 4/5 are uncached in this fixture and should be remapped into cached range [0,1,2].
+        remapped = plan.substitution_lut.index_select(0, torch.tensor([4, 5], dtype=torch.int64))
+        self.assertTrue(torch.all(remapped < 3).item())
+
+    def test_draft_plan_all_cached_uses_gpu_only_fast_path(self):
+        cache = LayerExpertCache(
+            num_experts=8,
+            slots_per_layer=8,
+            gate_up_shape=(4, 4),
+            down_shape=(4, 2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            cpu_expert_pool={},
+        )
+        fake = torch.zeros(4, 4)
+        fake_down = torch.zeros(4, 2)
+        for expert_id in range(8):
+            cache.put_to_slot(expert_id, expert_id, fake, fake_down)
+
+        class _SchedulerShouldNotBeCalled:
+            def select_cpu_experts_gpu(self, **_kwargs):
+                raise AssertionError("select_cpu_experts_gpu should not be called in all-cached fast path")
+
+            def build_substitution_lut_gpu(self, **_kwargs):
+                raise AssertionError("build_substitution_lut_gpu should not be called in all-cached fast path")
+
+        selected = torch.tensor([0, 4, 5, 2], dtype=torch.int64)
+        routing_w = torch.ones(2, 2, dtype=torch.float32)
+        plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=_SchedulerShouldNotBeCalled(),
+            num_experts=8,
+            top_c=0,
+        )
+
+        self.assertIsNone(plan.cpu_route_indices)
+        self.assertIsNotNone(plan.substitution_lut)
+        self.assertEqual(plan.gpu_route_indices.numel(), selected.numel())
+        # S=N acceptance criterion: top_c=0 still follows substitution path,
+        # but actual replacement count is zero (identity LUT).
+        expected = torch.arange(8, dtype=torch.int64)
+        self.assertTrue(torch.equal(plan.substitution_lut.cpu(), expected))
 
 
 if __name__ == "__main__":

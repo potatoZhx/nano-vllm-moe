@@ -33,6 +33,12 @@ class LayerExpertCache:
             dtype=torch.int64,
             device=device,
         )
+        self.slot_to_expert_lut = torch.full(
+            (self.num_slots,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
         self.cached_expert_mask = torch.zeros(
             (self.num_experts,),
             dtype=torch.bool,
@@ -56,6 +62,7 @@ class LayerExpertCache:
         self.gate_up_buffer[slot_idx].copy_(gate_up_cpu, non_blocking=True)
         self.down_buffer[slot_idx].copy_(down_cpu, non_blocking=True)
         self.slot_to_expert[slot_idx] = expert_idx
+        self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
@@ -75,6 +82,9 @@ class LayerExpertCache:
 
     def get_cached_expert_mask(self) -> torch.Tensor:
         return self.cached_expert_mask
+
+    def get_slot_to_expert_lut(self) -> torch.Tensor:
+        return self.slot_to_expert_lut
 
     def get_cpu_expert_weights(self, expert_idx: int) -> dict[str, torch.Tensor] | None:
         return self.cpu_expert_pool.get(expert_idx)
