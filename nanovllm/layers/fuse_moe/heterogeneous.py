@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
 import torch
@@ -22,10 +23,11 @@ def heterogeneous_moe_forward(
     cpu_expert_execution_enabled: bool = False,
     cpu_expert_parallel_mode: str = "serial",
     cpu_expert_num_threads: int = 4,
+    cpu_gpu_parallel_execution_enabled: bool = True,
+    cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     profile: dict | None = None,
 ) -> torch.Tensor:
     """Run MoE with GPU cached experts + fallback path for uncached experts."""
-    _ = cpu_expert_num_threads
     top_k = routing_weights.size(1)
     flat_selected = selected_experts.reshape(-1)
     flat_weights = routing_weights.reshape(-1)
@@ -34,61 +36,123 @@ def heterogeneous_moe_forward(
     if plan is None:
         plan = build_moe_execution_plan(selected_experts, expert_cache)
 
+    has_gpu_work = plan.gpu_route_indices.numel() > 0 and plan.gpu_m_sizes is not None
+    cpu_indices = plan.cpu_route_indices
+    has_cpu_work = cpu_indices is not None and cpu_indices.numel() > 0
+    cpu_route_ratio = (float(cpu_indices.numel()) / float(flat_selected.numel())) if has_cpu_work else 0.0
+
+    if has_cpu_work and cpu_expert_pool is None:
+        raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
+
+    can_overlap_cpu_gpu = (
+        has_gpu_work
+        and has_cpu_work
+        and hidden_states.is_cuda
+        and cpu_expert_execution_enabled
+        and cpu_gpu_parallel_execution_enabled
+        and cpu_route_ratio >= float(cpu_gpu_parallel_min_cpu_route_ratio)
+    )
+
+    if can_overlap_cpu_gpu:
+        t_parallel0 = perf_counter()
+        gpu_stream = torch.cuda.Stream(device=hidden_states.device)
+        current_stream = torch.cuda.current_stream(device=hidden_states.device)
+        gpu_stream.wait_stream(current_stream)
+        with torch.cuda.stream(gpu_stream):
+            gpu_token_indices, gpu_expert_out, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
+                hidden_states=hidden_states,
+                flat_weights=flat_weights,
+                top_k=top_k,
+                gpu_route_indices=plan.gpu_route_indices,
+                gpu_m_sizes=plan.gpu_m_sizes,
+                expert_cache=expert_cache,
+                act_fn=act_fn,
+            )
+
+        cpu_token_indices, cpu_outputs, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
+            hidden_states=hidden_states,
+            flat_weights=flat_weights,
+            top_k=top_k,
+            cpu_indices=cpu_indices,
+            cpu_task_expert_ids=plan.cpu_task_expert_ids,
+            cpu_task_offsets=plan.cpu_task_offsets,
+            flat_selected_original=plan.flat_selected_original,
+            cpu_expert_pool=cpu_expert_pool,
+            act_fn=act_fn,
+            cpu_expert_parallel_mode=cpu_expert_parallel_mode,
+            cpu_expert_num_threads=cpu_expert_num_threads,
+        )
+
+        torch.cuda.current_stream(device=hidden_states.device).wait_stream(gpu_stream)
+
+        t_scatter0 = perf_counter()
+        output.index_add_(0, gpu_token_indices, gpu_expert_out)
+        scatter_ms = (perf_counter() - t_scatter0) * 1000.0
+
+        merge_ms = _merge_real_cpu_outputs(
+            output=output,
+            token_indices=cpu_token_indices,
+            cpu_outputs=cpu_outputs,
+            output_dtype=hidden_states.dtype,
+            output_device=hidden_states.device,
+        )
+
+        gpu_core_ms = gpu_gather_ms + gpu_compute_ms
+        cpu_core_ms = prep_ms + compute_ms
+        overlap_est_ms = min(gpu_core_ms, cpu_core_ms)
+        critical_path_est_ms = max(gpu_core_ms, cpu_core_ms) + scatter_ms + merge_ms
+        parallel_wall_ms = (perf_counter() - t_parallel0) * 1000.0
+
+        _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
+        _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
+        _prof_add(profile, "scatter_ms", scatter_ms / 1000.0)
+        _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
+        _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
+        _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
+        _prof_add(profile, "parallel_overlap_est_ms", overlap_est_ms / 1000.0)
+        _prof_add(profile, "parallel_critical_path_est_ms", critical_path_est_ms / 1000.0)
+        _prof_add(profile, "parallel_wall_ms", parallel_wall_ms / 1000.0)
+        _prof_add(profile, "cpu_wait_ms", max(0.0, gpu_core_ms - cpu_core_ms) / 1000.0)
+        _prof_add(profile, "gpu_wait_ms", max(0.0, cpu_core_ms - gpu_core_ms) / 1000.0)
+        if profile is not None:
+            profile["parallel_enabled_count"] = float(profile.get("parallel_enabled_count", 0.0) + 1.0)
+        return output
+
     # GPU path: cached experts are remapped to contiguous slot buffers.
-    if plan.gpu_route_indices.numel() > 0 and plan.gpu_m_sizes is not None:
-        t_gather0 = perf_counter()
-        gpu_token_indices = torch.div(plan.gpu_route_indices, top_k, rounding_mode="floor")
-        gpu_hidden = hidden_states[gpu_token_indices]
-        gpu_weights = flat_weights.index_select(0, plan.gpu_route_indices)
-        _prof_add(profile, "gpu_gather_ms", perf_counter() - t_gather0)
-
-        gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
-
-        t_comp0 = perf_counter()
-        gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.gpu_m_sizes)
-        gpu_expert_out = fused_moe_linear(act_fn(gate_up), down_buffer, plan.gpu_m_sizes)
-        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
-        _prof_add(profile, "gpu_compute_ms", perf_counter() - t_comp0)
+    if has_gpu_work:
+        gpu_token_indices, gpu_expert_out, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
+            hidden_states=hidden_states,
+            flat_weights=flat_weights,
+            top_k=top_k,
+            gpu_route_indices=plan.gpu_route_indices,
+            gpu_m_sizes=plan.gpu_m_sizes,
+            expert_cache=expert_cache,
+            act_fn=act_fn,
+        )
+        _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
+        _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
 
         t_scatter0 = perf_counter()
         output.index_add_(0, gpu_token_indices, gpu_expert_out)
         _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
 
     # CPU path for uncached experts.
-    # TODO: 清理/统一实现
-    cpu_indices = plan.cpu_route_indices
-    if cpu_indices is not None and cpu_indices.numel() > 0:
-        if cpu_expert_pool is None:
-            raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
-
+    if has_cpu_work:
         if cpu_expert_execution_enabled:
-            if cpu_expert_parallel_mode == "serial":
-                prep_ms, compute_ms, merge_ms = _run_real_cpu_expert_execution(
-                    hidden_states=hidden_states,
-                    output=output,
-                    flat_weights=flat_weights,
-                    top_k=top_k,
-                    cpu_indices=cpu_indices,
-                    cpu_task_expert_ids=plan.cpu_task_expert_ids,
-                    cpu_task_offsets=plan.cpu_task_offsets,
-                    flat_selected_original=plan.flat_selected_original,
-                    cpu_expert_pool=cpu_expert_pool,
-                    act_fn=act_fn,
-                )
-            else:
-                # First implementation keeps expert-level serial execution for stability.
-                prep_ms, compute_ms, merge_ms = _run_real_cpu_expert_execution(
-                    hidden_states=hidden_states,
-                    output=output,
-                    flat_weights=flat_weights,
-                    top_k=top_k,
-                    cpu_indices=cpu_indices,
-                    cpu_task_expert_ids=plan.cpu_task_expert_ids,
-                    cpu_task_offsets=plan.cpu_task_offsets,
-                    flat_selected_original=plan.flat_selected_original,
-                    cpu_expert_pool=cpu_expert_pool,
-                    act_fn=act_fn,
-                )
+            prep_ms, compute_ms, merge_ms = _run_real_cpu_expert_execution(
+                hidden_states=hidden_states,
+                output=output,
+                flat_weights=flat_weights,
+                top_k=top_k,
+                cpu_indices=cpu_indices,
+                cpu_task_expert_ids=plan.cpu_task_expert_ids,
+                cpu_task_offsets=plan.cpu_task_offsets,
+                flat_selected_original=plan.flat_selected_original,
+                cpu_expert_pool=cpu_expert_pool,
+                act_fn=act_fn,
+                cpu_expert_parallel_mode=cpu_expert_parallel_mode,
+                cpu_expert_num_threads=cpu_expert_num_threads,
+            )
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
             _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
@@ -107,9 +171,32 @@ def heterogeneous_moe_forward(
     return output
 
 
-def _run_real_cpu_expert_execution(
+def _run_gpu_cached_expert_path(
     hidden_states: torch.Tensor,
-    output: torch.Tensor,
+    flat_weights: torch.Tensor,
+    top_k: int,
+    gpu_route_indices: torch.Tensor,
+    gpu_m_sizes: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    act_fn: SiluAndMul,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    t_gather0 = perf_counter()
+    gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
+    gpu_hidden = hidden_states[gpu_token_indices]
+    gpu_weights = flat_weights.index_select(0, gpu_route_indices)
+    gather_ms = (perf_counter() - t_gather0) * 1000.0
+
+    gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
+    t_comp0 = perf_counter()
+    gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, gpu_m_sizes)
+    gpu_expert_out = fused_moe_linear(act_fn(gate_up), down_buffer, gpu_m_sizes)
+    gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+    compute_ms = (perf_counter() - t_comp0) * 1000.0
+    return gpu_token_indices, gpu_expert_out, gather_ms, compute_ms
+
+
+def _compute_real_cpu_expert_outputs(
+    hidden_states: torch.Tensor,
     flat_weights: torch.Tensor,
     top_k: int,
     cpu_indices: torch.Tensor,
@@ -118,10 +205,10 @@ def _run_real_cpu_expert_execution(
     flat_selected_original: torch.Tensor,
     cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
     act_fn: SiluAndMul,
-) -> tuple[float, float, float]:
-    prep_ms = 0.0
-    compute_ms = 0.0
-    merge_ms = 0.0
+    cpu_expert_parallel_mode: str,
+    cpu_expert_num_threads: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], float, float]:
+    prep_t0 = perf_counter()
     if cpu_task_expert_ids is None or cpu_task_offsets is None:
         cpu_experts = flat_selected_original.index_select(0, cpu_indices)
         sorted_experts, sort_idx = torch.sort(cpu_experts)
@@ -134,40 +221,110 @@ def _run_real_cpu_expert_execution(
         )
         cpu_task_offsets[1:] = torch.cumsum(counts.to(torch.int64), dim=0)
 
-    for i in range(int(cpu_task_expert_ids.numel())):
-        start = int(cpu_task_offsets[i].item())
-        end = int(cpu_task_offsets[i + 1].item())
-        if start >= end:
-            continue
+    # Match model activation dtype to reduce CPU/GPU numerical drift.
+    compute_dtype = hidden_states.dtype
+    token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
+    hidden_cpu = hidden_states.index_select(0, token_indices).to("cpu", dtype=compute_dtype, non_blocking=False)
+    weights_cpu = flat_weights.index_select(0, cpu_indices).to("cpu", dtype=compute_dtype, non_blocking=False)
+    prep_ms = (perf_counter() - prep_t0) * 1000.0
 
-        expert_idx = int(cpu_task_expert_ids[i].item())
+    num_tasks = int(cpu_task_expert_ids.numel())
+    task_offsets_host = [int(x) for x in cpu_task_offsets.detach().to("cpu", non_blocking=False).tolist()]
+    task_expert_ids_host = [int(x) for x in cpu_task_expert_ids.detach().to("cpu", non_blocking=False).tolist()]
+    token_indices_chunks: list[torch.Tensor] = []
+    cpu_outputs: list[torch.Tensor] = [torch.empty(0)] * num_tasks
+
+    def run_task(task_idx: int) -> torch.Tensor:
+        start = task_offsets_host[task_idx]
+        end = task_offsets_host[task_idx + 1]
+        if start >= end:
+            return torch.empty((0, hidden_states.shape[-1]), dtype=compute_dtype, device="cpu")
+
+        expert_idx = task_expert_ids_host[task_idx]
         params = cpu_expert_pool.get(expert_idx)
         if params is None:
             raise RuntimeError(f"Missing CPU expert weights for expert {expert_idx}")
 
-        route_slice = cpu_indices[start:end]
-        token_indices = torch.div(route_slice, top_k, rounding_mode="floor")
-
-        # Match model activation dtype to reduce CPU/GPU numerical drift.
-        compute_dtype = hidden_states.dtype
-        t0 = perf_counter()
-        hidden_cpu = hidden_states.index_select(0, token_indices).to("cpu", dtype=compute_dtype, non_blocking=False)
-        weights_cpu = flat_weights.index_select(0, route_slice).to("cpu", dtype=compute_dtype, non_blocking=False)
+        hidden_chunk = hidden_cpu[start:end]
+        weight_chunk = weights_cpu[start:end]
         gate_up_weight = params["gate_up"].to(dtype=compute_dtype)
         down_weight = params["down"].to(dtype=compute_dtype)
-        prep_ms += (perf_counter() - t0) * 1000.0
-
-        t0 = perf_counter()
-        gate_up = F.linear(hidden_cpu, gate_up_weight)
+        gate_up = F.linear(hidden_chunk, gate_up_weight)
         cpu_out = F.linear(act_fn(gate_up), down_weight)
-        cpu_out.mul_(weights_cpu.unsqueeze(-1))
-        compute_ms += (perf_counter() - t0) * 1000.0
+        cpu_out.mul_(weight_chunk.unsqueeze(-1))
+        return cpu_out
 
-        t0 = perf_counter()
-        out = cpu_out.to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=False)
-        output.index_add_(0, token_indices, out)
-        merge_ms += (perf_counter() - t0) * 1000.0
+    for i in range(num_tasks):
+        start = task_offsets_host[i]
+        end = task_offsets_host[i + 1]
+        token_indices_chunks.append(token_indices[start:end])
 
+    compute_t0 = perf_counter()
+    can_parallel = cpu_expert_parallel_mode == "expert_parallel" and cpu_expert_num_threads > 1 and num_tasks > 1
+    if can_parallel:
+        max_workers = min(cpu_expert_num_threads, num_tasks)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(run_task, i) for i in range(num_tasks)]
+            for i, fut in enumerate(futures):
+                cpu_outputs[i] = fut.result()
+    else:
+        for i in range(num_tasks):
+            cpu_outputs[i] = run_task(i)
+    compute_ms = (perf_counter() - compute_t0) * 1000.0
+
+    return token_indices_chunks, cpu_outputs, prep_ms, compute_ms
+
+
+def _merge_real_cpu_outputs(
+    output: torch.Tensor,
+    token_indices: list[torch.Tensor],
+    cpu_outputs: list[torch.Tensor],
+    output_dtype: torch.dtype,
+    output_device: torch.device,
+) -> float:
+    merge_t0 = perf_counter()
+    for tokens, cpu_out in zip(token_indices, cpu_outputs):
+        if tokens.numel() == 0:
+            continue
+        out = cpu_out.to(device=output_device, dtype=output_dtype, non_blocking=False)
+        output.index_add_(0, tokens, out)
+    return (perf_counter() - merge_t0) * 1000.0
+
+
+def _run_real_cpu_expert_execution(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    flat_weights: torch.Tensor,
+    top_k: int,
+    cpu_indices: torch.Tensor,
+    cpu_task_expert_ids: torch.Tensor | None,
+    cpu_task_offsets: torch.Tensor | None,
+    flat_selected_original: torch.Tensor,
+    cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
+    act_fn: SiluAndMul,
+    cpu_expert_parallel_mode: str = "serial",
+    cpu_expert_num_threads: int = 4,
+) -> tuple[float, float, float]:
+    token_indices, cpu_outputs, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
+        hidden_states=hidden_states,
+        flat_weights=flat_weights,
+        top_k=top_k,
+        cpu_indices=cpu_indices,
+        cpu_task_expert_ids=cpu_task_expert_ids,
+        cpu_task_offsets=cpu_task_offsets,
+        flat_selected_original=flat_selected_original,
+        cpu_expert_pool=cpu_expert_pool,
+        act_fn=act_fn,
+        cpu_expert_parallel_mode=cpu_expert_parallel_mode,
+        cpu_expert_num_threads=cpu_expert_num_threads,
+    )
+    merge_ms = _merge_real_cpu_outputs(
+        output=output,
+        token_indices=token_indices,
+        cpu_outputs=cpu_outputs,
+        output_dtype=hidden_states.dtype,
+        output_device=hidden_states.device,
+    )
     return prep_ms, compute_ms, merge_ms
 
 

@@ -66,7 +66,20 @@ def run_case(args: argparse.Namespace) -> dict:
     cpu_counter = {"calls": 0, "routes": 0}
     orig_cpu_exec = hetero_mod._run_real_cpu_expert_execution
 
-    def wrapped_cpu_exec(hidden_states, output, flat_weights, top_k, cpu_indices, cpu_task_expert_ids, cpu_task_offsets, flat_selected_original, cpu_expert_pool, act_fn):
+    def wrapped_cpu_exec(
+        hidden_states,
+        output,
+        flat_weights,
+        top_k,
+        cpu_indices,
+        cpu_task_expert_ids,
+        cpu_task_offsets,
+        flat_selected_original,
+        cpu_expert_pool,
+        act_fn,
+        cpu_expert_parallel_mode="serial",
+        cpu_expert_num_threads=4,
+    ):
         cpu_counter["calls"] += 1
         cpu_counter["routes"] += int(cpu_indices.numel())
         return orig_cpu_exec(
@@ -80,6 +93,8 @@ def run_case(args: argparse.Namespace) -> dict:
             flat_selected_original,
             cpu_expert_pool,
             act_fn,
+            cpu_expert_parallel_mode=cpu_expert_parallel_mode,
+            cpu_expert_num_threads=cpu_expert_num_threads,
         )
 
     if args.mode == "heter":
@@ -95,6 +110,8 @@ def run_case(args: argparse.Namespace) -> dict:
             cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
             cpu_expert_parallel_mode="serial",
             cpu_expert_num_threads=args.cpu_expert_num_threads,
+            cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
+            cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
             enforce_eager=True,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -132,6 +149,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slots-per-layer", type=int, default=0)
     p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    p.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=True)
+    p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
     p.add_argument("--remap-cache-high-ids", type=str2bool, default=False)
     p.add_argument("--num-seqs", type=int, default=4)
     p.add_argument("--prompt-len", type=int, default=96)

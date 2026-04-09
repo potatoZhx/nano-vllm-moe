@@ -52,6 +52,8 @@ class ModelRunner:
                 cpu_expert_execution_enabled=getattr(config, "cpu_expert_execution_enabled", False),
                 cpu_expert_parallel_mode=getattr(config, "cpu_expert_parallel_mode", "serial"),
                 cpu_expert_num_threads=getattr(config, "cpu_expert_num_threads", 4),
+                cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", True),
+                cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.7),
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
         else:

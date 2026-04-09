@@ -101,6 +101,8 @@ def run_case(args: argparse.Namespace) -> dict:
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
         cpu_expert_num_threads=args.cpu_expert_num_threads,
+        cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
+        cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
         spec_profile=args.spec_profile,
         engine_profile=args.engine_profile,
         engine_profile_cuda_sync=args.engine_profile_cuda_sync,
@@ -197,6 +199,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    parser.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=True)
+    parser.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
     parser.add_argument("--dist-port", type=int, default=2333)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)

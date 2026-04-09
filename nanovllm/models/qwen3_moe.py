@@ -294,6 +294,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_execution_enabled = False
         self.cpu_expert_parallel_mode = "serial"
         self.cpu_expert_num_threads = 4
+        self.cpu_gpu_parallel_execution_enabled = True
+        self.cpu_gpu_parallel_min_cpu_route_ratio = 0.7
         self._last_profile: dict[str, float] = {}
 
     def enable_heterogeneous(
@@ -303,12 +305,16 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
+        cpu_gpu_parallel_execution_enabled: bool = True,
+        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
         self.cpu_expert_execution_enabled = bool(cpu_expert_execution_enabled)
         self.cpu_expert_parallel_mode = cpu_expert_parallel_mode
         self.cpu_expert_num_threads = int(cpu_expert_num_threads)
+        self.cpu_gpu_parallel_execution_enabled = bool(cpu_gpu_parallel_execution_enabled)
+        self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
 
     def set_speculative_execution(
         self,
@@ -379,6 +385,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_expert_execution_enabled=self.cpu_expert_execution_enabled,
             cpu_expert_parallel_mode=self.cpu_expert_parallel_mode,
             cpu_expert_num_threads=self.cpu_expert_num_threads,
+            cpu_gpu_parallel_execution_enabled=self.cpu_gpu_parallel_execution_enabled,
+            cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
             profile=profile,
         )
         if plan is not None and plan.cpu_route_indices is not None and plan.cpu_route_indices.numel() > 0:
@@ -552,6 +560,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
+        cpu_gpu_parallel_execution_enabled: bool = True,
+        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ):
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
@@ -563,6 +573,8 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_expert_execution_enabled=cpu_expert_execution_enabled,
                     cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                     cpu_expert_num_threads=cpu_expert_num_threads,
+                    cpu_gpu_parallel_execution_enabled=cpu_gpu_parallel_execution_enabled,
+                    cpu_gpu_parallel_min_cpu_route_ratio=cpu_gpu_parallel_min_cpu_route_ratio,
                 )
 
     def set_speculative_execution_mode(

@@ -35,6 +35,8 @@ class Config:
     cpu_expert_execution_enabled: bool = False
     cpu_expert_num_threads: int = 4
     cpu_expert_parallel_mode: str = "serial"
+    cpu_gpu_parallel_execution_enabled: bool = True
+    cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7
     gpu_plan_builder_enabled: bool = False
     gpu_plan_builder_fallback: bool = True
     draft_cuda_graph_enabled: bool = True
@@ -75,6 +77,7 @@ class Config:
         assert self.draft_top_c >= 0
         assert self.cpu_expert_num_threads >= 1
         assert self.cpu_expert_parallel_mode in {"serial", "expert_parallel"}
+        assert 0.0 <= self.cpu_gpu_parallel_min_cpu_route_ratio <= 1.0
         assert self.perf_profile_level in {"basic", "detailed"}
         assert self.draft_cuda_graph_max_bs >= 1
         assert len(self.draft_cuda_graph_bucket_steps) > 0
