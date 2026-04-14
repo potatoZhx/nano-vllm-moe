@@ -39,7 +39,7 @@
 
 新增配置：
 
-1. `cpu_gpu_parallel_execution_enabled: bool = True`
+1. `cpu_gpu_parallel_execution_enabled: bool = False`
 2. `cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7`
 
 调度策略（hybrid static + dynamic）：

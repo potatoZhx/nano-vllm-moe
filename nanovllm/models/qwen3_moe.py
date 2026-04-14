@@ -294,7 +294,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_execution_enabled = False
         self.cpu_expert_parallel_mode = "serial"
         self.cpu_expert_num_threads = 4
-        self.cpu_gpu_parallel_execution_enabled = True
+        self.cpu_gpu_parallel_execution_enabled = False
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.7
         self._last_profile: dict[str, float] = {}
 
@@ -305,7 +305,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
-        cpu_gpu_parallel_execution_enabled: bool = True,
+        cpu_gpu_parallel_execution_enabled: bool = False,
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ) -> None:
         self.expert_cache = expert_cache
@@ -389,24 +389,29 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
             profile=profile,
         )
-        if plan is not None and plan.cpu_route_indices is not None and plan.cpu_route_indices.numel() > 0:
-            total_routes = float(flat_selected.numel())
-            cpu_routes = float(plan.cpu_route_indices.numel())
-            flat_weights = routing_weights.reshape(-1).float()
-            cpu_weight_mass = float(flat_weights.index_select(0, plan.cpu_route_indices).sum().item())
-            total_weight_mass = float(flat_weights.sum().item())
-            profile["cpu_route_ratio_sum"] = cpu_routes / total_routes if total_routes > 0 else 0.0
-            profile["cpu_weight_mass_ratio_sum"] = (
-                cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
-            )
-            if plan.cpu_task_expert_ids is not None:
-                profile["realized_cpu_expert_count_sum"] = float(plan.cpu_task_expert_ids.numel())
+        if (
+            "cpu_route_ratio_sum" not in profile
+            or "cpu_weight_mass_ratio_sum" not in profile
+            or "realized_cpu_expert_count_sum" not in profile
+        ):
+            if plan is not None and plan.cpu_route_indices is not None and plan.cpu_route_indices.numel() > 0:
+                total_routes = float(flat_selected.numel())
+                cpu_routes = float(plan.cpu_route_indices.numel())
+                flat_weights = routing_weights.reshape(-1).float()
+                cpu_weight_mass = float(flat_weights.index_select(0, plan.cpu_route_indices).sum().item())
+                total_weight_mass = float(flat_weights.sum().item())
+                profile["cpu_route_ratio_sum"] = cpu_routes / total_routes if total_routes > 0 else 0.0
+                profile["cpu_weight_mass_ratio_sum"] = (
+                    cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
+                )
+                if plan.cpu_task_expert_ids is not None:
+                    profile["realized_cpu_expert_count_sum"] = float(plan.cpu_task_expert_ids.numel())
+                else:
+                    profile["realized_cpu_expert_count_sum"] = 0.0
             else:
+                profile["cpu_route_ratio_sum"] = 0.0
+                profile["cpu_weight_mass_ratio_sum"] = 0.0
                 profile["realized_cpu_expert_count_sum"] = 0.0
-        else:
-            profile["cpu_route_ratio_sum"] = 0.0
-            profile["cpu_weight_mass_ratio_sum"] = 0.0
-            profile["realized_cpu_expert_count_sum"] = 0.0
 
         self._last_profile = profile
         return out
@@ -434,6 +439,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
+        rope_theta = getattr(config, "rope_theta", None)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            rope_scaling = None
+        if rope_theta is None:
+            rope_parameters = getattr(config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                rope_theta = float(rope_parameters.get("rope_theta", 10000.0))
+        if rope_theta is None:
+            rope_theta = 10000.0
         self.self_attn = Qwen3MoeAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -442,8 +457,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', False),
-            rope_theta=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
             sliding_window=config.sliding_window,
         )
         if (layer_idx not in config.mlp_only_layers) and (
@@ -560,7 +575,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
-        cpu_gpu_parallel_execution_enabled: bool = True,
+        cpu_gpu_parallel_execution_enabled: bool = False,
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ):
         for layer_idx, layer in enumerate(self.model.layers):

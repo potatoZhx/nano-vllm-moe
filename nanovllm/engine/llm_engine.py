@@ -53,6 +53,30 @@ class LLMEngine:
         if hasattr(self.spec_engine, "get_profile"):
             spec_profile = self.spec_engine.get_profile(reset=reset)
             out.update({f"spec_{k}": v for k, v in spec_profile.items()})
+
+        # Canonical phase2_post keys for downstream reports.
+        canonical_map = {
+            "route_ms": "model_route_ms",
+            "plan_ms": "model_plan_ms",
+            "gpu_gather_ms": "model_gpu_gather_ms",
+            "gpu_compute_ms": "model_gpu_compute_ms",
+            "cpu_prepare_ms": "model_cpu_prepare_ms",
+            "cpu_compute_ms": "model_cpu_compute_ms",
+            "cpu_to_gpu_merge_ms": "model_cpu_to_gpu_merge_ms",
+            "scatter_ms": "model_scatter_ms",
+            "draft_ms": "spec_draft_ms",
+            "verify_ms": "spec_verify_ms",
+            "spec_step_ms": "spec_spec_step_ms",
+            "graph_hit_rate": "model_graph_hit_rate",
+            "graph_replay_count": "model_graph_replay_count",
+            "cpu_route_ratio": "model_cpu_route_ratio",
+            "cpu_weight_mass_ratio": "model_cpu_weight_mass_ratio",
+            "activated_expert_set_size": "model_activated_expert_set_size",
+            "realized_cpu_expert_count": "model_realized_cpu_expert_count",
+        }
+        for alias, source_key in canonical_map.items():
+            if alias not in out and source_key in out:
+                out[alias] = out[source_key]
         if reset and self.profile_enabled:
             self._profile.clear()
         return out

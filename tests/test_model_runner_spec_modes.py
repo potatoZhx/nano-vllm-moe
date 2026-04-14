@@ -1,4 +1,5 @@
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
@@ -57,6 +58,56 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         self.assertEqual(traces, [[0, 1, 0]])
         self.assertEqual(mr.model.mode_calls[0][0], "verify")
         self.assertEqual(mr.model.mode_calls[-1][0], "normal")
+
+    def test_get_profile_exposes_phase2_post_core_fields(self):
+        mr = object.__new__(ModelRunner)
+        mr.rank = 0
+        mr._profile = defaultdict(
+            float,
+            {
+                "decode_count": 4,
+                "graph_hit_count": 3,
+                "route_ms": 12.0,
+                "plan_ms": 5.0,
+                "gpu_gather_ms": 2.0,
+                "gpu_compute_ms": 7.0,
+                "cpu_prepare_ms": 1.5,
+                "cpu_compute_ms": 4.5,
+                "cpu_to_gpu_merge_ms": 0.8,
+                "scatter_ms": 1.2,
+                "graph_replay_count": 3,
+                "moe_profile_count": 2,
+                "cpu_route_ratio_sum": 0.9,
+                "cpu_weight_mass_ratio_sum": 0.7,
+                "activated_expert_set_size_sum": 10.0,
+                "realized_cpu_expert_count_sum": 4.0,
+            },
+        )
+
+        out = ModelRunner.get_profile(mr, reset=False)
+
+        self.assertEqual(out["decode_count"], 4)
+        self.assertAlmostEqual(out["graph_hit_rate"], 0.75, places=6)
+        self.assertAlmostEqual(out["cpu_route_ratio"], 0.45, places=6)
+        self.assertAlmostEqual(out["cpu_weight_mass_ratio"], 0.35, places=6)
+        self.assertAlmostEqual(out["activated_expert_set_size"], 5.0, places=6)
+        self.assertAlmostEqual(out["realized_cpu_expert_count"], 2.0, places=6)
+
+        for key in [
+            "route_ms",
+            "plan_ms",
+            "gpu_gather_ms",
+            "gpu_compute_ms",
+            "cpu_prepare_ms",
+            "cpu_compute_ms",
+            "cpu_to_gpu_merge_ms",
+            "scatter_ms",
+            "graph_replay_count",
+        ]:
+            self.assertIn(key, out)
+
+        _ = ModelRunner.get_profile(mr, reset=True)
+        self.assertEqual(len(mr._profile), 0)
 
 
 if __name__ == "__main__":

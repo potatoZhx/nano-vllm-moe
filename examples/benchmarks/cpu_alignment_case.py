@@ -114,6 +114,8 @@ def run_case(args: argparse.Namespace) -> dict:
             cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
             enforce_eager=True,
             max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
             gpu_memory_utilization=args.gpu_memory_utilization,
             engine_profile=True,
             dist_port=args.dist_port,
@@ -149,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slots-per-layer", type=int, default=0)
     p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
-    p.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=True)
+    p.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=False)
     p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
     p.add_argument("--remap-cache-high-ids", type=str2bool, default=False)
     p.add_argument("--num-seqs", type=int, default=4)
@@ -158,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tokens", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-model-len", type=int, default=256)
+    p.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    p.add_argument("--max-num-seqs", type=int, default=16)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     p.add_argument("--dist-port", type=int, required=True)
     p.add_argument("--output", type=str, default="")

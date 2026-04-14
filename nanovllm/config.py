@@ -35,7 +35,7 @@ class Config:
     cpu_expert_execution_enabled: bool = False
     cpu_expert_num_threads: int = 4
     cpu_expert_parallel_mode: str = "serial"
-    cpu_gpu_parallel_execution_enabled: bool = True
+    cpu_gpu_parallel_execution_enabled: bool = False
     cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7
     gpu_plan_builder_enabled: bool = False
     gpu_plan_builder_fallback: bool = True

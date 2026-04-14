@@ -35,6 +35,16 @@ class TestSpecEngineBasic(unittest.TestCase):
         self.assertEqual(out, [7, 7])
         self.assertEqual(mr.calls[0][0], "run")
 
+    def test_get_profile_exposes_draft_ms_alias(self):
+        mr = _DummyModelRunner()
+        config = SimpleNamespace(max_draft_tokens=4, acceptance_strategy="greedy", acceptance_threshold=0.7)
+        engine = SpeculativeEngine(model_runner=mr, scheduler=_DummyScheduler(), config=config)
+        engine._profile["draft_loop_ms"] = 12.5
+
+        prof = engine.get_profile(reset=False)
+        self.assertIn("draft_ms", prof)
+        self.assertAlmostEqual(float(prof["draft_ms"]), 12.5, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

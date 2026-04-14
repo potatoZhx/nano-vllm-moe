@@ -199,7 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
-    parser.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=True)
+    parser.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
     parser.add_argument("--dist-port", type=int, default=2333)
     parser.add_argument("--seed", type=int, default=0)

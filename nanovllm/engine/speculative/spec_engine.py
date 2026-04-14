@@ -30,6 +30,10 @@ class SpeculativeEngine:
 
     def get_profile(self, reset: bool = False) -> dict:
         out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+        # Keep a canonical phase2_post field so benchmark/report layers don't have
+        # to infer draft-stage latency from internal counters.
+        if "draft_ms" not in out:
+            out["draft_ms"] = float(out.get("draft_loop_ms", 0.0))
         out["draft_steps_per_step"] = list(self._draft_steps_per_step)
         out["step_traces"] = deepcopy(self._step_traces)
         if reset:

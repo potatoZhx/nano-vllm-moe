@@ -23,7 +23,7 @@ def heterogeneous_moe_forward(
     cpu_expert_execution_enabled: bool = False,
     cpu_expert_parallel_mode: str = "serial",
     cpu_expert_num_threads: int = 4,
-    cpu_gpu_parallel_execution_enabled: bool = True,
+    cpu_gpu_parallel_execution_enabled: bool = False,
     cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     profile: dict | None = None,
 ) -> torch.Tensor:
@@ -40,6 +40,21 @@ def heterogeneous_moe_forward(
     cpu_indices = plan.cpu_route_indices
     has_cpu_work = cpu_indices is not None and cpu_indices.numel() > 0
     cpu_route_ratio = (float(cpu_indices.numel()) / float(flat_selected.numel())) if has_cpu_work else 0.0
+
+    if profile is not None:
+        profile["cpu_route_ratio_sum"] = float(cpu_route_ratio)
+        if has_cpu_work:
+            cpu_weight_mass = float(flat_weights.index_select(0, cpu_indices).sum().item())
+            total_weight_mass = float(flat_weights.sum().item())
+            profile["cpu_weight_mass_ratio_sum"] = (
+                cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
+            )
+        else:
+            profile["cpu_weight_mass_ratio_sum"] = 0.0
+        if plan.cpu_task_expert_ids is not None:
+            profile["realized_cpu_expert_count_sum"] = float(plan.cpu_task_expert_ids.numel())
+        else:
+            profile["realized_cpu_expert_count_sum"] = 0.0
 
     if has_cpu_work and cpu_expert_pool is None:
         raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")

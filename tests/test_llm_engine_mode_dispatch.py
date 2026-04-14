@@ -26,6 +26,18 @@ class _DummyRunner:
         self.calls.append((name, is_prefill, len(seqs)))
         return [42 for _ in seqs]
 
+    def get_profile(self, reset=False):
+        return {
+            "route_ms": 3.0,
+            "verify_ms": 0.0,
+            "graph_hit_rate": 0.8,
+            "graph_replay_count": 6,
+            "cpu_route_ratio": 0.25,
+            "cpu_weight_mass_ratio": 0.2,
+            "activated_expert_set_size": 4.0,
+            "realized_cpu_expert_count": 1.0,
+        }
+
 
 class _DummySpec:
     def __init__(self):
@@ -34,6 +46,13 @@ class _DummySpec:
     def speculative_step(self, seqs):
         self.calls.append(len(seqs))
         return [99 for _ in seqs]
+
+    def get_profile(self, reset=False):
+        return {
+            "draft_ms": 5.0,
+            "verify_ms": 7.0,
+            "spec_step_ms": 9.0,
+        }
 
 
 class TestLLMEngineModeDispatch(unittest.TestCase):
@@ -52,6 +71,23 @@ class TestLLMEngineModeDispatch(unittest.TestCase):
         self.assertEqual(eng.spec_engine.calls, [1])
         self.assertEqual(len(eng.scheduler.post_calls), 0)
         self.assertEqual(outputs, [])
+
+    def test_get_profile_adds_canonical_phase2_post_aliases(self):
+        eng = object.__new__(LLMEngine)
+        eng.profile_enabled = False
+        eng._profile = defaultdict(float)
+        eng.model_runner = _DummyRunner()
+        eng.spec_engine = _DummySpec()
+
+        profile = LLMEngine.get_profile(eng, reset=False)
+
+        self.assertAlmostEqual(float(profile["route_ms"]), 3.0, places=6)
+        self.assertAlmostEqual(float(profile["draft_ms"]), 5.0, places=6)
+        self.assertAlmostEqual(float(profile["verify_ms"]), 7.0, places=6)
+        self.assertAlmostEqual(float(profile["spec_step_ms"]), 9.0, places=6)
+        self.assertAlmostEqual(float(profile["graph_hit_rate"]), 0.8, places=6)
+        self.assertEqual(int(profile["graph_replay_count"]), 6)
+        self.assertAlmostEqual(float(profile["cpu_route_ratio"]), 0.25, places=6)
 
 
 if __name__ == "__main__":

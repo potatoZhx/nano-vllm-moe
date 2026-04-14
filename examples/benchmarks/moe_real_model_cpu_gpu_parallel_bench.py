@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from transformers import AutoConfig
+
 
 def str2bool(value: str) -> bool:
     value = value.strip().lower()
@@ -12,33 +14,6 @@ def str2bool(value: str) -> bool:
     if value in {"0", "false", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"Invalid bool value: {value}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Spec/verify benchmark by CPU expert-set ratios")
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--num-experts", type=int, default=128)
-    parser.add_argument("--cpu-ratios", type=str, default="0,25,50,75,100")
-    parser.add_argument("--parallel-settings", type=str, default="off,on")
-    parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
-    parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
-    parser.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
-    parser.add_argument("--num-seqs", type=int, default=8)
-    parser.add_argument("--input-len", type=int, default=64)
-    parser.add_argument("--output-len", type=int, default=24)
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
-    parser.add_argument("--max-num-seqs", type=int, default=16)
-    parser.add_argument("--max-draft-tokens", type=int, default=8)
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--dist-port-base", type=int, default=28600)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--enforce-eager", type=str2bool, default=True)
-    parser.add_argument("--engine-profile", type=str2bool, default=True)
-    parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
-    parser.add_argument("--output", type=str, default="")
-    return parser.parse_args()
 
 
 def _percentile(values: list[float], q: float) -> float:
@@ -85,6 +60,32 @@ def _extract_latency_breakdown_from_engine_profile(profile: dict) -> dict[str, f
     }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Real-model benchmark for CPU/GPU MoE parallel execution")
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--cpu-ratios", type=str, default="25,50,75")
+    parser.add_argument("--parallel-settings", type=str, default="off,on")
+    parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
+    parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    parser.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.7)
+    parser.add_argument("--num-seqs", type=int, default=2)
+    parser.add_argument("--input-len", type=int, default=32)
+    parser.add_argument("--output-len", type=int, default=8)
+    parser.add_argument("--max-model-len", type=int, default=512)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--max-num-seqs", type=int, default=16)
+    parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument("--dist-port-base", type=int, default=29600)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--enforce-eager", type=str2bool, default=True)
+    parser.add_argument("--engine-profile", type=str2bool, default=True)
+    parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--output", type=str, default="")
+    return parser.parse_args()
+
+
 def run_case(
     case_script: Path,
     args: argparse.Namespace,
@@ -98,7 +99,7 @@ def run_case(
         "--model-path",
         args.model_path,
         "--mode",
-        "spec",
+        "heter",
         "--slots-per-layer",
         str(slots_per_layer),
         "--num-seqs",
@@ -113,8 +114,8 @@ def run_case(
         str(args.max_num_batched_tokens),
         "--max-num-seqs",
         str(args.max_num_seqs),
-        "--max-draft-tokens",
-        str(args.max_draft_tokens),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
         "--cpu-expert-execution-enabled",
         "true",
         "--cpu-expert-parallel-mode",
@@ -146,7 +147,9 @@ def run_case(
     ]
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     if proc.returncode != 0:
-        raise RuntimeError(f"Benchmark case failed (slots={slots_per_layer}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        raise RuntimeError(
+            f"Benchmark case failed (slots={slots_per_layer}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
         raise RuntimeError("No JSON output from heterogeneous_benchmark_case.py")
@@ -167,6 +170,7 @@ def main() -> None:
             raise ValueError(f"Invalid parallel setting: {token}")
     parallel_settings = list(dict.fromkeys(parallel_settings))
 
+    num_experts = int(getattr(AutoConfig.from_pretrained(args.model_path), "num_experts"))
     case_script = Path(__file__).resolve().parents[1] / "heterogeneous_benchmark_case.py"
 
     rows = []
@@ -174,17 +178,16 @@ def main() -> None:
     case_idx = 0
     for ratio in ratios:
         cpu_ratio = max(0.0, min(1.0, ratio / 100.0))
-        slots = int(round(args.num_experts * (1.0 - cpu_ratio)))
+        slots = max(1, int(round(num_experts * (1.0 - cpu_ratio))))
         per_mode: dict[bool, dict] = {}
 
         for parallel_enabled in parallel_settings:
             latencies: list[float] = []
             throughput_output: list[float] = []
             throughput_total: list[float] = []
-            verify_per_call: list[float] = []
-            spec_step_per_call: list[float] = []
             cpu_route_ratios: list[float] = []
             cpu_weight_mass_ratios: list[float] = []
+            realized_cpu_expert_counts: list[float] = []
             gpu_path_exec_ms_list: list[float] = []
             cpu_path_exec_ms_list: list[float] = []
             wait_ms_list: list[float] = []
@@ -206,15 +209,9 @@ def main() -> None:
                 latencies.append(elapsed_sec * 1000.0)
                 throughput_output.append(float(result.get("throughput_output_tok_s", 0.0)))
                 throughput_total.append(float(result.get("throughput_total_tok_s", 0.0)))
-
-                verify_ms = float(profile.get("spec_verify_ms", 0.0))
-                verify_count = max(1.0, float(profile.get("spec_run_verify_calls", 0.0)))
-                spec_step_ms = float(profile.get("spec_spec_step_ms", 0.0))
-                spec_step_count = max(1.0, float(profile.get("spec_spec_step_count", 0.0)))
-                verify_per_call.append(verify_ms / verify_count)
-                spec_step_per_call.append(spec_step_ms / spec_step_count)
                 cpu_route_ratios.append(float(profile.get("model_cpu_route_ratio", 0.0)))
                 cpu_weight_mass_ratios.append(float(profile.get("model_cpu_weight_mass_ratio", 0.0)))
+                realized_cpu_expert_counts.append(float(profile.get("model_realized_cpu_expert_count", 0.0)))
 
                 breakdown = _extract_latency_breakdown_from_engine_profile(profile)
                 gpu_path_exec_ms_list.append(float(breakdown["gpu_path_exec_ms"]))
@@ -241,10 +238,9 @@ def main() -> None:
                 "latency_ms_mean": latency_mean,
                 "throughput_output_tok_s_mean": _mean(throughput_output),
                 "throughput_total_tok_s_mean": _mean(throughput_total),
-                "verify_ms_per_call_mean": _mean(verify_per_call),
-                "spec_step_ms_per_call_mean": _mean(spec_step_per_call),
                 "cpu_route_ratio": _mean(cpu_route_ratios),
                 "cpu_weight_mass_ratio": _mean(cpu_weight_mass_ratios),
+                "realized_cpu_expert_count": _mean(realized_cpu_expert_counts),
                 "latency_breakdown_gpu_path_exec_ms": gpu_path_exec_ms_mean,
                 "latency_breakdown_cpu_path_exec_ms": cpu_path_exec_ms_mean,
                 "latency_breakdown_wait_ms": wait_ms_mean,
@@ -266,7 +262,7 @@ def main() -> None:
             curves.append(
                 {
                     "cpu_expert_set_ratio": cpu_ratio,
-                    "verify_latency_speedup_parallel_vs_serial": (
+                    "latency_speedup_parallel_vs_serial": (
                         serial_mean / parallel_mean if parallel_mean > 0 else 0.0
                     ),
                 }
@@ -274,8 +270,9 @@ def main() -> None:
 
     report = {
         "config": {
+            "model_path": args.model_path,
             "cpu_ratios": ratios,
-            "num_experts": args.num_experts,
+            "num_experts": num_experts,
             "parallel_settings": parallel_settings,
             "cpu_expert_parallel_mode": args.cpu_expert_parallel_mode,
             "cpu_expert_num_threads": args.cpu_expert_num_threads,
@@ -283,10 +280,12 @@ def main() -> None:
             "num_seqs": args.num_seqs,
             "input_len": args.input_len,
             "output_len": args.output_len,
+            "max_model_len": args.max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "max_num_seqs": args.max_num_seqs,
-            "enforce_eager": args.enforce_eager,
             "repeat": args.repeat,
+            "enforce_eager": args.enforce_eager,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
         },
         "results": rows,
         "curves": curves,

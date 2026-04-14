@@ -106,10 +106,39 @@ class TestCpuGpuParallelMoe(unittest.TestCase):
             profile=None,
         )
 
+        profile_gated: dict[str, float] = {}
+        _ = heterogeneous_moe_forward(
+            hidden_states=hidden_states,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            expert_cache=cache,
+            cpu_expert_pool=cpu_pool,
+            act_fn=act_fn,
+            plan=plan,
+            cpu_expert_execution_enabled=True,
+            cpu_expert_parallel_mode="serial",
+            cpu_expert_num_threads=1,
+            cpu_gpu_parallel_execution_enabled=True,
+            cpu_gpu_parallel_min_cpu_route_ratio=1.0,
+            profile=profile_gated,
+        )
+
         self.assertTrue(torch.allclose(out_serial.float(), out_overlap.float(), atol=1e-5, rtol=1e-5))
         self.assertTrue(torch.allclose(out_serial.float(), out_overlap_ep.float(), atol=1e-5, rtol=1e-5))
         self.assertGreaterEqual(float(profile_overlap.get("parallel_enabled_count", 0.0)), 1.0)
         self.assertGreaterEqual(float(profile_overlap.get("parallel_overlap_est_ms", 0.0)), 0.0)
+        for key in [
+            "gpu_gather_ms",
+            "gpu_compute_ms",
+            "scatter_ms",
+            "cpu_prepare_ms",
+            "cpu_compute_ms",
+            "cpu_to_gpu_merge_ms",
+            "parallel_wall_ms",
+        ]:
+            self.assertIn(key, profile_overlap)
+        self.assertEqual(float(profile_gated.get("parallel_enabled_count", 0.0)), 0.0)
+        self.assertEqual(float(profile_gated.get("parallel_wall_ms", 0.0)), 0.0)
 
 
 if __name__ == "__main__":
