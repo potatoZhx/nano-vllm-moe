@@ -9,7 +9,7 @@ from nanovllm.sampling_params import SamplingParams
 class TestSchedulerDraftKVWrappers(unittest.TestCase):
     def test_scheduler_wraps_block_manager_draft_apis(self):
         cfg = Config(
-            model="/zx_data1/models/Qwen--Qwen3-30B-A3B-Base",
+            model="/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B",
             max_num_seqs=1,
             max_num_batched_tokens=32,
             max_model_len=16,

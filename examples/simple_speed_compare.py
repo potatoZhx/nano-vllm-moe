@@ -6,7 +6,7 @@
 
 示例：
 CUDA_VISIBLE_DEVICES=3 python /zx_data1/sparsity/nano-vllm-moe/examples/simple_speed_compare.py \
-  --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base \
+  --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
   --max-new-tokens 50 \
   --enforce-eager \
   --warmup 1
@@ -199,7 +199,7 @@ def main() -> None:
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/zx_data1/models/Qwen--Qwen3-30B-A3B-Base",
+        default="/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B",
         help="HuggingFace model path",
     )
     parser.add_argument("--max-new-tokens", type=int, default=50)

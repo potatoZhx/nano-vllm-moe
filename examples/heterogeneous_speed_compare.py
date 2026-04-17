@@ -9,15 +9,15 @@ from pathlib import Path
 
 '''
 单案例（标准）
-python examples/heterogeneous_benchmark_case.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+python examples/heterogeneous_benchmark_case.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0
 
 单案例（异构，默认 S=N）
-python examples/heterogeneous_benchmark_case.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+python examples/heterogeneous_benchmark_case.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
 自动对比并输出统计
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
 '''
 
 
@@ -264,7 +264,7 @@ def build_qualitative_samples(standard: dict, heterogeneous: dict, max_examples:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run standard vs heterogeneous benchmark in isolated processes.")
-    parser.add_argument("--model-path", default=os.path.expanduser("/zx_data1/models/Qwen--Qwen3-30B-A3B-Base"))
+    parser.add_argument("--model-path", default=os.path.expanduser("/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B"))
     parser.add_argument("--slots-per-layer", type=int, default=0)
     parser.add_argument("--num-seqs", type=int, default=64)
     parser.add_argument("--min-input-len", type=int, default=64)

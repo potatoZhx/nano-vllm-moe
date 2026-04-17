@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# CUDA_VISIBLE_DEVICES=2 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --max-draft-tokens 4 --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_profile_avg.json
+# CUDA_VISIBLE_DEVICES=2 conda run -n moe_spec python examples/three_mode_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --num-seqs 1 --input-len 12 --output-len 6 --temperature 0.0 --enforce-eager true --check-correctness true --max-draft-tokens 4 --dist-port-base 27420 --result-json benchmarks/results/three_mode_smoke_profile_avg.json
 
 
 def str2bool(value: str) -> bool:
@@ -133,7 +133,7 @@ def summarize(standard: dict, heter: dict, spec: dict, deterministic: bool) -> d
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare standard/heter/spec modes on speed and correctness.")
-    parser.add_argument("--model-path", default=os.path.expanduser("/zx_data1/models/Qwen--Qwen3-30B-A3B-Base"))
+    parser.add_argument("--model-path", default=os.path.expanduser("/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B"))
     parser.add_argument("--slots-per-layer", type=int, default=0)
     parser.add_argument("--num-seqs", type=int, default=8)
     parser.add_argument("--input-len", type=int, default=64)

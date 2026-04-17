@@ -673,13 +673,13 @@ print('ok', len(out), len(out[0]['token_ids']))
 llm.exit()
 PY
 
-读取 [](file:///zx_data1/models)
+读取 [](file:///data1/group_谈海生/mumura/models)
 
 我找到了可用的小模型路径，接下来用它做一次最小运行验证，避免 30B 干扰排障。
 
 Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -p /opt/conda --no-capture-output python - <<'PY'
 from nanovllm import LLM, SamplingParams
-path = '/zx_data1/models/Qwen3-0.6B/'
+path = '/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B'
 llm = LLM(path, enforce_eager=True, max_model_len=1024, enable_heterogeneous=True, heterogeneous_slots_per_layer=0)
 out = llm.generate([[1,2,3,4]], SamplingParams(temperature=0.0, max_tokens=4), use_tqdm=False)
 print('ok', len(out), len(out[0]['token_ids']))
@@ -687,7 +687,7 @@ llm.exit()
 PY
 Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -p /opt/conda --no-capture-output python - <<'PY'
 from nanovllm import LLM, SamplingParams
-path = '/zx_data1/models/Qwen3-0.6B/'
+path = '/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B'
 llm = LLM(path, enforce_eager=True, max_model_len=1024, enable_heterogeneous=True, heterogeneous_slots_per_layer=0)
 out = llm.generate([[1,2,3,4]], SamplingParams(temperature=0.0, max_tokens=4), use_tqdm=False)
 print('ok', len(out), len(out[0]['token_ids']))
@@ -738,7 +738,7 @@ PY
 
 **建议你马上复测**
 1. 先用你同一条命令复测初始化：
-   - `python examples/heterogeneous_benchmark_case.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0`
+   - `python examples/heterogeneous_benchmark_case.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0`
 2. 若仍有 OOM，我下一步会加“初始化阶段显存打点”（模型构建后、non-expert 后、slot 填充后）到基准脚本，精确定位剩余峰值来源。
 
 Made changes.
@@ -788,8 +788,8 @@ Completed with input: {
   "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
 }
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enforce-eager true
-Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enforce-eager true
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enforce-eager true
 
 当前 debug 脚本一次进程里连跑标准+异构，第二段触发了显存残留导致 OOM。আমি会把脚本改成“单模式单进程”运行，再分别跑标准与异构两次并对比，避免结果被初始化残留干扰。
 
@@ -803,9 +803,9 @@ Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
 
 我再把异构 debug 细化一层：把 `heterogeneous_moe_forward` 的内部阶段拆分计时（plan、expand、两次 fused、scatter），避免当前统计里的重复 remap 干扰结论。跑完这次就能给出更精确归因。
 
@@ -819,9 +819,9 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
 
 搜索正则表达式 `def remap_experts_to_slots|def build_moe_execution_plan|def heterogeneous_moe_forward|class Qwen3MoeHeterogeneousSparseMoeBlock|def get_expert_counts_and_idx` (`**/nanovllm/**/*.py`)，6 个结果
 
@@ -1065,11 +1065,11 @@ Completed with input: {
   "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
 }
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec --no-capture-output python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/cache.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py)，未发现问题
 
@@ -1178,19 +1178,19 @@ Made changes.
 
 读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/hetero_compare.json)
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
-Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
-Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Completed with input:  cd /zx_data1/sparsity/nano-vllm-moe && source /root/miniconda3/etc/profile.d/conda.sh && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
 
 我拿到了你这次的 JSON，确认确实是 `0.315`；另外我发现刚才这边激活 `moe_spec` 失败是因为 conda 初始化脚本路径不对。我马上改用通用方式激活环境并复跑 profile，给你准确的分段耗时归因。
 
 Ran terminal command:  conda info --base
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0 --num-seqs 64 --min-input-len 64 --max-input-len 512 --min-output-len 32 --max-output-len 128 --max-model-len 4096 --seed 0 --enforce-eager true
 
 分段结果已经跑出来了：这次异构主要慢在 `plan`（约 7.46s）和重排相关开销，而不是 CPU fallback。接下来我会直接改两个脚本：1）吞吐指标改成 input/output/total 三套；2）新增固定输入下的 token 级一致性检查，让你每次改动都能同时看“性能+正确性”。
 
@@ -1214,7 +1214,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shel
 
 脚本已改完并通过静态检查。现在我会在 `moe_spec` 里先用小规模参数跑一轮，确认新输出字段与正确性检查都正常，再给你推荐一组“稳定可对比”的正式命令。
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 16 --max-output-len 24 --seed 0 --enforce-eager true --result-json benchmarks/results/hetero_compare_smoke.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 16 --max-output-len 24 --seed 0 --enforce-eager true --result-json benchmarks/results/hetero_compare_smoke.json
 
 读取 [](file:///zx_data1/sparsity/nano-vllm-moe/benchmarks/results/hetero_compare_smoke.json#1-1)，行 1 到 260
 
@@ -1228,7 +1228,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shel
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 16 --max-output-len 24 --seed 0 --enforce-eager true --max-mismatches 2 --result-json benchmarks/results/hetero_compare_smoke.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 16 --max-output-len 24 --seed 0 --enforce-eager true --max-mismatches 2 --result-json benchmarks/results/hetero_compare_smoke.json
 
 我已经完成脚本改造并做了小规模实跑验证，输出现在同时包含性能与一致性信息。最后我再读取一下改动位置的行号，给你一份可直接复现实验与判断结果的结论。
 
@@ -1258,7 +1258,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shel
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_benchmark_case.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_speed_compare.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 8 --max-output-len 8 --temperature 1e-5 --seed 0 --enforce-eager true --max-mismatches 2 --result-json benchmarks/results/hetero_compare_smoke.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shell.bash hook)" && conda activate moe_spec && python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --num-seqs 8 --min-input-len 64 --max-input-len 96 --min-output-len 8 --max-output-len 8 --temperature 1e-5 --seed 0 --enforce-eager true --max-mismatches 2 --result-json benchmarks/results/hetero_compare_smoke.json
 
 搜索正则表达式 `def summarize_correctness|--check-correctness|throughput_total_tok_s|--temperature` (`**/nano-vllm-moe/examples/heterogeneous_speed_compare.py`)，8 个结果
 
@@ -1307,11 +1307,11 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && eval "$(conda shel
 
 1. 性能+正确性一起跑（推荐）
 conda activate moe_spec
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 
 2. 只看性能（排除 token 比对开销）
 conda activate moe_spec
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --check-correctness false --result-json benchmarks/results/hetero_compare_perf_only.json
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --check-correctness false --result-json benchmarks/results/hetero_compare_perf_only.json
 
 如果你要更严格地做“正确性不受影响”验证，建议：
 1. 把输出长度先收短（例如固定 1 到 8）减少分叉放大。  
@@ -1421,11 +1421,11 @@ Completed with input: {
   "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
 }
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0
 
 我刚完成实测：吞吐差距已收敛到约 -19%，但 debug 输出里出现了 `atexit` 二次 `exit()` 的噪声异常。下一步我会顺手把 `LLMEngine.exit` 做成幂等，避免干扰后续 profiling。
 
@@ -1439,9 +1439,9 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/engine/llm_engine.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --num-seqs 8 --min-input-len 32 --max-input-len 64 --min-output-len 16 --max-output-len 32
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --num-seqs 8 --min-input-len 32 --max-input-len 64 --min-output-len 16 --max-output-len 32
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
 读取活动 git 存储库中已更改的文件
 
@@ -1575,11 +1575,11 @@ Completed with input: {
   "resourcePath": "/zx_data1/sparsity/nano-vllm-moe"
 }
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 
 已继续优化，并完成复测。当前这一轮的核心收益是把异构 forward 里的大张量展开去掉了，plan 也减少了重复索引路径，端到端差距进一步缩小。
 
@@ -1631,7 +1631,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 Made changes.
 [results]
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 === Standard Path ===
 input=33561, output=5034, processed=38595, time=17.246s, output_tps=291.90, total_tps=2237.92
 === Heterogeneous Path (S=N by default when slots=0) ===
@@ -1679,15 +1679,15 @@ Saved report to: benchmarks/results/hetero_compare.json
 
 这轮改动已通过检查。我现在跑异构/标准 debug 和端到端对比，确认这次“去 token_indices 构造”是否带来可见增益。
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0
 
 这次异构 debug 出现异常回退（plan 激增到 17s），和改动点不一致，我会立刻复跑同命令确认是否是环境抖动；若稳定复现再回滚这次变更。
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --result-json benchmarks/results/hetero_compare.json
 
 读取记忆 [](file:///root/.vscode-server/data/User/globalStorage/github.copilot-chat/memory-tool/memories/preferences.md)
 
@@ -1736,7 +1736,7 @@ Made changes.
 
 [results]
 
-/zx_data1/sparsity/nano-vllm-moe# python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 5
+/zx_data1/sparsity/nano-vllm-moe# python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 5
 === Standard Path ===
 input=33561, output=5034, processed=38595, time=12.840s, output_tps=392.04, total_tps=3005.73
 === Heterogeneous Path (S=N by default when slots=0) ===
@@ -1840,12 +1840,12 @@ heterogeneous: <|endoftext|>Human: The task is to propose a practical strategy t
 用法示例：
 1. 快速模式（默认，不加开关）
 ```bash
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0
 ```
 
 2. 稳健模式（会更慢）
 ```bash
-python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
+python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 7
 ```
 
 我也做了文件级错误检查，当前无语法/诊断错误。
@@ -1900,7 +1900,7 @@ Made changes.
 
 已检查 [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/expert/placement.py), [](file:///zx_data1/sparsity/nano-vllm-moe/nanovllm/layers/fuse_moe/heterogeneous.py), [](file:///zx_data1/sparsity/nano-vllm-moe/examples/heterogeneous_debug_profile.py)，未发现问题
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
 Made changes.
 
@@ -1912,13 +1912,13 @@ Made changes.
 
 我已经确认好脚本参数了，接下来开始正式重跑：先跑标准 debug，再跑异构 debug，最后跑 speed_compare 形成完整 A/B 结果。
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous false --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous false --slots-per-layer 0
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
 标准和异构 debug 都已重跑完成，结果与上次接近但异构本次略低一些。现在我跑端到端 speed_compare，把吞吐比和正确性摘要一起更新给你。
 
-Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0
+Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0
 
 本轮已按你的要求重试完成，结果如下。
 
@@ -1950,7 +1950,7 @@ Ran terminal command:  cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_s
 
 如果你同意，我下一步会直接做一轮更激进的 plan/scatter 优化并再重跑同一套对比。
 [results]
-CUDA_VISIBLE_DEVICES=3 python examples/heterogeneous_speed_compare.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 5
+CUDA_VISIBLE_DEVICES=3 python examples/heterogeneous_speed_compare.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --slots-per-layer 0 --enable-robust-benchmark true --robust-repeat 5
 === Standard Path ===
 input=33561, output=5034, processed=38595, time=14.009s, output_tps=359.34, total_tps=2755.03
 === Heterogeneous Path (S=N by default when slots=0) ===

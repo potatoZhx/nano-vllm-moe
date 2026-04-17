@@ -8,7 +8,7 @@ import torch
 
 from nanovllm import LLM, SamplingParams
 
-# cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /zx_data1/models/Qwen--Qwen3-30B-A3B-Base --enable-heterogeneous true --slots-per-layer 0
+# cd /zx_data1/sparsity/nano-vllm-moe && conda run -n moe_spec python examples/heterogeneous_debug_profile.py --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B --enable-heterogeneous true --slots-per-layer 0
 
 
 GREEDY_LIKE_TEMPERATURE = 1e-5

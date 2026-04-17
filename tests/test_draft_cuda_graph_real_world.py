@@ -28,7 +28,7 @@ class TestDraftCudaGraphRealWorld(unittest.TestCase):
 
         cls.repo_root = Path(__file__).resolve().parents[1]
         cls.case_script = cls.repo_root / "examples" / "heterogeneous_benchmark_case.py"
-        cls.model_path = Path(os.getenv("NANOVLLM_REAL_MODEL_PATH", "/zx_data1/models/Qwen--Qwen3-30B-A3B-Base"))
+        cls.model_path = Path(os.getenv("NANOVLLM_REAL_MODEL_PATH", "/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B"))
         if not cls.model_path.is_dir():
             raise unittest.SkipTest(f"Model path not found: {cls.model_path}")
 
