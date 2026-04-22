@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 from glob import glob
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -20,6 +23,9 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
+
+if TYPE_CHECKING:
+    from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -297,6 +303,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_gpu_parallel_execution_enabled = False
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.7
         self._last_profile: dict[str, float] = {}
+        self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
 
     def enable_heterogeneous(
         self,
@@ -326,6 +333,12 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.draft_scheduler = draft_scheduler
         self.draft_top_c = draft_top_c
 
+    def set_runtime_meta_recorder(
+        self,
+        recorder: ModelRuntimeMetaRecorder | None,
+    ) -> None:
+        self.runtime_meta_recorder = recorder
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.expert_cache is None:
             raise RuntimeError("Heterogeneous MoE block is not initialized with expert cache.")
@@ -339,6 +352,13 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
         profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
+
+        if self.runtime_meta_recorder is not None:
+            self.runtime_meta_recorder.record_layer(
+                layer_idx=self.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+            )
 
         t_plan0 = perf_counter()
         if self.execution_mode == "draft":
@@ -601,6 +621,14 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_speculative_execution(mode, draft_scheduler, draft_top_c)
+
+    def set_runtime_meta_recorder(
+        self,
+        recorder: ModelRuntimeMetaRecorder | None,
+    ) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                layer.mlp.set_runtime_meta_recorder(recorder)
 
     def get_and_reset_heterogeneous_profile(self) -> dict[str, float]:
         agg: dict[str, float] = {}

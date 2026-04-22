@@ -1,8 +1,31 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
+
+
+@dataclass
+class DraftSchedulerContext:
+    uncached_expert_mask: torch.Tensor
+    routing_weights_flat: torch.Tensor
+    selected_experts_flat: torch.Tensor
+    top_c: int
+
+
+def build_draft_scheduler_context(
+    uncached_expert_mask: torch.Tensor,
+    routing_weights_flat: torch.Tensor,
+    selected_experts_flat: torch.Tensor,
+    top_c: int,
+) -> DraftSchedulerContext:
+    return DraftSchedulerContext(
+        uncached_expert_mask=uncached_expert_mask,
+        routing_weights_flat=routing_weights_flat,
+        selected_experts_flat=selected_experts_flat,
+        top_c=int(top_c),
+    )
 
 
 class DraftScheduler(ABC):

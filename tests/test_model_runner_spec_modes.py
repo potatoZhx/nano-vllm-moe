@@ -30,13 +30,14 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr.profile_cuda_sync = False
         mr.rank = 0
         mr._profile = {}
+        mr._prefetch_step_id = 0
         mr._decode_graph_policy = "standard"
         mr.run = lambda seqs, is_prefill: [7 for _ in seqs]
 
         out, aux = ModelRunner.run_draft(mr, [SimpleNamespace(seq_id=1)])
 
         self.assertEqual(out, [7])
-        self.assertEqual(aux, [])
+        self.assertIn("prefetch_step_id", aux)
         self.assertEqual(mr.model.mode_calls[0][0], "draft")
         self.assertEqual(mr.model.mode_calls[-1][0], "normal")
         self.assertEqual(mr._decode_graph_policy, "standard")
@@ -51,6 +52,7 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr.world_size = 1
         mr.rank = 0
         mr._profile = {}
+        mr._prefetch_step_id = 0
         mr.prepare_prefill = lambda seqs: (torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
 
         traces = ModelRunner.run_verify(mr, [SimpleNamespace(seq_id=1)], [3])

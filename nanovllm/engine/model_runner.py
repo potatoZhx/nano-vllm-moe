@@ -12,6 +12,10 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.scheduling.draft_scheduler import create_draft_scheduler
+from nanovllm.scheduling.cache_strategy import create_cache_strategy
+from nanovllm.scheduling.prefetch_strategy import create_prefetch_strategy
+from nanovllm.expert.prefetcher import PrefetchRuntime
+from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
@@ -34,6 +38,13 @@ class ModelRunner:
         self.profile_enabled = bool(getattr(config, "engine_profile", False))
         self.profile_cuda_sync = bool(getattr(config, "engine_profile_cuda_sync", True))
         self._profile = defaultdict(float)
+        self.layer_caches = {}
+        self.cpu_expert_pool = {}
+        self.cache_strategy = create_cache_strategy(config.cache_strategy)
+        self.prefetch_strategy = create_prefetch_strategy(config.prefetch_strategy, config)
+        self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
+        self.prefetch_runtime: PrefetchRuntime | None = None
+        self._prefetch_step_id = 0
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -46,6 +57,8 @@ class ModelRunner:
         if config.enable_heterogeneous and hasattr(self.model, "enable_heterogeneous_mode"):
             loader = HeterogeneousModelLoader(config)
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
+            self.layer_caches = layer_caches
+            self.cpu_expert_pool = cpu_expert_pool
             self.model.enable_heterogeneous_mode(
                 layer_caches,
                 cpu_expert_pool,
@@ -56,6 +69,19 @@ class ModelRunner:
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.7),
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
+
+            if config.spec_enable_prefetch:
+                self.runtime_meta_recorder = ModelRuntimeMetaRecorder(config=config, hf_config=config.hf_config)
+                self.prefetch_runtime = PrefetchRuntime(
+                    config=config,
+                    layer_caches=self.layer_caches,
+                    cpu_expert_pool=self.cpu_expert_pool,
+                    cache_strategy=self.cache_strategy,
+                    prefetch_strategy=self.prefetch_strategy,
+                    runtime_meta_recorder=self.runtime_meta_recorder,
+                )
+                if hasattr(self.model, "set_runtime_meta_recorder"):
+                    self.model.set_runtime_meta_recorder(self.runtime_meta_recorder)
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None
@@ -135,6 +161,10 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             self._profile[key] += dt_sec * 1000.0
 
+    def _next_prefetch_step_id(self) -> int:
+        self._prefetch_step_id += 1
+        return self._prefetch_step_id
+
     def get_profile(self, reset: bool = False) -> dict:
         if self.rank != 0:
             return {}
@@ -153,8 +183,13 @@ class ModelRunner:
             out["cpu_weight_mass_ratio"] = 0.0
             out["activated_expert_set_size"] = 0.0
             out["realized_cpu_expert_count"] = 0.0
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is not None:
+            out.update(prefetch_runtime.get_profile(reset=False))
         if reset:
             self._profile.clear()
+            if prefetch_runtime is not None:
+                _ = prefetch_runtime.get_profile(reset=True)
         return out
 
     def _run_model_eager(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -340,6 +375,18 @@ class ModelRunner:
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         self._record_profile("prepare_prefill_ms" if is_prefill else "prepare_decode_ms", perf_counter() - t0)
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        prefill_step_id = None
+        if is_prefill and prefetch_runtime is not None and runtime_meta_recorder is not None:
+            prefill_step_id = self._next_prefetch_step_id()
+            token_count = int(input_ids.numel())
+            runtime_meta_recorder.arm(
+                mode="prefill",
+                step_id=prefill_step_id,
+                token_capacity=token_count,
+                logical_token_count=token_count,
+            )
         if self.profile_enabled and self.rank == 0:
             self._profile["prepare_count"] += 1
             self._profile["prefill_count"] += int(is_prefill)
@@ -364,6 +411,19 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             self._profile["tokens_in_total"] += int(input_ids.numel())
             self._profile["run_count"] += 1
+
+        if is_prefill and prefetch_runtime is not None and runtime_meta_recorder is not None and prefill_step_id is not None:
+            meta_t0 = perf_counter()
+            handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
+            runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
+            prefetch_runtime.observe_prefill(runtime_meta, step_id=prefill_step_id)
+            if handle is not None:
+                prefetch_runtime.record_metadata_offload(
+                    dt_ms=(perf_counter() - meta_t0) * 1000.0,
+                    num_bytes=handle.buffer_bytes,
+                )
+            runtime_meta_recorder.reset()
+
         reset_context()
         return token_ids
 
@@ -372,14 +432,45 @@ class ModelRunner:
             draft_top_c = getattr(self.config, "draft_top_c", 0)
             self.model.set_speculative_execution_mode(mode, self.draft_scheduler, draft_top_c)
 
-    def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], list]:
+    @torch.inference_mode()
+    def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], dict[str, object]]:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
         t0 = perf_counter()
+        step_id = self._next_prefetch_step_id()
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         self._set_speculative_execution_mode("draft")
         self._decode_graph_policy = "draft"
         try:
+            if prefetch_runtime is not None and runtime_meta_recorder is not None:
+                draft_capacity = len(seqs)
+                if self._can_use_draft_cudagraph(len(seqs)):
+                    draft_capacity = next(x for x in self.draft_graph_bs if x >= len(seqs))
+
+                prefetch_runtime.publish_ready(step_id=step_id)
+                prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="before_draft")
+                runtime_meta_recorder.arm(
+                    mode="draft",
+                    step_id=step_id,
+                    token_capacity=draft_capacity,
+                    logical_token_count=len(seqs),
+                )
+
             token_ids = self.run(seqs, False)
-            return token_ids, []
+
+            if prefetch_runtime is not None and runtime_meta_recorder is not None:
+                meta_t0 = perf_counter()
+                handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
+                runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
+                prefetch_runtime.observe_draft(runtime_meta, step_id=step_id)
+                prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="after_draft")
+                if handle is not None:
+                    prefetch_runtime.record_metadata_offload(
+                        dt_ms=(perf_counter() - meta_t0) * 1000.0,
+                        num_bytes=handle.buffer_bytes,
+                    )
+                runtime_meta_recorder.reset()
+            return token_ids, {"prefetch_step_id": step_id}
         finally:
             self._decode_graph_policy = "standard"
             self._set_speculative_execution_mode("normal")
@@ -390,14 +481,39 @@ class ModelRunner:
                 if self.rank == 0:
                     self._profile["run_draft_count"] += 1
 
+    def wait_prefetch_for_verify(self, step_id: int) -> dict[str, float]:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is None:
+            return {}
+        t0 = perf_counter()
+        prefetch_runtime.wait_for_verify(
+            step_id=step_id,
+            timeout_ms=float(self.config.prefetch_verify_wait_ms),
+        )
+        return {
+            "verify_prefetch_wait_ms": (perf_counter() - t0) * 1000.0,
+        }
+
     @torch.inference_mode()
     def run_verify(self, seqs: list[Sequence], verify_lengths: list[int]) -> list[list[int]]:
         """Run one-shot verify in prefill-like mode and return per-sequence argmax traces."""
         total_t0 = perf_counter()
+        step_id = self._next_prefetch_step_id()
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         self._set_speculative_execution_mode("verify")
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs)
         self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
+
+        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            token_count = int(input_ids.numel())
+            runtime_meta_recorder.arm(
+                mode="verify",
+                step_id=step_id,
+                token_capacity=token_count,
+                logical_token_count=token_count,
+            )
 
         # compute_logits() slices prefill outputs to last token per sequence.
         # Verify needs logits for every queried token position.
@@ -438,6 +554,20 @@ class ModelRunner:
             seq_logits = logits[offset:offset + length]
             offset += length
             verify_tokens_per_seq.append(seq_logits.argmax(dim=-1).tolist())
+
+        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            meta_t0 = perf_counter()
+            handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
+            runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
+            prefetch_runtime.observe_verify(runtime_meta, step_id=step_id)
+            prefetch_runtime.record_verify_consumed(runtime_meta, step_id=step_id)
+            prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="after_verify")
+            if handle is not None:
+                prefetch_runtime.record_metadata_offload(
+                    dt_ms=(perf_counter() - meta_t0) * 1000.0,
+                    num_bytes=handle.buffer_bytes,
+                )
+            runtime_meta_recorder.reset()
         return verify_tokens_per_seq
 
     @torch.inference_mode()
@@ -510,10 +640,18 @@ class ModelRunner:
             return
 
         self._set_speculative_execution_mode("draft")
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         try:
             for bs in reversed(self.draft_graph_bs):
                 graph = torch.cuda.CUDAGraph()
                 set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="draft",
+                        step_id=-1,
+                        token_capacity=bs,
+                        logical_token_count=bs,
+                    )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 with torch.cuda.graph(graph, self.draft_graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
@@ -521,6 +659,8 @@ class ModelRunner:
                     self.draft_graph_pool = graph.pool()
                 self.draft_graphs[bs] = graph
                 torch.cuda.synchronize()
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.reset()
                 reset_context()
         finally:
             self._set_speculative_execution_mode("normal")

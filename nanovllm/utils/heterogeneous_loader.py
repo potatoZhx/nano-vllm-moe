@@ -111,6 +111,8 @@ class HeterogeneousModelLoader:
                 device=torch.device("cuda"),
                 dtype=self.hf_config.torch_dtype,
                 cpu_expert_pool=experts,
+                staging_slots_per_layer=getattr(self.config, "prefetch_staging_slots_per_layer", 0),
+                enable_prefetch=bool(getattr(self.config, "spec_enable_prefetch", False)),
             )
         return layer_caches
 

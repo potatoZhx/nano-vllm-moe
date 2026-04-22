@@ -45,9 +45,14 @@ def _build_grouped_layout(
     gpu_route_indices: torch.Tensor,
     num_slots: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Group tokens by slot id for grouped GEMM.
-    sorted_slots, sort_idx = torch.sort(gpu_slots)
-    sorted_gpu_route_indices = gpu_route_indices.index_select(0, sort_idx)
+    # Group routes by slot id with deterministic tie-break on original route index.
+    # This keeps intra-slot order stable across runs and matches route-major semantics.
+    route_order = torch.argsort(gpu_route_indices, stable=True)
+    slots_by_route = gpu_slots.index_select(0, route_order)
+    slot_order = torch.argsort(slots_by_route, stable=True)
+    final_order = route_order.index_select(0, slot_order)
+    sorted_slots = gpu_slots.index_select(0, final_order)
+    sorted_gpu_route_indices = gpu_route_indices.index_select(0, final_order)
     # Use fixed-shape scatter_add to keep graph capture friendly on some runtimes.
     m_sizes = torch.zeros(num_slots, dtype=torch.int32, device=sorted_slots.device)
     ones = torch.ones_like(sorted_slots, dtype=torch.int32)
@@ -87,8 +92,12 @@ def _build_cpu_task_layout(
         return None, None, None
 
     cpu_experts = flat_selected_original.index_select(0, cpu_route_indices)
-    sorted_experts, sort_idx = torch.sort(cpu_experts)
-    sorted_route_indices = cpu_route_indices.index_select(0, sort_idx)
+    route_order = torch.argsort(cpu_route_indices, stable=True)
+    experts_by_route = cpu_experts.index_select(0, route_order)
+    expert_order = torch.argsort(experts_by_route, stable=True)
+    final_order = route_order.index_select(0, expert_order)
+    sorted_experts = cpu_experts.index_select(0, final_order)
+    sorted_route_indices = cpu_route_indices.index_select(0, final_order)
     task_expert_ids, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
     task_offsets = torch.zeros(
         task_expert_ids.numel() + 1,
@@ -105,6 +114,20 @@ def _flatten_experts(selected_experts: torch.Tensor) -> torch.Tensor:
 
 def _flatten_weights(routing_weights: torch.Tensor) -> torch.Tensor:
     return routing_weights.reshape(-1).float()
+
+
+def flatten_selected_and_weights(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _flatten_experts(selected_experts), _flatten_weights(routing_weights)
+
+
+def build_runtime_meta_view(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return selected_experts, routing_weights
 
 
 def build_prefill_plan(

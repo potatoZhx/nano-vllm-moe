@@ -73,6 +73,21 @@ class LLMEngine:
             "cpu_weight_mass_ratio": "model_cpu_weight_mass_ratio",
             "activated_expert_set_size": "model_activated_expert_set_size",
             "realized_cpu_expert_count": "model_realized_cpu_expert_count",
+            "prefetch_submit_count": "model_prefetch_submit_count",
+            "prefetch_completed_count": "model_prefetch_completed_count",
+            "prefetch_late_count": "model_prefetch_late_count",
+            "prefetch_wait_ms": "model_prefetch_wait_ms",
+            "prefetch_consumed_count": "model_prefetch_consumed_count",
+            "prefetch_timeout_count": "model_prefetch_timeout_count",
+            "publish_count": "model_publish_count",
+            "publish_ms": "model_publish_ms",
+            "metadata_offload_ms": "model_metadata_offload_ms",
+            "metadata_offload_bytes": "model_metadata_offload_bytes",
+            "history_prefetch_submit_count": "model_history_prefetch_submit_count",
+            "verify_history_prefetch_submit_count": "model_verify_history_prefetch_submit_count",
+            "draft_live_prefetch_submit_count": "model_draft_live_prefetch_submit_count",
+            "verify_ready_before_wait_count": "model_verify_ready_before_wait_count",
+            "verify_ready_after_wait_count": "model_verify_ready_after_wait_count",
         }
         for alias, source_key in canonical_map.items():
             if alias not in out and source_key in out:

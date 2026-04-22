@@ -27,6 +27,25 @@ class Config:
     draft_scheduler: str = "simple"
     spec_verify_eager: bool = True
     spec_enable_prefetch: bool = False
+    cache_strategy: str = "lru"
+    prefetch_strategy: str = "history_window"
+    prefetch_staging_slots_per_layer: int = 2
+    prefetch_max_inflight: int = 8
+    prefetch_step_budget: int = 4
+    cache_eviction_budget_per_step: int = 2
+    prefetch_verify_wait_ms: float = 0.0
+    prefetch_global_queue_capacity: int = 4096
+    prefetch_history_decay: float = 0.9
+    prefetch_history_ttl_steps: int = 64
+    prefetch_source_weight_prefill: float = 1.0
+    prefetch_source_weight_verify: float = 1.2
+    prefetch_source_weight_draft: float = 1.5
+    prefetch_activation_count_weight: float = 0.1
+    prefetch_age_penalty: float = 0.02
+    prefetch_use_prefill_history: bool = True
+    prefetch_use_verify_history: bool = True
+    prefetch_use_draft_live: bool = True
+    prefetch_runtime_mode: str = "baseline_staging"
     spec_profile: bool = False
     engine_profile: bool = False
     engine_profile_cuda_sync: bool = True
@@ -75,6 +94,17 @@ class Config:
 
         assert self.max_draft_tokens >= 1
         assert self.draft_top_c >= 0
+        assert self.cache_strategy in {"lru", "lfu", "adaptive"}
+        assert self.prefetch_strategy in {"noop", "history_window"}
+        assert self.prefetch_staging_slots_per_layer >= 0
+        assert self.prefetch_max_inflight >= 0
+        assert self.prefetch_step_budget >= 0
+        assert self.cache_eviction_budget_per_step >= 0
+        assert self.prefetch_verify_wait_ms >= 0.0
+        assert self.prefetch_global_queue_capacity >= 0
+        assert 0.0 <= self.prefetch_history_decay <= 1.0
+        assert self.prefetch_history_ttl_steps >= 1
+        assert self.prefetch_runtime_mode == "baseline_staging"
         assert self.cpu_expert_num_threads >= 1
         assert self.cpu_expert_parallel_mode in {"serial", "expert_parallel"}
         assert 0.0 <= self.cpu_gpu_parallel_min_cpu_route_ratio <= 1.0

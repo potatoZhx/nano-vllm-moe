@@ -148,7 +148,15 @@ def heterogeneous_moe_forward(
         _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
 
         t_scatter0 = perf_counter()
-        output.index_add_(0, gpu_token_indices, gpu_expert_out)
+        if not has_cpu_work:
+            _accumulate_gpu_routes_deterministic(
+                output=output,
+                gpu_route_indices=plan.gpu_route_indices,
+                gpu_expert_out=gpu_expert_out,
+                top_k=top_k,
+            )
+        else:
+            output.index_add_(0, gpu_token_indices, gpu_expert_out)
         _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
 
     # CPU path for uncached experts.
@@ -184,6 +192,24 @@ def heterogeneous_moe_forward(
             )
 
     return output
+
+
+def _accumulate_gpu_routes_deterministic(
+    output: torch.Tensor,
+    gpu_route_indices: torch.Tensor,
+    gpu_expert_out: torch.Tensor,
+    top_k: int,
+) -> None:
+    """Accumulate route outputs with fixed token/top-k reduction order."""
+    if gpu_route_indices.numel() == 0:
+        return
+
+    num_tokens, hidden_dim = output.shape
+    num_routes = num_tokens * top_k
+    route_buffer = torch.zeros((num_routes, hidden_dim), dtype=gpu_expert_out.dtype, device=output.device)
+    route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
+    token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+    output.add_(token_output.to(dtype=output.dtype))
 
 
 def _run_gpu_cached_expert_path(
@@ -226,8 +252,12 @@ def _compute_real_cpu_expert_outputs(
     prep_t0 = perf_counter()
     if cpu_task_expert_ids is None or cpu_task_offsets is None:
         cpu_experts = flat_selected_original.index_select(0, cpu_indices)
-        sorted_experts, sort_idx = torch.sort(cpu_experts)
-        cpu_indices = cpu_indices.index_select(0, sort_idx)
+        route_order = torch.argsort(cpu_indices, stable=True)
+        experts_by_route = cpu_experts.index_select(0, route_order)
+        expert_order = torch.argsort(experts_by_route, stable=True)
+        final_order = route_order.index_select(0, expert_order)
+        sorted_experts = cpu_experts.index_select(0, final_order)
+        cpu_indices = cpu_indices.index_select(0, final_order)
         cpu_task_expert_ids, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
         cpu_task_offsets = torch.zeros(
             cpu_task_expert_ids.numel() + 1,

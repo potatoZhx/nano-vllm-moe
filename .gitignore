@@ -9,6 +9,10 @@ __pycache__/
 # macOS
 .DS_Store
 
+/.tmp/
+/.triton_cache/
+/torchinductor_mumura/
+
 # Distribution / packaging
 .Python
 build/

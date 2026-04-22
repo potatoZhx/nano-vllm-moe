@@ -3,7 +3,12 @@ import unittest
 import torch
 
 from nanovllm.expert.cache import LayerExpertCache
-from nanovllm.expert.placement import build_draft_plan, build_prefill_plan
+from nanovllm.expert.placement import (
+    build_draft_plan,
+    build_prefill_plan,
+    build_runtime_meta_view,
+    flatten_selected_and_weights,
+)
 from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler
 
 
@@ -128,6 +133,17 @@ class TestPlacementSpec(unittest.TestCase):
         # but actual replacement count is zero (identity LUT).
         expected = torch.arange(8, dtype=torch.int64)
         self.assertTrue(torch.equal(plan.substitution_lut.cpu(), expected))
+
+    def test_runtime_meta_helpers(self):
+        selected = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+        weights = torch.tensor([[0.1, 0.9], [0.3, 0.7]], dtype=torch.float32)
+        flat_selected, flat_weights = flatten_selected_and_weights(selected, weights)
+        view_selected, view_weights = build_runtime_meta_view(selected, weights)
+
+        self.assertEqual(flat_selected.tolist(), [1, 2, 3, 4])
+        self.assertEqual(len(flat_weights.tolist()), 4)
+        self.assertTrue(torch.equal(view_selected, selected))
+        self.assertTrue(torch.equal(view_weights, weights))
 
 
 if __name__ == "__main__":

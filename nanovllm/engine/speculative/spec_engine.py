@@ -98,6 +98,7 @@ class SpeculativeEngine:
         self._profile["start_draft_ms"] += (perf_counter() - t0) * 1000.0
 
         draft_tokens_map = {seq.seq_id: [] for seq in seqs}
+        draft_prefetch_state = None
         t0 = perf_counter()
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
@@ -105,6 +106,8 @@ class SpeculativeEngine:
             self._profile["run_draft_infer_ms_total"] += (perf_counter() - infer_t0) * 1000.0
             if isinstance(draft_result, tuple):
                 token_ids = draft_result[0]
+                if len(draft_result) > 1 and isinstance(draft_result[1], dict):
+                    draft_prefetch_state = draft_result[1]
             else:
                 token_ids = draft_result
 
@@ -143,6 +146,15 @@ class SpeculativeEngine:
             seq.num_cached_tokens = seq._draft_start_num_tokens - 1
             verify_lengths.append(len(draft_tokens) + 1)
         self._profile["prepare_verify_ms"] += (perf_counter() - t0) * 1000.0
+
+        if draft_prefetch_state is not None and "prefetch_step_id" in draft_prefetch_state:
+            wait_prof = self.model_runner.call(
+                "wait_prefetch_for_verify",
+                draft_prefetch_state["prefetch_step_id"],
+            )
+            if self.profile_enabled and isinstance(wait_prof, dict):
+                for key, value in wait_prof.items():
+                    self._profile[key] += float(value)
 
         infer_t0 = perf_counter()
         verify_traces = self.model_runner.call("run_verify", seqs, verify_lengths)

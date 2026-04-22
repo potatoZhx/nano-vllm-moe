@@ -2,7 +2,11 @@ import unittest
 
 import torch
 
-from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler, create_draft_scheduler
+from nanovllm.scheduling.draft_scheduler import (
+    SimpleDraftScheduler,
+    build_draft_scheduler_context,
+    create_draft_scheduler,
+)
 
 
 class TestSimpleDraftScheduler(unittest.TestCase):
@@ -47,6 +51,16 @@ class TestSimpleDraftScheduler(unittest.TestCase):
         self.assertEqual(int(lut[5].item()), 1)
         self.assertEqual(int(lut[6].item()), 2)
         self.assertEqual(int(lut[7].item()), 1)
+
+    def test_build_draft_scheduler_context(self):
+        ctx = build_draft_scheduler_context(
+            uncached_expert_mask=torch.tensor([False, True]),
+            routing_weights_flat=torch.tensor([0.3, 0.7]),
+            selected_experts_flat=torch.tensor([1, 1]),
+            top_c=1,
+        )
+        self.assertEqual(int(ctx.top_c), 1)
+        self.assertEqual(int(ctx.selected_experts_flat.numel()), 2)
 
 
 if __name__ == "__main__":

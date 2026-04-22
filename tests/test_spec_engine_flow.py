@@ -76,16 +76,22 @@ class _DummyModelRunner:
         self.draft_calls = 0
         self.verify_calls = 0
         self.last_verify_lengths = None
+        self.wait_calls = 0
 
-    def call(self, name, seqs, *args):
+    def call(self, name, *args):
         if name == "run_draft":
+            seqs = args[0]
             self.draft_calls += 1
             if self.draft_calls == 1:
-                return [11 for _ in seqs], []
-            return [12 for _ in seqs], []
+                return [11 for _ in seqs], {"prefetch_step_id": 1}
+            return [12 for _ in seqs], {"prefetch_step_id": 1}
+        if name == "wait_prefetch_for_verify":
+            self.wait_calls += 1
+            return {"verify_prefetch_wait_ms": 0.1}
         if name == "run_verify":
+            seqs = args[0]
             self.verify_calls += 1
-            self.last_verify_lengths = list(args[0]) if args else None
+            self.last_verify_lengths = list(args[1]) if len(args) > 1 else None
             return [[11, 12, 99] for _ in seqs]
         raise RuntimeError(name)
 
@@ -103,6 +109,7 @@ class TestSpecEngineFlow(unittest.TestCase):
 
         self.assertEqual(token_ids, [99])
         self.assertEqual(model_runner.verify_calls, 1)
+        self.assertEqual(model_runner.wait_calls, 1)
         self.assertEqual(seq.last_token, 99)
         self.assertEqual(seq.token_ids, [1, 2, 3, 11, 12, 99])
         self.assertFalse(seq.is_drafting)

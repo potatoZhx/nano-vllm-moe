@@ -108,6 +108,25 @@ def run_case(args: argparse.Namespace) -> dict:
         engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         max_draft_tokens=args.max_draft_tokens,
         heterogeneous_slots_per_layer=args.slots_per_layer,
+        spec_enable_prefetch=args.spec_enable_prefetch,
+        cache_strategy=args.cache_strategy,
+        prefetch_strategy=args.prefetch_strategy,
+        prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
+        prefetch_max_inflight=args.prefetch_max_inflight,
+        prefetch_step_budget=args.prefetch_step_budget,
+        cache_eviction_budget_per_step=args.cache_eviction_budget_per_step,
+        prefetch_verify_wait_ms=args.prefetch_verify_wait_ms,
+        prefetch_global_queue_capacity=args.prefetch_global_queue_capacity,
+        prefetch_history_decay=args.prefetch_history_decay,
+        prefetch_history_ttl_steps=args.prefetch_history_ttl_steps,
+        prefetch_source_weight_prefill=args.prefetch_source_weight_prefill,
+        prefetch_source_weight_verify=args.prefetch_source_weight_verify,
+        prefetch_source_weight_draft=args.prefetch_source_weight_draft,
+        prefetch_activation_count_weight=args.prefetch_activation_count_weight,
+        prefetch_age_penalty=args.prefetch_age_penalty,
+        prefetch_use_prefill_history=args.prefetch_use_prefill_history,
+        prefetch_use_verify_history=args.prefetch_use_verify_history,
+        prefetch_use_draft_live=args.prefetch_use_draft_live,
     )
 
     prompts = _build_meaningful_prompts(args, rng)
@@ -208,6 +227,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spec-profile", type=str2bool, default=False)
     parser.add_argument("--engine-profile", type=str2bool, default=False)
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
+    parser.add_argument("--spec-enable-prefetch", type=str2bool, default=False)
+    parser.add_argument("--cache-strategy", type=str, default="lru")
+    parser.add_argument("--prefetch-strategy", type=str, default="history_window")
+    parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
+    parser.add_argument("--prefetch-max-inflight", type=int, default=8)
+    parser.add_argument("--prefetch-step-budget", type=int, default=4)
+    parser.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
+    parser.add_argument("--prefetch-verify-wait-ms", type=float, default=0.0)
+    parser.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
+    parser.add_argument("--prefetch-history-decay", type=float, default=0.9)
+    parser.add_argument("--prefetch-history-ttl-steps", type=int, default=64)
+    parser.add_argument("--prefetch-source-weight-prefill", type=float, default=1.0)
+    parser.add_argument("--prefetch-source-weight-verify", type=float, default=1.2)
+    parser.add_argument("--prefetch-source-weight-draft", type=float, default=1.5)
+    parser.add_argument("--prefetch-activation-count-weight", type=float, default=0.1)
+    parser.add_argument("--prefetch-age-penalty", type=float, default=0.02)
+    parser.add_argument("--prefetch-use-prefill-history", type=str2bool, default=True)
+    parser.add_argument("--prefetch-use-verify-history", type=str2bool, default=True)
+    parser.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
     parser.add_argument("--return-token-ids", type=str2bool, default=False)
     parser.add_argument("--return-text", type=str2bool, default=True)
     parser.add_argument("--return-prompts", type=str2bool, default=True)
