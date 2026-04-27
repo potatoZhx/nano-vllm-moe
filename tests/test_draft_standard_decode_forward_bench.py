@@ -29,6 +29,7 @@ class TestDraftStandardDecodeForwardBench(unittest.TestCase):
         self.assertEqual(metrics["forward_ms"], 8.0)
         self.assertEqual(metrics["tokens_per_forward"], 8.0)
         self.assertAlmostEqual(metrics["forward_tok_s"], 1000.0)
+        self.assertIn("profile_breakdown", metrics)
 
     def test_extract_draft_forward_metrics_with_draft_tokens(self):
         case_result = {
@@ -37,12 +38,14 @@ class TestDraftStandardDecodeForwardBench(unittest.TestCase):
                 "spec_run_draft_infer_ms_total": 120.0,
                 "spec_run_draft_calls": 10,
                 "spec_draft_tokens_total": 80.0,
+                "model_route_ms": 30.0,
             },
         }
         metrics = self.mod.extract_draft_forward_metrics(case_result)
         self.assertEqual(metrics["forward_ms"], 12.0)
         self.assertEqual(metrics["tokens_per_forward"], 8.0)
         self.assertAlmostEqual(metrics["forward_tok_s"], 666.6666666, places=4)
+        self.assertAlmostEqual(metrics["profile_breakdown"]["route_ms_per_call"], 3.0)
 
     def test_extract_draft_forward_metrics_fallback_to_num_seqs(self):
         case_result = {
@@ -57,6 +60,11 @@ class TestDraftStandardDecodeForwardBench(unittest.TestCase):
         self.assertEqual(metrics["tokens_per_forward"], 4.0)
         self.assertEqual(metrics["forward_ms"], 8.0)
         self.assertAlmostEqual(metrics["forward_tok_s"], 500.0)
+
+    def test_extract_json_stdout_accepts_pretty_json(self):
+        payload = {"mode": "spec", "value": 3}
+        stdout = "{\n  \"mode\": \"spec\",\n  \"value\": 3\n}\n"
+        self.assertEqual(self.mod._extract_json_stdout(stdout), payload)
 
     def test_summarize_repeats(self):
         rows = [

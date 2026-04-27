@@ -68,35 +68,61 @@ class GlobalWarmStartQueue:
         source: str,
         step_id: int,
         layer_caches: dict[int, LayerExpertCache],
-    ) -> None:
+    ) -> dict[str, float]:
+        stats = defaultdict(float)
         if not runtime_meta:
-            return
+            return stats
 
         for layer_idx, meta in runtime_meta.items():
             cache = layer_caches.get(layer_idx)
             if cache is None:
                 continue
-
-            flat_experts = meta.selected_experts.reshape(-1).to(device="cpu", dtype=torch.int64)
-            if flat_experts.numel() == 0:
-                continue
-            flat_weights = meta.routing_weights.reshape(-1).to(device="cpu", dtype=torch.float32)
-            unique_ids, inverse = torch.unique(flat_experts, return_inverse=True)
-            # Keep aggregation tensors on CPU to avoid default-device leakage (e.g. torch.device("cuda") context).
-            score_sum = torch.zeros((unique_ids.numel(),), dtype=torch.float32, device=torch.device("cpu"))
-            score_sum.scatter_add_(0, inverse, flat_weights)
-            counts = torch.zeros((unique_ids.numel(),), dtype=torch.int64, device=torch.device("cpu"))
-            counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.int64))
-
-            cached_mask_all = cache.get_cached_expert_mask().detach().to("cpu")
-            cached_mask = cached_mask_all.index_select(0, unique_ids)
-
-            for i, expert_idx in enumerate(unique_ids.tolist()):
-                if bool(cached_mask[i].item()):
+            stats["queue_layer_count"] += 1.0
+            aggregate_t0 = time.perf_counter()
+            if meta.aggregated_expert_ids is None or meta.aggregated_score_sum is None or meta.aggregated_activation_count is None:
+                if meta.selected_experts is None or meta.routing_weights is None:
                     continue
-                key = (int(layer_idx), int(expert_idx))
-                new_score = float(score_sum[i].item())
-                new_count = int(counts[i].item())
+                flat_experts = meta.selected_experts.reshape(-1)
+                if flat_experts.device.type != "cpu" or flat_experts.dtype != torch.int64:
+                    flat_experts = flat_experts.to(device="cpu", dtype=torch.int64)
+                if flat_experts.numel() == 0:
+                    continue
+                flat_weights = meta.routing_weights.reshape(-1)
+                if flat_weights.device.type != "cpu" or flat_weights.dtype != torch.float32:
+                    flat_weights = flat_weights.to(device="cpu", dtype=torch.float32)
+                unique_ids, inverse = torch.unique(flat_experts, return_inverse=True)
+                score_sum = torch.zeros((unique_ids.numel(),), dtype=torch.float32, device=torch.device("cpu"))
+                score_sum.scatter_add_(0, inverse, flat_weights)
+                counts = torch.zeros((unique_ids.numel(),), dtype=torch.int64, device=torch.device("cpu"))
+                counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.int64))
+            else:
+                unique_ids = meta.aggregated_expert_ids
+                if unique_ids.device.type != "cpu" or unique_ids.dtype != torch.int64:
+                    unique_ids = unique_ids.to(device="cpu", dtype=torch.int64)
+                score_sum = meta.aggregated_score_sum
+                if score_sum.device.type != "cpu" or score_sum.dtype != torch.float32:
+                    score_sum = score_sum.to(device="cpu", dtype=torch.float32)
+                counts = meta.aggregated_activation_count
+                if counts.device.type != "cpu" or counts.dtype != torch.int64:
+                    counts = counts.to(device="cpu", dtype=torch.int64)
+            stats["queue_aggregate_ms"] += (time.perf_counter() - aggregate_t0) * 1000.0
+            if unique_ids.numel() == 0:
+                continue
+            filter_t0 = time.perf_counter()
+            uncached_entries: list[tuple[int, float, int]] = []
+            for expert_idx, new_score, new_count in zip(unique_ids.tolist(), score_sum.tolist(), counts.tolist()):
+                expert_idx = int(expert_idx)
+                if cache.is_cached_cpu(expert_idx):
+                    continue
+                uncached_entries.append((expert_idx, float(new_score), int(new_count)))
+            stats["queue_filter_ms"] += (time.perf_counter() - filter_t0) * 1000.0
+            stats["queue_uncached_candidate_count"] += float(len(uncached_entries))
+            if not uncached_entries:
+                continue
+
+            update_t0 = time.perf_counter()
+            for expert_idx, new_score, new_count in uncached_entries:
+                key = (int(layer_idx), expert_idx)
                 if key in self.entries:
                     entry = self.entries[key]
                     decay = float(self.config.prefetch_history_decay)
@@ -125,6 +151,8 @@ class GlobalWarmStartQueue:
                     age=age,
                     config=self.config,
                 )
+            stats["queue_entry_update_ms"] += (time.perf_counter() - update_t0) * 1000.0
+        return stats
 
     def prune(self, step_id: int, layer_caches: dict[int, LayerExpertCache]) -> None:
         stale_keys = []
@@ -138,7 +166,7 @@ class GlobalWarmStartQueue:
             if int(step_id) - int(entry.last_seen_step) > ttl:
                 stale_keys.append(key)
                 continue
-            if bool(cache.get_cached_expert_mask()[expert_idx].item()):
+            if cache.is_cached_cpu(expert_idx):
                 stale_keys.append(key)
                 continue
 
@@ -165,7 +193,7 @@ class GlobalWarmStartQueue:
             cache = layer_caches.get(layer_idx)
             if cache is None:
                 continue
-            if bool(cache.get_cached_expert_mask()[expert_idx].item()):
+            if cache.is_cached_cpu(expert_idx):
                 continue
             age = max(0, int(step_id) - int(entry.last_seen_step))
             entry.priority = compute_priority(
@@ -211,33 +239,63 @@ class PrefetchRuntime:
         runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
         source: str,
         step_id: int,
-    ) -> None:
+    ) -> dict[str, float]:
         if runtime_meta is None:
-            return
+            return {}
+        observe_t0 = time.perf_counter()
+        mark_access_t0 = time.perf_counter()
         for layer_idx, meta in runtime_meta.items():
             cache = self.layer_caches.get(layer_idx)
             if cache is None:
                 continue
-            cache.mark_access(meta.selected_experts, meta.routing_weights, step_id=step_id)
+            if meta.aggregated_expert_ids is not None:
+                cache.mark_access_aggregated(
+                    meta.aggregated_expert_ids,
+                    meta.aggregated_activation_count,
+                    meta.aggregated_score_sum,
+                    step_id=step_id,
+                )
+            elif meta.selected_experts is not None:
+                cache.mark_access(meta.selected_experts, meta.routing_weights, step_id=step_id)
+        mark_access_ms = (time.perf_counter() - mark_access_t0) * 1000.0
 
-        self.global_queue.update_from_runtime_meta(
+        queue_update_t0 = time.perf_counter()
+        queue_stats = self.global_queue.update_from_runtime_meta(
             runtime_meta=runtime_meta,
             source=source,
             step_id=step_id,
             layer_caches=self.layer_caches,
         )
+        queue_update_ms = (time.perf_counter() - queue_update_t0) * 1000.0
+        self._profile["observe_runtime_meta_count"] += 1.0
+        self._profile["observe_runtime_meta_ms"] += (time.perf_counter() - observe_t0) * 1000.0
+        self._profile["observe_mark_access_ms"] += mark_access_ms
+        self._profile["observe_queue_update_ms"] += queue_update_ms
+        for key, value in queue_stats.items():
+            self._profile[key] += float(value)
+        out = {
+            "mark_access_ms": mark_access_ms,
+            "queue_update_ms": queue_update_ms,
+            "queue_aggregate_ms": float(queue_stats.get("queue_aggregate_ms", 0.0)),
+            "queue_filter_ms": float(queue_stats.get("queue_filter_ms", 0.0)),
+            "queue_entry_update_ms": float(queue_stats.get("queue_entry_update_ms", 0.0)),
+        }
+        return out
 
-    def observe_prefill(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> None:
+    def observe_prefill(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
         if bool(self.config.prefetch_use_prefill_history):
-            self.observe_runtime_meta(runtime_meta, source="prefill_history", step_id=step_id)
+            return self.observe_runtime_meta(runtime_meta, source="prefill_history", step_id=step_id)
+        return {}
 
-    def observe_draft(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> None:
+    def observe_draft(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
         if bool(self.config.prefetch_use_draft_live):
-            self.observe_runtime_meta(runtime_meta, source="draft_live", step_id=step_id)
+            return self.observe_runtime_meta(runtime_meta, source="draft_live", step_id=step_id)
+        return {}
 
-    def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> None:
+    def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
         if bool(self.config.prefetch_use_verify_history):
-            self.observe_runtime_meta(runtime_meta, source="verify_history", step_id=step_id)
+            return self.observe_runtime_meta(runtime_meta, source="verify_history", step_id=step_id)
+        return {}
 
     def submit_from_global_queue(self, step_id: int, phase: str) -> int:
         _ = phase
@@ -267,7 +325,7 @@ class PrefetchRuntime:
             cache = self.layer_caches.get(layer_idx)
             if cache is None:
                 continue
-            if bool(cache.get_cached_expert_mask()[expert_idx].item()):
+            if cache.is_cached_cpu(expert_idx):
                 continue
             if key in self.inflight:
                 continue
@@ -429,12 +487,23 @@ class PrefetchRuntime:
             cache = self.layer_caches.get(layer_idx)
             if cache is None:
                 continue
-            unique_ids = torch.unique(meta.selected_experts.reshape(-1).to(torch.int64)).tolist()
+            if meta.aggregated_expert_ids is not None:
+                unique_ids_tensor = meta.aggregated_expert_ids
+                if unique_ids_tensor.device.type != "cpu" or unique_ids_tensor.dtype != torch.int64:
+                    unique_ids_tensor = unique_ids_tensor.to(device="cpu", dtype=torch.int64)
+                unique_ids = unique_ids_tensor.tolist()
+            elif meta.selected_experts is not None:
+                flat_experts = meta.selected_experts.reshape(-1)
+                if flat_experts.device.type != "cpu" or flat_experts.dtype != torch.int64:
+                    flat_experts = flat_experts.to(device="cpu", dtype=torch.int64)
+                unique_ids = torch.unique(flat_experts).tolist()
+            else:
+                continue
             for expert_idx in unique_ids:
                 key = (int(layer_idx), int(expert_idx))
                 if key not in self._recent_published:
                     continue
-                if bool(cache.get_cached_expert_mask()[expert_idx].item()):
+                if cache.is_cached_cpu(expert_idx):
                     consumed += 1
         self._profile["prefetch_consumed_count"] += consumed
 
@@ -446,9 +515,30 @@ class PrefetchRuntime:
         for key in stale:
             self._recent_published.pop(key, None)
 
-    def record_metadata_offload(self, dt_ms: float, num_bytes: int) -> None:
-        self._profile["metadata_offload_ms"] += float(dt_ms)
+    def record_metadata_offload(
+        self,
+        *,
+        mode: str,
+        num_bytes: int,
+        enqueue_ms: float = 0.0,
+        transfer_wait_ms: float = 0.0,
+        collect_ms: float = 0.0,
+        observe_ms: float = 0.0,
+    ) -> None:
+        mode_key = mode.strip().lower() if mode else "unknown"
+        total_ms = float(enqueue_ms) + float(transfer_wait_ms) + float(collect_ms) + float(observe_ms)
+
+        self._profile["metadata_offload_count"] += 1.0
+        self._profile["metadata_offload_ms"] += total_ms
         self._profile["metadata_offload_bytes"] += float(num_bytes)
+        self._profile["metadata_offload_enqueue_ms"] += float(enqueue_ms)
+        self._profile["metadata_offload_transfer_wait_ms"] += float(transfer_wait_ms)
+        self._profile["metadata_offload_collect_ms"] += float(collect_ms)
+        self._profile["metadata_offload_observe_ms"] += float(observe_ms)
+
+        self._profile[f"metadata_offload_{mode_key}_count"] += 1.0
+        self._profile[f"metadata_offload_{mode_key}_ms"] += total_ms
+        self._profile[f"metadata_offload_{mode_key}_bytes"] += float(num_bytes)
 
     def get_profile(self, reset: bool = False) -> dict:
         out = {
@@ -460,8 +550,31 @@ class PrefetchRuntime:
             "prefetch_timeout_count": int(self._profile.get("prefetch_timeout_count", 0.0)),
             "publish_count": int(self._profile.get("publish_count", 0.0)),
             "publish_ms": float(self._profile.get("publish_ms", 0.0)),
+            "observe_runtime_meta_count": int(self._profile.get("observe_runtime_meta_count", 0.0)),
+            "observe_runtime_meta_ms": float(self._profile.get("observe_runtime_meta_ms", 0.0)),
+            "observe_mark_access_ms": float(self._profile.get("observe_mark_access_ms", 0.0)),
+            "observe_queue_update_ms": float(self._profile.get("observe_queue_update_ms", 0.0)),
+            "queue_layer_count": int(self._profile.get("queue_layer_count", 0.0)),
+            "queue_aggregate_ms": float(self._profile.get("queue_aggregate_ms", 0.0)),
+            "queue_filter_ms": float(self._profile.get("queue_filter_ms", 0.0)),
+            "queue_entry_update_ms": float(self._profile.get("queue_entry_update_ms", 0.0)),
+            "queue_uncached_candidate_count": float(self._profile.get("queue_uncached_candidate_count", 0.0)),
+            "metadata_offload_count": int(self._profile.get("metadata_offload_count", 0.0)),
             "metadata_offload_ms": float(self._profile.get("metadata_offload_ms", 0.0)),
             "metadata_offload_bytes": float(self._profile.get("metadata_offload_bytes", 0.0)),
+            "metadata_offload_enqueue_ms": float(self._profile.get("metadata_offload_enqueue_ms", 0.0)),
+            "metadata_offload_transfer_wait_ms": float(self._profile.get("metadata_offload_transfer_wait_ms", 0.0)),
+            "metadata_offload_collect_ms": float(self._profile.get("metadata_offload_collect_ms", 0.0)),
+            "metadata_offload_observe_ms": float(self._profile.get("metadata_offload_observe_ms", 0.0)),
+            "metadata_offload_prefill_count": int(self._profile.get("metadata_offload_prefill_count", 0.0)),
+            "metadata_offload_prefill_ms": float(self._profile.get("metadata_offload_prefill_ms", 0.0)),
+            "metadata_offload_prefill_bytes": float(self._profile.get("metadata_offload_prefill_bytes", 0.0)),
+            "metadata_offload_draft_count": int(self._profile.get("metadata_offload_draft_count", 0.0)),
+            "metadata_offload_draft_ms": float(self._profile.get("metadata_offload_draft_ms", 0.0)),
+            "metadata_offload_draft_bytes": float(self._profile.get("metadata_offload_draft_bytes", 0.0)),
+            "metadata_offload_verify_count": int(self._profile.get("metadata_offload_verify_count", 0.0)),
+            "metadata_offload_verify_ms": float(self._profile.get("metadata_offload_verify_ms", 0.0)),
+            "metadata_offload_verify_bytes": float(self._profile.get("metadata_offload_verify_bytes", 0.0)),
             "history_prefetch_submit_count": int(self._profile.get("history_prefetch_submit_count", 0.0)),
             "verify_history_prefetch_submit_count": int(self._profile.get("verify_history_prefetch_submit_count", 0.0)),
             "draft_live_prefetch_submit_count": int(self._profile.get("draft_live_prefetch_submit_count", 0.0)),

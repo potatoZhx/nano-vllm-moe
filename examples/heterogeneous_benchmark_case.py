@@ -108,7 +108,7 @@ def run_case(args: argparse.Namespace) -> dict:
         engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         max_draft_tokens=args.max_draft_tokens,
         heterogeneous_slots_per_layer=args.slots_per_layer,
-        spec_enable_prefetch=args.spec_enable_prefetch,
+        spec_enable_prefetch=(mode == "spec" and args.spec_enable_prefetch),
         cache_strategy=args.cache_strategy,
         prefetch_strategy=args.prefetch_strategy,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
@@ -175,6 +175,8 @@ def run_case(args: argparse.Namespace) -> dict:
         "input_len": args.input_len,
         "output_len": args.output_len,
         "seed": args.seed,
+        "spec_enable_prefetch": bool(mode == "spec" and args.spec_enable_prefetch),
+        "prefetch_verify_wait_ms": float(args.prefetch_verify_wait_ms),
         "input_tokens": input_tokens,
         "target_output_tokens": target_output_tokens,
         "generated_output_tokens": generated_output_tokens,
@@ -227,14 +229,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spec-profile", type=str2bool, default=False)
     parser.add_argument("--engine-profile", type=str2bool, default=False)
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
-    parser.add_argument("--spec-enable-prefetch", type=str2bool, default=False)
+    parser.add_argument("--spec-enable-prefetch", type=str2bool, default=True)
     parser.add_argument("--cache-strategy", type=str, default="lru")
     parser.add_argument("--prefetch-strategy", type=str, default="history_window")
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     parser.add_argument("--prefetch-max-inflight", type=int, default=8)
     parser.add_argument("--prefetch-step-budget", type=int, default=4)
     parser.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
-    parser.add_argument("--prefetch-verify-wait-ms", type=float, default=0.0)
+    parser.add_argument("--prefetch-verify-wait-ms", type=float, default=1.0)
     parser.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
     parser.add_argument("--prefetch-history-decay", type=float, default=0.9)
     parser.add_argument("--prefetch-history-ttl-steps", type=int, default=64)
@@ -249,13 +251,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--return-token-ids", type=str2bool, default=False)
     parser.add_argument("--return-text", type=str2bool, default=True)
     parser.add_argument("--return-prompts", type=str2bool, default=True)
+    parser.add_argument("--output", type=str, default="")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     result = run_case(args)
-    print(json.dumps(result, ensure_ascii=True))
+    text = json.dumps(result, ensure_ascii=True, indent=2)
+    print(text)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.write("\n")
 
 
 if __name__ == "__main__":

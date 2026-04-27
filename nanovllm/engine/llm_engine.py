@@ -54,6 +54,23 @@ class LLMEngine:
             spec_profile = self.spec_engine.get_profile(reset=reset)
             out.update({f"spec_{k}": v for k, v in spec_profile.items()})
 
+        # Single-forward granularity metrics across core phases.
+        prefill_steps = float(out.get("prefill_step_count", 0.0))
+        if prefill_steps > 0:
+            out["prefill_forward_ms"] = float(out.get("prefill_runner_ms", 0.0) / prefill_steps)
+
+        decode_steps = float(out.get("decode_step_count", 0.0))
+        if decode_steps > 0:
+            out["decode_forward_ms"] = float(out.get("decode_runner_ms", 0.0) / decode_steps)
+
+        draft_calls = float(out.get("spec_run_draft_calls", 0.0))
+        if draft_calls > 0:
+            out["draft_forward_ms"] = float(out.get("spec_run_draft_infer_ms_total", 0.0) / draft_calls)
+
+        verify_calls = float(out.get("spec_run_verify_calls", 0.0))
+        if verify_calls > 0:
+            out["verify_forward_ms"] = float(out.get("spec_run_verify_infer_ms_total", 0.0) / verify_calls)
+
         # Canonical phase2_post keys for downstream reports.
         canonical_map = {
             "route_ms": "model_route_ms",
@@ -81,8 +98,23 @@ class LLMEngine:
             "prefetch_timeout_count": "model_prefetch_timeout_count",
             "publish_count": "model_publish_count",
             "publish_ms": "model_publish_ms",
+            "metadata_offload_count": "model_metadata_offload_count",
             "metadata_offload_ms": "model_metadata_offload_ms",
             "metadata_offload_bytes": "model_metadata_offload_bytes",
+            "metadata_offload_enqueue_ms": "model_metadata_offload_enqueue_ms",
+            "metadata_offload_transfer_wait_ms": "model_metadata_offload_transfer_wait_ms",
+            "metadata_offload_collect_ms": "model_metadata_offload_collect_ms",
+            "metadata_offload_observe_ms": "model_metadata_offload_observe_ms",
+            "metadata_offload_prefill_count": "model_metadata_offload_prefill_count",
+            "metadata_offload_prefill_ms": "model_metadata_offload_prefill_ms",
+            "metadata_offload_prefill_bytes": "model_metadata_offload_prefill_bytes",
+            "metadata_offload_draft_count": "model_metadata_offload_draft_count",
+            "metadata_offload_draft_ms": "model_metadata_offload_draft_ms",
+            "metadata_offload_draft_bytes": "model_metadata_offload_draft_bytes",
+            "metadata_offload_verify_count": "model_metadata_offload_verify_count",
+            "metadata_offload_verify_ms": "model_metadata_offload_verify_ms",
+            "metadata_offload_verify_bytes": "model_metadata_offload_verify_bytes",
+            "metadata_observe_skipped_count": "model_metadata_observe_skipped_count",
             "history_prefetch_submit_count": "model_history_prefetch_submit_count",
             "verify_history_prefetch_submit_count": "model_verify_history_prefetch_submit_count",
             "draft_live_prefetch_submit_count": "model_draft_live_prefetch_submit_count",

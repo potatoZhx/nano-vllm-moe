@@ -145,7 +145,6 @@ class LayerExpertCache:
             return
         flat_experts = expert_ids.reshape(-1).to(torch.int64)
         unique_ids, inverse = torch.unique(flat_experts, return_inverse=True)
-
         score_sum = None
         if routing_weights is not None and routing_weights.numel() == expert_ids.numel():
             flat_weights = routing_weights.reshape(-1).float()
@@ -159,6 +158,36 @@ class LayerExpertCache:
             self.access_count[expert_idx] += 1
             if score_sum is not None:
                 self.access_score_sum[expert_idx] += float(score_sum[i].item())
+
+    def mark_access_aggregated(
+        self,
+        expert_ids: torch.Tensor,
+        activation_count: torch.Tensor | None,
+        score_sum: torch.Tensor | None,
+        step_id: int,
+    ) -> None:
+        if expert_ids.numel() == 0:
+            return
+        expert_ids_cpu = expert_ids if expert_ids.device.type == "cpu" and expert_ids.dtype == torch.int64 else expert_ids.to(device=torch.device("cpu"), dtype=torch.int64)
+        expert_list = expert_ids_cpu.tolist()
+        activation_list = (
+            (activation_count if activation_count.device.type == "cpu" and activation_count.dtype == torch.int64 else activation_count.to(device=torch.device("cpu"), dtype=torch.int64)).tolist()
+            if activation_count is not None
+            else None
+        )
+        score_list = (
+            (score_sum if score_sum.device.type == "cpu" and score_sum.dtype == torch.float32 else score_sum.to(device=torch.device("cpu"), dtype=torch.float32)).tolist()
+            if score_sum is not None
+            else None
+        )
+
+        for i, expert_idx in enumerate(expert_list):
+            if not (0 <= expert_idx < self.num_experts):
+                continue
+            self.last_access_step[expert_idx] = int(step_id)
+            self.access_count[expert_idx] += int(activation_list[i]) if activation_list is not None else 1
+            if score_list is not None:
+                self.access_score_sum[expert_idx] += float(score_list[i])
 
     def snapshot(self, layer_idx: int) -> LayerCacheSnapshot:
         return LayerCacheSnapshot(
@@ -295,6 +324,9 @@ class LayerExpertCache:
 
     def get_slot_idx(self, expert_idx: int) -> int:
         return self.expert_to_slot.get(expert_idx, -1)
+
+    def is_cached_cpu(self, expert_idx: int) -> bool:
+        return int(expert_idx) in self.expert_to_slot
 
     def remap_experts_to_slots(self, selected_experts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Map original expert ids to slot ids; uncached experts are marked as -1."""

@@ -34,6 +34,15 @@ class SpeculativeEngine:
         # to infer draft-stage latency from internal counters.
         if "draft_ms" not in out:
             out["draft_ms"] = float(out.get("draft_loop_ms", 0.0))
+
+        draft_calls = float(out.get("run_draft_calls", 0.0))
+        if draft_calls > 0:
+            out["draft_forward_ms"] = float(out.get("run_draft_infer_ms_total", 0.0) / draft_calls)
+
+        verify_calls = float(out.get("run_verify_calls", 0.0))
+        if verify_calls > 0:
+            out["verify_forward_ms"] = float(out.get("run_verify_infer_ms_total", 0.0) / verify_calls)
+
         out["draft_steps_per_step"] = list(self._draft_steps_per_step)
         out["step_traces"] = deepcopy(self._step_traces)
         if reset:
@@ -152,7 +161,7 @@ class SpeculativeEngine:
                 "wait_prefetch_for_verify",
                 draft_prefetch_state["prefetch_step_id"],
             )
-            if self.profile_enabled and isinstance(wait_prof, dict):
+            if isinstance(wait_prof, dict):
                 for key, value in wait_prof.items():
                     self._profile[key] += float(value)
 

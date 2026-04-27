@@ -14,10 +14,17 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
 
 
 def _extract_last_json(stdout: str) -> dict:
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not lines:
+    text = stdout.strip()
+    if not text:
         raise RuntimeError("No JSON output found in subprocess stdout")
-    return json.loads(lines[-1])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    raise RuntimeError(f"Unable to parse JSON from subprocess stdout:\n{stdout}")
 
 
 class TestDraftCudaGraphRealWorld(unittest.TestCase):
@@ -40,6 +47,8 @@ class TestDraftCudaGraphRealWorld(unittest.TestCase):
         cls.max_model_len = int(os.getenv("NANOVLLM_REAL_GRAPH_MAX_MODEL_LEN", "1024"))
         cls.gpu_memory_utilization = float(os.getenv("NANOVLLM_REAL_GRAPH_GPU_MEMORY_UTIL", "0.85"))
         cls.max_draft_tokens = int(os.getenv("NANOVLLM_REAL_GRAPH_MAX_DRAFT_TOKENS", "4"))
+        cls.spec_enable_prefetch = _as_bool(os.getenv("NANOVLLM_REAL_GRAPH_SPEC_ENABLE_PREFETCH"), default=True)
+        cls.prefetch_verify_wait_ms = float(os.getenv("NANOVLLM_REAL_GRAPH_PREFETCH_VERIFY_WAIT_MS", "1.0"))
         cls.base_port = int(os.getenv("NANOVLLM_REAL_GRAPH_BASE_PORT", "29920"))
         cls.case_timeout = int(os.getenv("NANOVLLM_REAL_GRAPH_CASE_TIMEOUT_SEC", "2400"))
 
@@ -87,6 +96,10 @@ class TestDraftCudaGraphRealWorld(unittest.TestCase):
             "true",
             "--engine-profile-cuda-sync",
             "true",
+            "--spec-enable-prefetch",
+            "true" if (mode == "spec" and cls.spec_enable_prefetch) else "false",
+            "--prefetch-verify-wait-ms",
+            str(cls.prefetch_verify_wait_ms),
             "--return-token-ids",
             "true",
             "--return-text",

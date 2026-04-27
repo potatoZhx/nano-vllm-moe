@@ -1,5 +1,8 @@
 import pickle
+import os
+import threading
 from collections import defaultdict
+from queue import Queue
 from time import perf_counter
 import torch
 import torch.nn.functional as F
@@ -44,7 +47,23 @@ class ModelRunner:
         self.prefetch_strategy = create_prefetch_strategy(config.prefetch_strategy, config)
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
         self.prefetch_runtime: PrefetchRuntime | None = None
+        self.prefetch_effective_enabled = False
+        self._pending_prefetch_metadata: list[dict[str, object]] = []
         self._prefetch_step_id = 0
+        self._skip_metadata_observe = os.getenv("NANOVLLM_PREFETCH_SKIP_OBSERVE", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        self._prefetch_async_enabled = False
+        self._prefetch_runtime_lock = threading.RLock()
+        self._prefetch_profile_lock = threading.RLock()
+        self._prefetch_worker_queue: Queue | None = None
+        self._prefetch_worker_cv = threading.Condition()
+        self._prefetch_worker_outstanding = 0
+        self._prefetch_worker_key_counts: dict[tuple[str, int, int], int] = defaultdict(int)
+        self._prefetch_device_handles: dict[tuple[str, int], list[object]] = defaultdict(list)
+        self._prefetch_worker_error: BaseException | None = None
+        self._prefetch_worker_thread: threading.Thread | None = None
+        self._prefetch_trace_events: list[dict[str, object]] = []
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -69,8 +88,9 @@ class ModelRunner:
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.7),
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
+            self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"
 
-            if config.spec_enable_prefetch:
+            if self.prefetch_effective_enabled:
                 self.runtime_meta_recorder = ModelRuntimeMetaRecorder(config=config, hf_config=config.hf_config)
                 self.prefetch_runtime = PrefetchRuntime(
                     config=config,
@@ -82,6 +102,15 @@ class ModelRunner:
                 )
                 if hasattr(self.model, "set_runtime_meta_recorder"):
                     self.model.set_runtime_meta_recorder(self.runtime_meta_recorder)
+                self._prefetch_async_enabled = bool(self.prefetch_effective_enabled)
+                if self._prefetch_async_enabled:
+                    self._prefetch_worker_queue = Queue()
+                    self._prefetch_worker_thread = threading.Thread(
+                        target=self._prefetch_worker_main,
+                        name=f"prefetch-worker-rank{self.rank}",
+                        daemon=True,
+                    )
+                    self._prefetch_worker_thread.start()
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None
@@ -113,6 +142,8 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
+        self._flush_pending_prefetch_metadata(block=True)
+        self._shutdown_prefetch_worker()
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -157,18 +188,422 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def _ensure_prefetch_internal_state(self) -> None:
+        if not hasattr(self, "profile_enabled"):
+            self.profile_enabled = False
+        if not hasattr(self, "profile_cuda_sync"):
+            self.profile_cuda_sync = False
+        if not hasattr(self, "rank"):
+            self.rank = 0
+        if not hasattr(self, "_profile"):
+            self._profile = defaultdict(float)
+        if not hasattr(self, "_prefetch_async_enabled"):
+            self._prefetch_async_enabled = False
+        if not hasattr(self, "_prefetch_runtime_lock"):
+            self._prefetch_runtime_lock = threading.RLock()
+        if not hasattr(self, "_prefetch_profile_lock"):
+            self._prefetch_profile_lock = threading.RLock()
+        if not hasattr(self, "_prefetch_worker_cv"):
+            self._prefetch_worker_cv = threading.Condition()
+        if not hasattr(self, "_prefetch_worker_outstanding"):
+            self._prefetch_worker_outstanding = 0
+        if not hasattr(self, "_prefetch_worker_key_counts"):
+            self._prefetch_worker_key_counts = defaultdict(int)
+        if not hasattr(self, "_prefetch_device_handles"):
+            self._prefetch_device_handles = defaultdict(list)
+        if not hasattr(self, "_prefetch_worker_error"):
+            self._prefetch_worker_error = None
+        if not hasattr(self, "_prefetch_worker_queue"):
+            self._prefetch_worker_queue = None
+        if not hasattr(self, "_prefetch_worker_thread"):
+            self._prefetch_worker_thread = None
+        if not hasattr(self, "_prefetch_trace_events"):
+            self._prefetch_trace_events = []
+
     def _record_profile(self, key: str, dt_sec: float) -> None:
+        self._ensure_prefetch_internal_state()
         if self.profile_enabled and self.rank == 0:
-            self._profile[key] += dt_sec * 1000.0
+            with self._prefetch_profile_lock:
+                self._profile[key] += dt_sec * 1000.0
 
     def _next_prefetch_step_id(self) -> int:
         self._prefetch_step_id += 1
         return self._prefetch_step_id
 
+    def _trace_prefetch_interval(
+        self,
+        *,
+        name: str,
+        start_ms: float,
+        duration_ms: float,
+        step_id: int,
+        mode: str,
+        tid: str,
+    ) -> None:
+        self._ensure_prefetch_internal_state()
+        if not (self.profile_enabled and self.rank == 0):
+            return
+        if duration_ms <= 0.0:
+            return
+        with self._prefetch_profile_lock:
+            self._prefetch_trace_events.append(
+                {
+                    "name": name,
+                    "ph": "X",
+                    "ts": float(start_ms) * 1000.0,
+                    "dur": float(duration_ms) * 1000.0,
+                    "pid": 1,
+                    "tid": tid,
+                    "args": {
+                        "step_id": int(step_id),
+                        "mode": str(mode),
+                    },
+                }
+            )
+
+    def _raise_prefetch_worker_error(self) -> None:
+        self._ensure_prefetch_internal_state()
+        error = getattr(self, "_prefetch_worker_error", None)
+        if error is not None:
+            raise RuntimeError("Background prefetch metadata worker failed") from error
+
+    def _prefetch_worker_key(self, *, mode: str, handle) -> tuple[str, int]:
+        return (str(mode), int(getattr(handle, "token_capacity", 0)))
+
+    def _wait_for_prefetch_device_reuse(self, *, mode: str, token_capacity: int) -> float:
+        self._ensure_prefetch_internal_state()
+        if not getattr(self, "_prefetch_async_enabled", False):
+            return 0.0
+        wait_t0 = perf_counter()
+        key = (str(mode), int(token_capacity))
+        with self._prefetch_worker_cv:
+            while True:
+                pending_handles = []
+                for handle in self._prefetch_device_handles.get(key, []):
+                    event = getattr(handle, "event", None)
+                    if event is not None and not event.query():
+                        pending_handles.append(handle)
+                if pending_handles:
+                    self._prefetch_device_handles[key] = pending_handles
+                else:
+                    self._prefetch_device_handles.pop(key, None)
+                    break
+                self._raise_prefetch_worker_error()
+                self._prefetch_worker_cv.wait(timeout=0.001)
+            self._raise_prefetch_worker_error()
+        wait_ms = (perf_counter() - wait_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            prefix = f"run_{mode}_metadata"
+            with self._prefetch_profile_lock:
+                self._profile["prefetch_async_buffer_reuse_wait_count"] += 1
+                self._profile["prefetch_async_buffer_reuse_wait_ms"] += wait_ms
+                self._profile["prefetch_async_device_reuse_wait_ms"] += wait_ms
+                self._profile[f"{prefix}_buffer_reuse_wait_ms"] += wait_ms
+                self._profile[f"{prefix}_buffer_device_reuse_wait_ms"] += wait_ms
+            self._trace_prefetch_interval(
+                name="prefetch_device_reuse_wait",
+                start_ms=wait_t0 * 1000.0,
+                duration_ms=wait_ms,
+                step_id=-1,
+                mode=mode,
+                tid="main",
+            )
+        return wait_ms
+
+    def _acquire_prefetch_host_buffer_slot(self, *, mode: str, token_capacity: int) -> tuple[int, float]:
+        self._ensure_prefetch_internal_state()
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if runtime_meta_recorder is None:
+            return 0, 0.0
+        if not getattr(self, "_prefetch_async_enabled", False):
+            return 0, 0.0
+        wait_t0 = perf_counter()
+        mode_key = str(mode)
+        capacity = int(token_capacity)
+        with self._prefetch_worker_cv:
+            while True:
+                pool_size = runtime_meta_recorder.get_host_buffer_pool_size(mode_key, capacity)
+                for slot_idx in range(pool_size):
+                    slot_key = (mode_key, capacity, slot_idx)
+                    if self._prefetch_worker_key_counts.get(slot_key, 0) <= 0:
+                        self._raise_prefetch_worker_error()
+                        wait_ms = (perf_counter() - wait_t0) * 1000.0
+                        if self.profile_enabled and self.rank == 0:
+                            prefix = f"run_{mode}_metadata"
+                            with self._prefetch_profile_lock:
+                                self._profile["prefetch_async_buffer_reuse_wait_count"] += 1
+                                self._profile["prefetch_async_buffer_reuse_wait_ms"] += wait_ms
+                                self._profile["prefetch_async_host_reuse_wait_ms"] += wait_ms
+                                self._profile[f"{prefix}_buffer_reuse_wait_ms"] += wait_ms
+                                self._profile[f"{prefix}_buffer_host_reuse_wait_ms"] += wait_ms
+                            self._trace_prefetch_interval(
+                                name="prefetch_host_reuse_wait",
+                                start_ms=wait_t0 * 1000.0,
+                                duration_ms=wait_ms,
+                                step_id=-1,
+                                mode=mode,
+                                tid="main",
+                            )
+                        return slot_idx, wait_ms
+                if runtime_meta_recorder.maybe_grow_host_buffer_pool(mode_key, capacity):
+                    continue
+                self._raise_prefetch_worker_error()
+                self._prefetch_worker_cv.wait(timeout=0.001)
+        return 0, 0.0
+
+    def _wait_for_prefetch_async_drain(self) -> float:
+        self._ensure_prefetch_internal_state()
+        if not getattr(self, "_prefetch_async_enabled", False):
+            return 0.0
+        wait_t0 = perf_counter()
+        with self._prefetch_worker_cv:
+            while self._prefetch_worker_outstanding > 0:
+                self._raise_prefetch_worker_error()
+                self._prefetch_worker_cv.wait(timeout=0.001)
+            self._raise_prefetch_worker_error()
+        wait_ms = (perf_counter() - wait_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["prefetch_async_drain_count"] += 1
+                self._profile["prefetch_async_drain_wait_ms"] += wait_ms
+        return wait_ms
+
+    def _process_prefetch_metadata_item(
+        self,
+        item: dict[str, object],
+        *,
+        block: bool,
+        processing_origin: str,
+    ) -> bool:
+        self._ensure_prefetch_internal_state()
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is None or runtime_meta_recorder is None:
+            return True
+
+        handle = item["handle"]
+        event = getattr(handle, "event", None)
+        if event is not None and not block and not event.query():
+            return False
+
+        worker_wait_t0 = perf_counter()
+        transfer_wait_ms = 0.0
+        if event is not None and block:
+            event.synchronize()
+            transfer_wait_ms = (perf_counter() - worker_wait_t0) * 1000.0
+
+        collect_t0 = perf_counter()
+        runtime_meta = runtime_meta_recorder.collect(handle, wait=False)
+        collect_ms = (perf_counter() - collect_t0) * 1000.0
+
+        observe_stats: dict[str, float] = {}
+        submit_after_ms = 0.0
+        observe_t0 = perf_counter()
+        with self._prefetch_runtime_lock:
+            if not getattr(self, "_skip_metadata_observe", False):
+                mode = str(item["mode"])
+                step_id = int(item["step_id"])
+                if mode == "prefill":
+                    observe_stats = prefetch_runtime.observe_prefill(runtime_meta, step_id=step_id)
+                elif mode == "draft":
+                    observe_stats = prefetch_runtime.observe_draft(runtime_meta, step_id=step_id)
+                elif mode == "verify":
+                    observe_stats = prefetch_runtime.observe_verify(runtime_meta, step_id=step_id)
+                    if bool(item["record_verify_consumed"]):
+                        prefetch_runtime.record_verify_consumed(runtime_meta, step_id=step_id)
+            elif self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["metadata_observe_skipped_count"] += 1
+            observe_ms = (perf_counter() - observe_t0) * 1000.0
+
+            submit_after_phase = item["submit_after_phase"]
+            if submit_after_phase is not None:
+                submit_after_t0 = perf_counter()
+                prefetch_runtime.submit_from_global_queue(step_id=int(item["step_id"]), phase=str(submit_after_phase))
+                submit_after_ms = (perf_counter() - submit_after_t0) * 1000.0
+
+            prefetch_runtime.record_metadata_offload(
+                mode=str(item["mode"]),
+                num_bytes=int(handle.buffer_bytes),
+                enqueue_ms=float(item["enqueue_ms"]),
+                transfer_wait_ms=transfer_wait_ms,
+                collect_ms=collect_ms,
+                observe_ms=observe_ms,
+            )
+
+        if self.profile_enabled and self.rank == 0:
+            prefix = f"run_{item['mode']}_metadata"
+            turnaround_ms = (perf_counter() * 1000.0) - float(item["enqueue_ts_ms"])
+            with self._prefetch_profile_lock:
+                self._profile[f"{prefix}_enqueue_ms"] += float(item["enqueue_ms"])
+                self._profile[f"{prefix}_wait_ms"] += transfer_wait_ms
+                self._profile[f"{prefix}_collect_ms"] += collect_ms
+                self._profile[f"{prefix}_observe_ms"] += observe_ms
+                self._profile[f"{prefix}_mark_access_ms"] += float(observe_stats.get("mark_access_ms", 0.0))
+                self._profile[f"{prefix}_queue_update_ms"] += float(observe_stats.get("queue_update_ms", 0.0))
+                self._profile[f"{prefix}_queue_aggregate_ms"] += float(observe_stats.get("queue_aggregate_ms", 0.0))
+                self._profile[f"{prefix}_queue_filter_ms"] += float(observe_stats.get("queue_filter_ms", 0.0))
+                self._profile[f"{prefix}_queue_entry_update_ms"] += float(observe_stats.get("queue_entry_update_ms", 0.0))
+                self._profile[f"{prefix}_async_turnaround_ms"] += turnaround_ms
+                if item["mode"] in {"draft", "verify"}:
+                    self._profile[f"run_{item['mode']}_submit_after_ms"] += submit_after_ms
+                if processing_origin == "worker":
+                    self._profile["prefetch_async_worker_item_count"] += 1
+                    self._profile["prefetch_async_worker_wait_ms"] += transfer_wait_ms
+                    self._profile["prefetch_async_worker_collect_ms"] += collect_ms
+                    self._profile["prefetch_async_worker_observe_ms"] += observe_ms
+                    self._profile["prefetch_async_worker_submit_ms"] += submit_after_ms
+                    self._profile["prefetch_async_worker_turnaround_ms"] += turnaround_ms
+
+            process_start_ms = float(item["enqueue_ts_ms"]) + float(item["enqueue_ms"])
+            self._trace_prefetch_interval(
+                name=f"{item['mode']}_metadata_wait",
+                start_ms=process_start_ms,
+                duration_ms=transfer_wait_ms,
+                step_id=int(item["step_id"]),
+                mode=str(item["mode"]),
+                tid=processing_origin,
+            )
+            self._trace_prefetch_interval(
+                name=f"{item['mode']}_metadata_process",
+                start_ms=process_start_ms + transfer_wait_ms,
+                duration_ms=collect_ms + observe_ms + submit_after_ms,
+                step_id=int(item["step_id"]),
+                mode=str(item["mode"]),
+                tid=processing_origin,
+            )
+
+        return True
+
+    def _prefetch_worker_main(self) -> None:
+        while True:
+            queue_obj = self._prefetch_worker_queue
+            if queue_obj is None:
+                return
+            item = queue_obj.get()
+            if item is None:
+                return
+            try:
+                self._process_prefetch_metadata_item(item, block=True, processing_origin="worker")
+            except BaseException as exc:
+                with self._prefetch_worker_cv:
+                    if self._prefetch_worker_error is None:
+                        self._prefetch_worker_error = exc
+            finally:
+                key = item.get("buffer_key")
+                handle = item.get("handle")
+                host_buffer_slot = int(item.get("host_buffer_slot", 0))
+                with self._prefetch_worker_cv:
+                    self._prefetch_worker_outstanding = max(0, self._prefetch_worker_outstanding - 1)
+                    if isinstance(key, tuple):
+                        slot_key = (*key, host_buffer_slot)
+                        remaining = self._prefetch_worker_key_counts.get(slot_key, 0) - 1
+                        if remaining > 0:
+                            self._prefetch_worker_key_counts[slot_key] = remaining
+                        else:
+                            self._prefetch_worker_key_counts.pop(slot_key, None)
+                        device_handles = [x for x in self._prefetch_device_handles.get(key, []) if x is not handle]
+                        if device_handles:
+                            self._prefetch_device_handles[key] = device_handles
+                        else:
+                            self._prefetch_device_handles.pop(key, None)
+                    self._prefetch_worker_cv.notify_all()
+
+    def _shutdown_prefetch_worker(self) -> None:
+        self._ensure_prefetch_internal_state()
+        if not getattr(self, "_prefetch_async_enabled", False):
+            return
+        queue_obj = getattr(self, "_prefetch_worker_queue", None)
+        worker = getattr(self, "_prefetch_worker_thread", None)
+        if queue_obj is not None:
+            queue_obj.put(None)
+        if worker is not None:
+            worker.join(timeout=5.0)
+        self._prefetch_worker_queue = None
+        self._prefetch_worker_thread = None
+
+    def _enqueue_prefetch_metadata(
+        self,
+        *,
+        mode: str,
+        step_id: int,
+        handle,
+        enqueue_ms: float,
+        host_buffer_slot: int = 0,
+        submit_after_phase: str | None = None,
+        record_verify_consumed: bool = False,
+    ) -> None:
+        self._ensure_prefetch_internal_state()
+        if handle is None:
+            return
+        item = {
+            "mode": mode,
+            "step_id": int(step_id),
+            "handle": handle,
+            "enqueue_ms": float(enqueue_ms),
+            "enqueue_ts_ms": perf_counter() * 1000.0,
+            "submit_after_phase": submit_after_phase,
+            "record_verify_consumed": bool(record_verify_consumed),
+            "buffer_key": self._prefetch_worker_key(mode=mode, handle=handle),
+            "host_buffer_slot": int(host_buffer_slot),
+        }
+        if getattr(self, "_prefetch_async_enabled", False):
+            self._raise_prefetch_worker_error()
+            queue_obj = getattr(self, "_prefetch_worker_queue", None)
+            if queue_obj is None:
+                raise RuntimeError("Prefetch async worker queue is not initialized")
+            with self._prefetch_worker_cv:
+                self._prefetch_worker_outstanding += 1
+                self._prefetch_worker_key_counts[
+                    (*item["buffer_key"], int(item["host_buffer_slot"]))
+                ] += 1
+                self._prefetch_device_handles[item["buffer_key"]].append(handle)
+                queue_depth = self._prefetch_worker_outstanding
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["prefetch_async_enqueue_count"] += 1
+                    self._profile["prefetch_async_queue_depth_sum"] += queue_depth
+                    self._profile["prefetch_async_queue_depth_max"] = max(
+                        float(self._profile.get("prefetch_async_queue_depth_max", 0.0)),
+                        float(queue_depth),
+                    )
+            queue_obj.put(item)
+            return
+        pending = getattr(self, "_pending_prefetch_metadata", None)
+        if pending is None:
+            pending = []
+            self._pending_prefetch_metadata = pending
+        pending.append(item)
+
+    def _flush_pending_prefetch_metadata(self, block: bool) -> None:
+        self._ensure_prefetch_internal_state()
+        self._raise_prefetch_worker_error()
+        if getattr(self, "_prefetch_async_enabled", False):
+            if block:
+                self._wait_for_prefetch_async_drain()
+            return
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is None or runtime_meta_recorder is None:
+            pending = getattr(self, "_pending_prefetch_metadata", None)
+            if pending is not None:
+                pending.clear()
+            return
+
+        pending: list[dict[str, object]] = []
+        for item in getattr(self, "_pending_prefetch_metadata", []):
+            if not self._process_prefetch_metadata_item(item, block=block, processing_origin="foreground"):
+                pending.append(item)
+
+        self._pending_prefetch_metadata = pending
+
     def get_profile(self, reset: bool = False) -> dict:
+        self._ensure_prefetch_internal_state()
         if self.rank != 0:
             return {}
-        out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+        self._flush_pending_prefetch_metadata(block=True)
+        with self._prefetch_profile_lock:
+            out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
         decode_count = int(self._profile.get("decode_count", 0))
         graph_hit_count = int(self._profile.get("graph_hit_count", 0))
         out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
@@ -185,11 +620,25 @@ class ModelRunner:
             out["realized_cpu_expert_count"] = 0.0
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         if prefetch_runtime is not None:
-            out.update(prefetch_runtime.get_profile(reset=False))
+            with self._prefetch_runtime_lock:
+                out.update(prefetch_runtime.get_profile(reset=False))
+        out["prefetch_async_enabled"] = bool(getattr(self, "_prefetch_async_enabled", False))
+        out["prefetch_trace_events"] = list(getattr(self, "_prefetch_trace_events", []))
+        worker_turnaround_ms = float(out.get("prefetch_async_worker_turnaround_ms", 0.0))
+        exposed_ms = float(out.get("prefetch_async_buffer_reuse_wait_ms", 0.0)) + float(out.get("prefetch_async_drain_wait_ms", 0.0))
+        out["prefetch_async_exposed_wait_ms"] = exposed_ms
+        out["prefetch_async_hidden_ms"] = max(0.0, worker_turnaround_ms - exposed_ms)
+        out["prefetch_async_hidden_ratio"] = float(out["prefetch_async_hidden_ms"] / worker_turnaround_ms) if worker_turnaround_ms > 0.0 else 0.0
         if reset:
-            self._profile.clear()
+            with self._prefetch_profile_lock:
+                self._profile.clear()
+                self._prefetch_trace_events.clear()
+            pending = getattr(self, "_pending_prefetch_metadata", None)
+            if pending is not None:
+                pending.clear()
             if prefetch_runtime is not None:
-                _ = prefetch_runtime.get_profile(reset=True)
+                with self._prefetch_runtime_lock:
+                    _ = prefetch_runtime.get_profile(reset=True)
         return out
 
     def _run_model_eager(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -372,15 +821,19 @@ class ModelRunner:
         return any(bucket >= bs for bucket in self.graph_bs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        phase = "prefill" if is_prefill else "decode"
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         self._record_profile("prepare_prefill_ms" if is_prefill else "prepare_decode_ms", perf_counter() - t0)
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         prefill_step_id = None
+        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            self._flush_pending_prefetch_metadata(block=False)
         if is_prefill and prefetch_runtime is not None and runtime_meta_recorder is not None:
             prefill_step_id = self._next_prefetch_step_id()
             token_count = int(input_ids.numel())
+            self._wait_for_prefetch_device_reuse(mode="prefill", token_capacity=token_count)
             runtime_meta_recorder.arm(
                 mode="prefill",
                 step_id=prefill_step_id,
@@ -394,35 +847,50 @@ class ModelRunner:
 
         t0 = perf_counter()
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        self._record_profile("prepare_sample_ms", perf_counter() - t0)
+        dt = perf_counter() - t0
+        self._record_profile("prepare_sample_ms", dt)
+        self._record_profile(f"prepare_sample_{phase}_ms", dt)
 
         t0 = perf_counter()
         logits = self.run_model(input_ids, positions, is_prefill)
         if self.profile_enabled and self.profile_cuda_sync:
             torch.cuda.synchronize()
-        self._record_profile("run_model_ms", perf_counter() - t0)
+        dt = perf_counter() - t0
+        self._record_profile("run_model_ms", dt)
+        self._record_profile(f"run_model_{phase}_ms", dt)
 
         t0 = perf_counter()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         if self.profile_enabled and self.profile_cuda_sync:
             torch.cuda.synchronize()
-        self._record_profile("sample_ms", perf_counter() - t0)
+        dt = perf_counter() - t0
+        self._record_profile("sample_ms", dt)
+        self._record_profile(f"sample_{phase}_ms", dt)
 
         if self.profile_enabled and self.rank == 0:
             self._profile["tokens_in_total"] += int(input_ids.numel())
             self._profile["run_count"] += 1
 
         if is_prefill and prefetch_runtime is not None and runtime_meta_recorder is not None and prefill_step_id is not None:
-            meta_t0 = perf_counter()
-            handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
-            runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
-            prefetch_runtime.observe_prefill(runtime_meta, step_id=prefill_step_id)
-            if handle is not None:
-                prefetch_runtime.record_metadata_offload(
-                    dt_ms=(perf_counter() - meta_t0) * 1000.0,
-                    num_bytes=handle.buffer_bytes,
-                )
+            host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+                mode="prefill",
+                token_capacity=int(input_ids.numel()),
+            )
+            enqueue_t0 = perf_counter()
+            handle = runtime_meta_recorder.offload_async(
+                prefetch_runtime.metadata_stream,
+                host_buffer_slot=host_buffer_slot,
+            )
+            enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+            self._enqueue_prefetch_metadata(
+                mode="prefill",
+                step_id=prefill_step_id,
+                handle=handle,
+                enqueue_ms=enqueue_ms,
+                host_buffer_slot=host_buffer_slot,
+            )
             runtime_meta_recorder.reset()
+            self._flush_pending_prefetch_metadata(block=False)
 
         reset_context()
         return token_ids
@@ -435,41 +903,88 @@ class ModelRunner:
     @torch.inference_mode()
     def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], dict[str, object]]:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
+        self._ensure_prefetch_internal_state()
         t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            self._flush_pending_prefetch_metadata(block=False)
+
+        mode_set_t0 = perf_counter()
         self._set_speculative_execution_mode("draft")
         self._decode_graph_policy = "draft"
+        mode_set_ms = (perf_counter() - mode_set_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            self._profile["run_draft_mode_set_ms"] += mode_set_ms
+
         try:
+            prefetch_before_ms = 0.0
             if prefetch_runtime is not None and runtime_meta_recorder is not None:
+                before_t0 = perf_counter()
                 draft_capacity = len(seqs)
                 if self._can_use_draft_cudagraph(len(seqs)):
                     draft_capacity = next(x for x in self.draft_graph_bs if x >= len(seqs))
 
-                prefetch_runtime.publish_ready(step_id=step_id)
-                prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="before_draft")
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.publish_ready(step_id=step_id)
+                    prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="before_draft")
+                self._wait_for_prefetch_device_reuse(mode="draft", token_capacity=draft_capacity)
                 runtime_meta_recorder.arm(
                     mode="draft",
                     step_id=step_id,
                     token_capacity=draft_capacity,
                     logical_token_count=len(seqs),
                 )
+                prefetch_before_ms = (perf_counter() - before_t0) * 1000.0
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["run_draft_prefetch_before_ms"] += prefetch_before_ms
+                    self._trace_prefetch_interval(
+                        name="run_draft_prefetch_before",
+                        start_ms=before_t0 * 1000.0,
+                        duration_ms=prefetch_before_ms,
+                        step_id=step_id,
+                        mode="draft",
+                        tid="main",
+                    )
 
+            core_run_t0 = perf_counter()
             token_ids = self.run(seqs, False)
+            core_run_ms = (perf_counter() - core_run_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["run_draft_core_run_ms"] += core_run_ms
+                self._trace_prefetch_interval(
+                    name="run_draft_core_run",
+                    start_ms=core_run_t0 * 1000.0,
+                    duration_ms=core_run_ms,
+                    step_id=step_id,
+                    mode="draft",
+                    tid="main",
+                )
 
             if prefetch_runtime is not None and runtime_meta_recorder is not None:
-                meta_t0 = perf_counter()
-                handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
-                runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
-                prefetch_runtime.observe_draft(runtime_meta, step_id=step_id)
-                prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="after_draft")
-                if handle is not None:
-                    prefetch_runtime.record_metadata_offload(
-                        dt_ms=(perf_counter() - meta_t0) * 1000.0,
-                        num_bytes=handle.buffer_bytes,
-                    )
+                host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+                    mode="draft",
+                    token_capacity=draft_capacity,
+                )
+                enqueue_t0 = perf_counter()
+                handle = runtime_meta_recorder.offload_async(
+                    prefetch_runtime.metadata_stream,
+                    host_buffer_slot=host_buffer_slot,
+                )
+                enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                self._enqueue_prefetch_metadata(
+                    mode="draft",
+                    step_id=step_id,
+                    handle=handle,
+                    enqueue_ms=enqueue_ms,
+                    host_buffer_slot=host_buffer_slot,
+                    submit_after_phase="after_draft",
+                )
                 runtime_meta_recorder.reset()
+                self._flush_pending_prefetch_metadata(block=False)
             return token_ids, {"prefetch_step_id": step_id}
         finally:
             self._decode_graph_policy = "standard"
@@ -482,25 +997,42 @@ class ModelRunner:
                     self._profile["run_draft_count"] += 1
 
     def wait_prefetch_for_verify(self, step_id: int) -> dict[str, float]:
+        self._ensure_prefetch_internal_state()
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         if prefetch_runtime is None:
             return {}
+        metadata_drain_ms = self._wait_for_prefetch_async_drain() if getattr(self, "_prefetch_async_enabled", False) else 0.0
+        self._flush_pending_prefetch_metadata(block=True)
         t0 = perf_counter()
-        prefetch_runtime.wait_for_verify(
+        with self._prefetch_runtime_lock:
+            prefetch_runtime.wait_for_verify(
+                step_id=step_id,
+                timeout_ms=float(self.config.prefetch_verify_wait_ms),
+            )
+        verify_wait_ms = (perf_counter() - t0) * 1000.0
+        self._trace_prefetch_interval(
+            name="verify_prefetch_wait",
+            start_ms=t0 * 1000.0,
+            duration_ms=verify_wait_ms,
             step_id=step_id,
-            timeout_ms=float(self.config.prefetch_verify_wait_ms),
+            mode="verify",
+            tid="main",
         )
         return {
-            "verify_prefetch_wait_ms": (perf_counter() - t0) * 1000.0,
+            "verify_prefetch_metadata_drain_ms": metadata_drain_ms,
+            "verify_prefetch_wait_ms": verify_wait_ms,
         }
 
     @torch.inference_mode()
     def run_verify(self, seqs: list[Sequence], verify_lengths: list[int]) -> list[list[int]]:
         """Run one-shot verify in prefill-like mode and return per-sequence argmax traces."""
+        self._ensure_prefetch_internal_state()
         total_t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            self._flush_pending_prefetch_metadata(block=False)
         self._set_speculative_execution_mode("verify")
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs)
@@ -508,6 +1040,7 @@ class ModelRunner:
 
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
             token_count = int(input_ids.numel())
+            self._wait_for_prefetch_device_reuse(mode="verify", token_capacity=token_count)
             runtime_meta_recorder.arm(
                 mode="verify",
                 step_id=step_id,
@@ -556,18 +1089,27 @@ class ModelRunner:
             verify_tokens_per_seq.append(seq_logits.argmax(dim=-1).tolist())
 
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
-            meta_t0 = perf_counter()
-            handle = runtime_meta_recorder.offload_async(prefetch_runtime.metadata_stream)
-            runtime_meta = runtime_meta_recorder.collect(handle, wait=True)
-            prefetch_runtime.observe_verify(runtime_meta, step_id=step_id)
-            prefetch_runtime.record_verify_consumed(runtime_meta, step_id=step_id)
-            prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="after_verify")
-            if handle is not None:
-                prefetch_runtime.record_metadata_offload(
-                    dt_ms=(perf_counter() - meta_t0) * 1000.0,
-                    num_bytes=handle.buffer_bytes,
-                )
+            host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+                mode="verify",
+                token_capacity=int(input_ids.numel()),
+            )
+            enqueue_t0 = perf_counter()
+            handle = runtime_meta_recorder.offload_async(
+                prefetch_runtime.metadata_stream,
+                host_buffer_slot=host_buffer_slot,
+            )
+            enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+            self._enqueue_prefetch_metadata(
+                mode="verify",
+                step_id=step_id,
+                handle=handle,
+                enqueue_ms=enqueue_ms,
+                host_buffer_slot=host_buffer_slot,
+                submit_after_phase="after_verify",
+                record_verify_consumed=True,
+            )
             runtime_meta_recorder.reset()
+            self._flush_pending_prefetch_metadata(block=False)
         return verify_tokens_per_seq
 
     @torch.inference_mode()

@@ -6,6 +6,9 @@ import torch
 
 from nanovllm.config import Config
 
+_SMALL_META_AGGREGATE_NUMEL = 64
+_DEFAULT_HOST_BUFFER_POOL_SIZE = 3
+
 
 class _ImmediateEvent:
     def query(self) -> bool:
@@ -21,8 +24,11 @@ class LayerRuntimeMetaCPU:
     mode: str
     layer_idx: int
     token_count: int
-    selected_experts: torch.Tensor
-    routing_weights: torch.Tensor
+    aggregated_expert_ids: torch.Tensor | None = None
+    aggregated_score_sum: torch.Tensor | None = None
+    aggregated_activation_count: torch.Tensor | None = None
+    selected_experts: torch.Tensor | None = None
+    routing_weights: torch.Tensor | None = None
 
 
 @dataclass
@@ -33,6 +39,36 @@ class RuntimeMetaOffloadHandle:
     token_capacity: int
     logical_token_count: int
     buffer_bytes: int
+    host_buffer_slot: int = 0
+
+
+def _aggregate_layer_runtime_meta_cpu(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    flat_experts = selected_experts.reshape(-1)
+    numel = int(flat_experts.numel())
+    if numel <= 0 or numel > _SMALL_META_AGGREGATE_NUMEL:
+        return None
+
+    flat_experts_cpu = flat_experts if flat_experts.device.type == "cpu" and flat_experts.dtype == torch.int64 else flat_experts.to(device="cpu", dtype=torch.int64)
+    unique_ids, inverse = torch.unique(flat_experts_cpu, sorted=True, return_inverse=True)
+    if unique_ids.numel() == 0:
+        return (
+            torch.empty((0,), dtype=torch.int64, device="cpu"),
+            torch.empty((0,), dtype=torch.float32, device="cpu"),
+            torch.empty((0,), dtype=torch.int64, device="cpu"),
+        )
+
+    aggregated_expert_ids = unique_ids.to(dtype=torch.int64, device="cpu")
+    aggregated_activation_count = torch.zeros((unique_ids.numel(),), dtype=torch.int64, device="cpu")
+    aggregated_activation_count.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.int64))
+    aggregated_score_sum = torch.zeros((unique_ids.numel(),), dtype=torch.float32, device="cpu")
+    if routing_weights is not None and routing_weights.numel() == selected_experts.numel():
+        flat_weights = routing_weights.reshape(-1)
+        flat_weights_cpu = flat_weights if flat_weights.device.type == "cpu" and flat_weights.dtype == torch.float32 else flat_weights.to(device="cpu", dtype=torch.float32)
+        aggregated_score_sum.scatter_add_(0, inverse, flat_weights_cpu)
+    return aggregated_expert_ids, aggregated_score_sum, aggregated_activation_count
 
 
 class ModelRuntimeMetaRecorder:
@@ -42,10 +78,38 @@ class ModelRuntimeMetaRecorder:
         self.top_k = int(hf_config.num_experts_per_tok)
         self.device_buffers: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
         self.host_buffers: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
+        self.host_buffer_pools: dict[tuple[str, int], list[dict[str, torch.Tensor]]] = {}
+        self.host_buffer_pool_size = max(
+            1,
+            int(getattr(config, "prefetch_metadata_host_buffer_pool_size", _DEFAULT_HOST_BUFFER_POOL_SIZE)),
+        )
         self.active_key: tuple[str, int] | None = None
         self.active_step_id: int = -1
         self.active_mode: str = "idle"
         self.active_logical_token_count: int = 0
+
+    def _make_host_buffer(self, token_capacity: int, device: torch.device) -> dict[str, torch.Tensor]:
+        if device.type == "cuda":
+            return {
+                "selected_experts": torch.empty(
+                    (self.num_layers, token_capacity, self.top_k),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "routing_weights": torch.empty(
+                    (self.num_layers, token_capacity, self.top_k),
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "token_count": torch.empty((self.num_layers,), dtype=torch.int32, device="cpu", pin_memory=True),
+            }
+        return {
+            "selected_experts": torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.int64),
+            "routing_weights": torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.float32),
+            "token_count": torch.empty((self.num_layers,), dtype=torch.int32),
+        }
 
     def _ensure_buffer(self, mode: str, token_capacity: int, device: torch.device) -> tuple[str, int]:
         key = (mode, int(token_capacity))
@@ -65,37 +129,33 @@ class ModelRuntimeMetaRecorder:
         token_count_device = torch.zeros((self.num_layers,), dtype=torch.int32, device=device)
         token_count_capture_value = torch.zeros((1,), dtype=torch.int32, device=device)
 
-        if device.type == "cuda":
-            selected_host = torch.empty(
-                (self.num_layers, token_capacity, self.top_k),
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            weights_host = torch.empty(
-                (self.num_layers, token_capacity, self.top_k),
-                dtype=torch.float32,
-                device="cpu",
-                pin_memory=True,
-            )
-            token_count_host = torch.empty((self.num_layers,), dtype=torch.int32, device="cpu", pin_memory=True)
-        else:
-            selected_host = torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.int64)
-            weights_host = torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.float32)
-            token_count_host = torch.empty((self.num_layers,), dtype=torch.int32)
-
         self.device_buffers[key] = {
             "selected_experts": selected_device,
             "routing_weights": weights_device,
             "token_count": token_count_device,
             "token_count_capture_value": token_count_capture_value,
         }
-        self.host_buffers[key] = {
-            "selected_experts": selected_host,
-            "routing_weights": weights_host,
-            "token_count": token_count_host,
-        }
+        host_buffer = self._make_host_buffer(token_capacity, device)
+        self.host_buffers[key] = host_buffer
+        self.host_buffer_pools[key] = [host_buffer]
         return key
+
+    def get_host_buffer_pool_size(self, mode: str, token_capacity: int) -> int:
+        key = (mode, int(token_capacity))
+        pool = self.host_buffer_pools.get(key)
+        return len(pool) if pool is not None else 0
+
+    def maybe_grow_host_buffer_pool(self, mode: str, token_capacity: int) -> bool:
+        key = (mode, int(token_capacity))
+        if key not in self.device_buffers:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            self._ensure_buffer(mode, int(token_capacity), device)
+        pool = self.host_buffer_pools[key]
+        if len(pool) >= self.host_buffer_pool_size:
+            return False
+        device = self.device_buffers[key]["selected_experts"].device
+        pool.append(self._make_host_buffer(int(token_capacity), device))
+        return True
 
     def arm(
         self,
@@ -150,13 +210,18 @@ class ModelRuntimeMetaRecorder:
     def offload_async(
         self,
         stream: torch.cuda.Stream | None,
+        host_buffer_slot: int = 0,
     ) -> RuntimeMetaOffloadHandle | None:
         if self.active_key is None:
             return None
 
         key = self.active_key
         dev = self.device_buffers[key]
-        host = self.host_buffers[key]
+        host_pool = self.host_buffer_pools[key]
+        host_slot = int(host_buffer_slot)
+        if not (0 <= host_slot < len(host_pool)):
+            raise IndexError(f"host_buffer_slot out of range: {host_slot}")
+        host = host_pool[host_slot]
         buffer_bytes = self._buffer_bytes(key)
 
         if dev["selected_experts"].is_cuda:
@@ -180,6 +245,7 @@ class ModelRuntimeMetaRecorder:
             token_capacity=key[1],
             logical_token_count=self.active_logical_token_count,
             buffer_bytes=buffer_bytes,
+            host_buffer_slot=host_slot,
         )
 
     def collect(
@@ -195,7 +261,7 @@ class ModelRuntimeMetaRecorder:
             return None
 
         key = (handle.mode, handle.token_capacity)
-        host = self.host_buffers[key]
+        host = self.host_buffer_pools[key][int(handle.host_buffer_slot)]
         token_counts = host["token_count"]
         out: dict[int, LayerRuntimeMetaCPU] = {}
 
@@ -204,13 +270,19 @@ class ModelRuntimeMetaRecorder:
             token_count = min(token_count, int(handle.logical_token_count))
             if token_count <= 0:
                 continue
+            selected_experts = host["selected_experts"][layer_idx, :token_count]
+            routing_weights = host["routing_weights"][layer_idx, :token_count]
+            aggregated = _aggregate_layer_runtime_meta_cpu(selected_experts, routing_weights)
             out[layer_idx] = LayerRuntimeMetaCPU(
                 step_id=handle.step_id,
                 mode=handle.mode,
                 layer_idx=layer_idx,
                 token_count=token_count,
-                selected_experts=host["selected_experts"][layer_idx, :token_count].clone(),
-                routing_weights=host["routing_weights"][layer_idx, :token_count].clone(),
+                aggregated_expert_ids=aggregated[0] if aggregated is not None else None,
+                aggregated_score_sum=aggregated[1] if aggregated is not None else None,
+                aggregated_activation_count=aggregated[2] if aggregated is not None else None,
+                selected_experts=None if aggregated is not None else selected_experts.clone(),
+                routing_weights=None if aggregated is not None else routing_weights.clone(),
             )
         return out
 

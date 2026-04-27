@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
-from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
+from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder, _aggregate_layer_runtime_meta_cpu
 
 
 class TestPrefetchRuntimeMeta(unittest.TestCase):
@@ -24,7 +24,11 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
         self.assertIsNotNone(handle)
         self.assertIn(0, out)
         self.assertEqual(out[0].token_count, 3)
-        self.assertEqual(tuple(out[0].selected_experts.shape), (3, 2))
+        self.assertIsNone(out[0].selected_experts)
+        self.assertIsNone(out[0].routing_weights)
+        self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(out[0].aggregated_activation_count.tolist(), [2, 2, 2])
+        self.assertEqual([round(x, 4) for x in out[0].aggregated_score_sum.tolist()], [0.7, 1.2, 1.1])
 
     def test_collect_respects_logical_token_count(self):
         recorder = ModelRuntimeMetaRecorder(
@@ -39,6 +43,41 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
 
         out = recorder.collect(recorder.offload_async(stream=None), wait=True)
         self.assertEqual(out[0].token_count, 2)
+        self.assertIsNone(out[0].selected_experts)
+        self.assertIsNone(out[0].routing_weights)
+        self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
+
+    def test_collect_supports_host_buffer_pool_slot(self):
+        recorder = ModelRuntimeMetaRecorder(
+            config=SimpleNamespace(prefetch_metadata_host_buffer_pool_size=2),
+            hf_config=SimpleNamespace(num_hidden_layers=1, num_experts_per_tok=2),
+        )
+        recorder.arm(mode="draft", step_id=5, token_capacity=2, logical_token_count=2)
+        self.assertTrue(recorder.maybe_grow_host_buffer_pool("draft", 2))
+        self.assertEqual(recorder.get_host_buffer_pool_size("draft", 2), 2)
+
+        selected = torch.tensor([[2, 1], [2, 3]], dtype=torch.int64)
+        weights = torch.tensor([[0.4, 0.6], [0.7, 0.3]], dtype=torch.float32)
+        recorder.record_layer(layer_idx=0, selected_experts=selected, routing_weights=weights)
+
+        handle = recorder.offload_async(stream=None, host_buffer_slot=1)
+        out = recorder.collect(handle, wait=True)
+
+        self.assertEqual(handle.host_buffer_slot, 1)
+        self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
+        self.assertEqual([round(x, 4) for x in out[0].aggregated_score_sum.tolist()], [0.6, 1.1, 0.3])
+
+    def test_small_cpu_aggregate_helper_uses_small_fast_path(self):
+        selected = torch.tensor([[3, 1], [3, 2]], dtype=torch.int64)
+        weights = torch.tensor([[0.6, 0.4], [0.7, 0.3]], dtype=torch.float32)
+        aggregated = _aggregate_layer_runtime_meta_cpu(selected, weights)
+        self.assertIsNotNone(aggregated)
+        expert_ids, score_sum, counts = aggregated
+        self.assertEqual(expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(counts.tolist(), [1, 1, 2])
+        self.assertEqual([round(x, 4) for x in score_sum.tolist()], [0.4, 0.3, 1.3])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for pinned-host allocation regression test")
     def test_arm_with_cuda_default_device_allocates_host_mirror_on_cpu(self):
