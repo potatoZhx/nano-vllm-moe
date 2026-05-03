@@ -52,6 +52,10 @@ class Config:
     heterogeneous_slots_per_layer: int = 0
     cpu_expert_pin_memory: bool = True
     cpu_expert_execution_enabled: bool = False
+    cpu_expert_backend: str = "torch"
+    cpu_expert_workspace_max_routes: int = 8192
+    cpu_expert_packed_min_routes: int = 32
+    cpu_expert_strict_dtype: bool = True
     cpu_expert_num_threads: int = 4
     cpu_expert_parallel_mode: str = "serial"
     cpu_gpu_parallel_execution_enabled: bool = False
@@ -105,6 +109,9 @@ class Config:
         assert 0.0 <= self.prefetch_history_decay <= 1.0
         assert self.prefetch_history_ttl_steps >= 1
         assert self.prefetch_runtime_mode == "baseline_staging"
+        assert self.cpu_expert_backend in {"torch", "torch_packed"}
+        assert self.cpu_expert_workspace_max_routes >= 1
+        assert self.cpu_expert_packed_min_routes >= 1
         assert self.cpu_expert_num_threads >= 1
         assert self.cpu_expert_parallel_mode in {"serial", "expert_parallel"}
         assert 0.0 <= self.cpu_gpu_parallel_min_cpu_route_ratio <= 1.0

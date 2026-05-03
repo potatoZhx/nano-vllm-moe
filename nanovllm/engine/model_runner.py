@@ -1,5 +1,6 @@
 import pickle
 import os
+import json
 import threading
 from collections import defaultdict
 from queue import Queue
@@ -84,6 +85,10 @@ class ModelRunner:
                 cpu_expert_execution_enabled=getattr(config, "cpu_expert_execution_enabled", False),
                 cpu_expert_parallel_mode=getattr(config, "cpu_expert_parallel_mode", "serial"),
                 cpu_expert_num_threads=getattr(config, "cpu_expert_num_threads", 4),
+                cpu_expert_backend=getattr(config, "cpu_expert_backend", "torch"),
+                cpu_expert_workspace_max_routes=getattr(config, "cpu_expert_workspace_max_routes", 8192),
+                cpu_expert_packed_min_routes=getattr(config, "cpu_expert_packed_min_routes", 32),
+                cpu_expert_strict_dtype=getattr(config, "cpu_expert_strict_dtype", True),
                 cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", False),
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.7),
             )
@@ -1052,12 +1057,59 @@ class ModelRunner:
         # Verify needs logits for every queried token position.
         try:
             t0 = perf_counter()
-            hidden_states = self.model(input_ids, positions)
+            profile_dir = os.getenv("NANOVLLM_VERIFY_TORCH_PROFILE_DIR", "").strip()
+            capture_verify_profile = (
+                bool(profile_dir)
+                and self.rank == 0
+                and not bool(getattr(self, "_verify_torch_profile_done", False))
+            )
+            if capture_verify_profile:
+                os.makedirs(profile_dir, exist_ok=True)
+                from torch.profiler import ProfilerActivity, profile
+
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+                    hidden_states = self.model(input_ids, positions)
+                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                torch.cuda.synchronize()
+                trace_path = os.path.join(profile_dir, f"verify_forward_rank{self.rank}.json")
+                summary_path = os.path.join(profile_dir, f"verify_forward_rank{self.rank}_summary.json")
+                prof.export_chrome_trace(trace_path)
+                events = []
+                for evt in prof.key_averages():
+                    events.append(
+                        {
+                            "key": evt.key,
+                            "count": int(evt.count),
+                            "self_cpu_time_total_us": float(evt.self_cpu_time_total),
+                            "cpu_time_total_us": float(evt.cpu_time_total),
+                            "self_cuda_time_total_us": float(getattr(evt, "self_cuda_time_total", 0.0)),
+                            "cuda_time_total_us": float(getattr(evt, "cuda_time_total", 0.0)),
+                        }
+                    )
+                events_by_cuda = sorted(events, key=lambda x: x["self_cuda_time_total_us"], reverse=True)
+                events_by_cpu = sorted(events, key=lambda x: x["self_cpu_time_total_us"], reverse=True)
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "trace_path": trace_path,
+                            "verify_tokens": int(input_ids.numel()),
+                            "top_self_cuda_events": events_by_cuda[:40],
+                            "top_self_cpu_events": events_by_cpu[:40],
+                        },
+                        f,
+                        ensure_ascii=True,
+                        indent=2,
+                    )
+                self._verify_torch_profile_done = True
+            else:
+                hidden_states = self.model(input_ids, positions)
+                logits = F.linear(hidden_states, self.model.lm_head.weight)
             if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
                 prof = self.model.get_and_reset_heterogeneous_profile()
                 for key, value in prof.items():
+                    value = float(value)
                     self._profile[key] = float(self._profile.get(key, 0.0) + value)
-            logits = F.linear(hidden_states, self.model.lm_head.weight)
+                    self._profile[f"verify_{key}"] = float(self._profile.get(f"verify_{key}", 0.0) + value)
             if self.world_size > 1:
                 if self.rank == 0:
                     all_logits = [torch.empty_like(logits) for _ in range(self.world_size)]

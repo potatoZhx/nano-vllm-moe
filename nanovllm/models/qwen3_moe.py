@@ -18,6 +18,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
+from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
@@ -300,6 +301,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_execution_enabled = False
         self.cpu_expert_parallel_mode = "serial"
         self.cpu_expert_num_threads = 4
+        self.cpu_expert_backend_name = "torch"
+        self.cpu_expert_packed_min_routes = 32
+        self.cpu_backend: TorchPackedCpuMoeBackend | None = None
         self.cpu_gpu_parallel_execution_enabled = False
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.7
         self._last_profile: dict[str, float] = {}
@@ -312,6 +316,10 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
+        cpu_expert_backend: str = "torch",
+        cpu_expert_workspace_max_routes: int = 8192,
+        cpu_expert_packed_min_routes: int = 32,
+        cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: bool = False,
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ) -> None:
@@ -320,6 +328,19 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_execution_enabled = bool(cpu_expert_execution_enabled)
         self.cpu_expert_parallel_mode = cpu_expert_parallel_mode
         self.cpu_expert_num_threads = int(cpu_expert_num_threads)
+        self.cpu_expert_backend_name = cpu_expert_backend
+        self.cpu_expert_packed_min_routes = int(cpu_expert_packed_min_routes)
+        if cpu_expert_backend == "torch_packed":
+            self.cpu_backend = TorchPackedCpuMoeBackend(
+                layer_idx=self.layer_idx,
+                cpu_expert_pool=cpu_expert_pool,
+                max_routes=cpu_expert_workspace_max_routes,
+                strict_dtype=cpu_expert_strict_dtype,
+            )
+        elif cpu_expert_backend == "torch":
+            self.cpu_backend = None
+        else:
+            raise ValueError(f"Unsupported CPU expert backend: {cpu_expert_backend}")
         self.cpu_gpu_parallel_execution_enabled = bool(cpu_gpu_parallel_execution_enabled)
         self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
 
@@ -407,6 +428,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_expert_num_threads=self.cpu_expert_num_threads,
             cpu_gpu_parallel_execution_enabled=self.cpu_gpu_parallel_execution_enabled,
             cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
+            cpu_backend=self.cpu_backend,
+            cpu_backend_min_routes=self.cpu_expert_packed_min_routes,
             profile=profile,
         )
         if (
@@ -595,6 +618,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_execution_enabled: bool = False,
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
+        cpu_expert_backend: str = "torch",
+        cpu_expert_workspace_max_routes: int = 8192,
+        cpu_expert_packed_min_routes: int = 32,
+        cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: bool = False,
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
     ):
@@ -608,6 +635,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_expert_execution_enabled=cpu_expert_execution_enabled,
                     cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                     cpu_expert_num_threads=cpu_expert_num_threads,
+                    cpu_expert_backend=cpu_expert_backend,
+                    cpu_expert_workspace_max_routes=cpu_expert_workspace_max_routes,
+                    cpu_expert_packed_min_routes=cpu_expert_packed_min_routes,
+                    cpu_expert_strict_dtype=cpu_expert_strict_dtype,
                     cpu_gpu_parallel_execution_enabled=cpu_gpu_parallel_execution_enabled,
                     cpu_gpu_parallel_min_cpu_route_ratio=cpu_gpu_parallel_min_cpu_route_ratio,
                 )

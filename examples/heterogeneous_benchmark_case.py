@@ -99,6 +99,9 @@ def run_case(args: argparse.Namespace) -> dict:
         enable_speculative=(mode == "spec"),
         draft_top_c=args.draft_top_c,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
+        cpu_expert_backend=args.cpu_expert_backend,
+        cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
+        cpu_expert_packed_min_routes=args.cpu_expert_packed_min_routes,
         cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
         cpu_expert_num_threads=args.cpu_expert_num_threads,
         cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
@@ -218,6 +221,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--draft-top-c", type=int, default=2)
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
+    parser.add_argument("--cpu-expert-backend", type=str, default="torch")
+    parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=8192)
+    parser.add_argument("--cpu-expert-packed-min-routes", type=int, default=32)
     parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
     parser.add_argument("--cpu-gpu-parallel-execution-enabled", type=str2bool, default=False)

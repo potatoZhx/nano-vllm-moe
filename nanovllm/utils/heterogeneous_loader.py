@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import os
 from glob import glob
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors import safe_open
 
 from nanovllm.config import Config
 from nanovllm.expert.cache import LayerExpertCache
-from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanovllm.expert.cpu_weights import CpuExpertWeights
 from nanovllm.utils.loader import default_weight_loader
+
+if TYPE_CHECKING:
+    from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 
 
 class HeterogeneousModelLoader:
@@ -79,7 +83,10 @@ class HeterogeneousModelLoader:
                     cpu_pool.setdefault(layer_idx, {}).setdefault(expert_idx, {})
 
                     if "down_proj" in weight_name:
-                        cpu_pool[layer_idx][expert_idx]["down"] = self._to_cpu(weight)
+                        cpu_pool[layer_idx][expert_idx]["down"] = self._to_cpu(
+                            weight,
+                            dtype=self._target_expert_dtype(),
+                        )
                     elif "gate_proj" in weight_name:
                         pending_gate[key] = weight
                     elif "up_proj" in weight_name:
@@ -89,7 +96,17 @@ class HeterogeneousModelLoader:
             up = pending_up[key]
             gate_up = torch.cat([gate, up], dim=0)
             layer_idx, expert_idx = key
-            cpu_pool[layer_idx][expert_idx]["gate_up"] = self._to_cpu(gate_up)
+            gate_up_cpu = self._to_cpu(gate_up, dtype=self._target_expert_dtype())
+            down_cpu = cpu_pool[layer_idx][expert_idx]["down"]
+            packed = CpuExpertWeights(
+                expert_idx=expert_idx,
+                gate_up=gate_up_cpu,
+                down=down_cpu,
+                dtype=self._target_expert_dtype(),
+            )
+            packed.validate()
+            cpu_pool[layer_idx][expert_idx]["gate_up"] = gate_up_cpu
+            cpu_pool[layer_idx][expert_idx]["packed"] = packed
 
         return cpu_pool
 
@@ -128,9 +145,15 @@ class HeterogeneousModelLoader:
                 params = cpu_pool[layer_idx][expert_idx]
                 cache.put_to_slot(slot_idx, expert_idx, params["gate_up"], params["down"])
 
-    def _to_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.to("cpu")
+    def _to_cpu(self, x: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+        if dtype is None:
+            dtype = self._target_expert_dtype()
+        x = x.to(device="cpu", dtype=dtype).contiguous()
         return x.pin_memory() if self.pin_memory else x
+
+    def _target_expert_dtype(self) -> torch.dtype:
+        dtype = getattr(self.hf_config, "torch_dtype", None)
+        return dtype if isinstance(dtype, torch.dtype) else torch.get_default_dtype()
 
     @staticmethod
     def _parse_layer_idx(weight_name: str) -> int:
