@@ -12,7 +12,7 @@ from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.cpu_weights import CpuExpertWeights
 from nanovllm.expert.placement import build_prefill_plan_gpu
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend
+from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 
 
@@ -90,6 +90,7 @@ def _run_backend(
     iterations: int,
     warmup: int,
     packed_min_routes: int,
+    intermediate_size: int = 0,
 ):
     cpu_backend = None
     if backend_name == "torch_packed":
@@ -97,6 +98,14 @@ def _run_backend(
             layer_idx=0,
             cpu_expert_pool=cpu_pool,
             max_routes=selected_experts.numel(),
+            strict_dtype=True,
+        )
+    elif backend_name == "fused":
+        cpu_backend = FusedTorchCpuMoeBackend(
+            layer_idx=0,
+            cpu_expert_pool=cpu_pool,
+            max_routes=selected_experts.numel(),
+            moe_intermediate_size=intermediate_size,
             strict_dtype=True,
         )
     elif backend_name != "torch":
@@ -145,7 +154,7 @@ def _run_backend(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", action="append", choices=["torch", "torch_packed"], default=None)
+    parser.add_argument("--backend", action="append", choices=["torch", "torch_packed", "fused"], default=None)
     parser.add_argument("--tokens", default="1,8,32,128")
     parser.add_argument("--cpu-route-ratio", default="0.25,0.5,0.75")
     parser.add_argument("--top-k", type=int, default=2)
@@ -189,6 +198,7 @@ def main() -> None:
                     iterations=args.iterations,
                     warmup=args.warmup,
                     packed_min_routes=args.packed_min_routes,
+                    intermediate_size=args.intermediate_size,
                 )
                 if ref_out is None:
                     ref_out = out.detach()

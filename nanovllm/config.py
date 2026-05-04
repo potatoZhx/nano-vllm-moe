@@ -109,7 +109,7 @@ class Config:
         assert 0.0 <= self.prefetch_history_decay <= 1.0
         assert self.prefetch_history_ttl_steps >= 1
         assert self.prefetch_runtime_mode == "baseline_staging"
-        assert self.cpu_expert_backend in {"torch", "torch_packed"}
+        assert self.cpu_expert_backend in {"torch", "torch_packed", "fused"}
         assert self.cpu_expert_workspace_max_routes >= 1
         assert self.cpu_expert_packed_min_routes >= 1
         assert self.cpu_expert_num_threads >= 1

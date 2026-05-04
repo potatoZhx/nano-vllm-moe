@@ -18,7 +18,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
-from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend
+from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
@@ -284,12 +284,14 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         hidden_size: int,
         num_experts_per_tok: int,
         norm_topk_prob: bool,
+        moe_intermediate_size: int = 0,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.num_selected = num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
+        self.moe_intermediate_size = moe_intermediate_size
 
         self.gate = RowParallelLinear(hidden_size, num_experts, bias=False)
         self.act_fn = SiluAndMul()
@@ -336,6 +338,14 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 layer_idx=self.layer_idx,
                 cpu_expert_pool=cpu_expert_pool,
                 max_routes=cpu_expert_workspace_max_routes,
+                strict_dtype=cpu_expert_strict_dtype,
+            )
+        elif cpu_expert_backend == "fused":
+            self.cpu_backend = FusedTorchCpuMoeBackend(
+                layer_idx=self.layer_idx,
+                cpu_expert_pool=cpu_expert_pool,
+                max_routes=cpu_expert_workspace_max_routes,
+                moe_intermediate_size=self.moe_intermediate_size,
                 strict_dtype=cpu_expert_strict_dtype,
             )
         elif cpu_expert_backend == "torch":
@@ -524,6 +534,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                     hidden_size=config.hidden_size,
                     num_experts_per_tok=config.num_experts_per_tok,
                     norm_topk_prob=config.norm_topk_prob,
+                    moe_intermediate_size=getattr(config, "moe_intermediate_size", 0),
                 )
             else:
                 self.mlp = Qwen3MoeBlock(
