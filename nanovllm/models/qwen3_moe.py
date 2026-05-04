@@ -304,8 +304,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_backend_name = "torch"
         self.cpu_expert_packed_min_routes = 32
         self.cpu_backend: TorchPackedCpuMoeBackend | None = None
-        self.cpu_gpu_parallel_execution_enabled = False
-        self.cpu_gpu_parallel_min_cpu_route_ratio = 0.7
+        self.cpu_gpu_parallel_execution_enabled = "auto"
+        self.cpu_gpu_parallel_min_cpu_route_ratio = 0.0
+        self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
 
@@ -320,8 +321,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_workspace_max_routes: int = 8192,
         cpu_expert_packed_min_routes: int = 32,
         cpu_expert_strict_dtype: bool = True,
-        cpu_gpu_parallel_execution_enabled: bool = False,
-        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
+        cpu_gpu_parallel_execution_enabled: str = "auto",
+        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
@@ -341,8 +342,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             self.cpu_backend = None
         else:
             raise ValueError(f"Unsupported CPU expert backend: {cpu_expert_backend}")
-        self.cpu_gpu_parallel_execution_enabled = bool(cpu_gpu_parallel_execution_enabled)
+        self.cpu_gpu_parallel_execution_enabled = str(cpu_gpu_parallel_execution_enabled)
         self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
+        self._parallel_stream = None
 
     def set_speculative_execution(
         self,
@@ -359,6 +361,13 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         recorder: ModelRuntimeMetaRecorder | None,
     ) -> None:
         self.runtime_meta_recorder = recorder
+
+    def _get_parallel_stream(self) -> torch.cuda.Stream | None:
+        if self.cpu_gpu_parallel_execution_enabled == "off":
+            return None
+        if self._parallel_stream is None and torch.cuda.is_available():
+            self._parallel_stream = torch.cuda.Stream()
+        return self._parallel_stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.expert_cache is None:
@@ -428,6 +437,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_expert_num_threads=self.cpu_expert_num_threads,
             cpu_gpu_parallel_execution_enabled=self.cpu_gpu_parallel_execution_enabled,
             cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
+            cpu_gpu_parallel_stream=self._get_parallel_stream(),
             cpu_backend=self.cpu_backend,
             cpu_backend_min_routes=self.cpu_expert_packed_min_routes,
             profile=profile,
@@ -622,8 +632,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_workspace_max_routes: int = 8192,
         cpu_expert_packed_min_routes: int = 32,
         cpu_expert_strict_dtype: bool = True,
-        cpu_gpu_parallel_execution_enabled: bool = False,
-        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
+        cpu_gpu_parallel_execution_enabled: str = "auto",
+        cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
     ):
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):

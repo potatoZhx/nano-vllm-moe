@@ -16,11 +16,13 @@ class MoEExecutionPlan:
     cpu_route_indices: torch.Tensor | None
     cpu_task_expert_ids: torch.Tensor | None
     cpu_task_offsets: torch.Tensor | None
-    flat_selected_original: torch.Tensor
-    flat_selected_effective: torch.Tensor
-    substitution_lut: torch.Tensor | None
-    gpu_route_mask: torch.Tensor | None
-    cpu_route_mask: torch.Tensor | None
+    cpu_task_expert_ids_host: list[int] | None = None
+    cpu_task_offsets_host: list[int] | None = None
+    flat_selected_original: torch.Tensor | None = None
+    flat_selected_effective: torch.Tensor | None = None
+    substitution_lut: torch.Tensor | None = None
+    gpu_route_mask: torch.Tensor | None = None
+    cpu_route_mask: torch.Tensor | None = None
 
     @property
     def m_sizes(self) -> torch.Tensor | None:
@@ -87,9 +89,9 @@ def _build_topc0_substitution_lut(
 def _build_cpu_task_layout(
     flat_selected_original: torch.Tensor,
     cpu_route_indices: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, list[int] | None, list[int] | None]:
     if cpu_route_indices.numel() == 0:
-        return None, None, None
+        return None, None, None, None, None
 
     cpu_experts = flat_selected_original.index_select(0, cpu_route_indices)
     route_order = torch.argsort(cpu_route_indices, stable=True)
@@ -105,7 +107,11 @@ def _build_cpu_task_layout(
         device=cpu_route_indices.device,
     )
     task_offsets[1:] = torch.cumsum(counts.to(torch.int64), dim=0)
-    return sorted_route_indices, task_expert_ids.to(torch.int64), task_offsets
+    ids_cpu = task_expert_ids.to(torch.int64)
+    # Pre-extract host metadata to avoid GPU->CPU transfer in hot path.
+    ids_host = [int(x) for x in ids_cpu.detach().to("cpu", non_blocking=False).tolist()]
+    offsets_host = [int(x) for x in task_offsets.detach().to("cpu", non_blocking=False).tolist()]
+    return sorted_route_indices, ids_cpu, task_offsets, ids_host, offsets_host
 
 
 def _flatten_experts(selected_experts: torch.Tensor) -> torch.Tensor:
@@ -170,7 +176,7 @@ def build_prefill_plan_gpu(
 
     cpu_route_mask = ~gpu_route_mask
     cpu_route_indices_raw = torch.nonzero(cpu_route_mask, as_tuple=False).flatten()
-    cpu_route_indices, cpu_task_expert_ids, cpu_task_offsets = _build_cpu_task_layout(
+    cpu_route_indices, cpu_task_expert_ids, cpu_task_offsets, ids_host, offsets_host = _build_cpu_task_layout(
         flat_selected,
         cpu_route_indices_raw,
     )
@@ -182,6 +188,8 @@ def build_prefill_plan_gpu(
         cpu_route_indices=cpu_route_indices,
         cpu_task_expert_ids=cpu_task_expert_ids,
         cpu_task_offsets=cpu_task_offsets,
+        cpu_task_expert_ids_host=ids_host,
+        cpu_task_offsets_host=offsets_host,
         flat_selected_original=flat_selected,
         flat_selected_effective=flat_selected,
         substitution_lut=None,
@@ -251,6 +259,8 @@ def build_draft_plan_gpu(
             cpu_route_indices=None,
             cpu_task_expert_ids=None,
             cpu_task_offsets=None,
+            cpu_task_expert_ids_host=None,
+            cpu_task_offsets_host=None,
             flat_selected_original=flat_selected,
             flat_selected_effective=flat_effective,
             substitution_lut=substitution_lut,
@@ -295,7 +305,7 @@ def build_draft_plan_gpu(
         m_sizes = None
 
     cpu_route_indices_raw = torch.nonzero(cpu_route_mask, as_tuple=False).flatten()
-    cpu_route_indices, cpu_task_expert_ids, cpu_task_offsets = _build_cpu_task_layout(
+    cpu_route_indices, cpu_task_expert_ids, cpu_task_offsets, ids_host, offsets_host = _build_cpu_task_layout(
         flat_selected,
         cpu_route_indices_raw,
     )
@@ -307,6 +317,8 @@ def build_draft_plan_gpu(
         cpu_route_indices=cpu_route_indices,
         cpu_task_expert_ids=cpu_task_expert_ids,
         cpu_task_offsets=cpu_task_offsets,
+        cpu_task_expert_ids_host=ids_host,
+        cpu_task_offsets_host=offsets_host,
         flat_selected_original=flat_selected,
         flat_selected_effective=flat_effective,
         substitution_lut=substitution_lut,

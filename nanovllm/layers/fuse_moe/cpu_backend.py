@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
@@ -17,6 +18,47 @@ class CpuMoeResult:
     outputs_cpu: torch.Tensor
     prep_ms: float
     compute_ms: float
+
+
+def _resolve_dynamic_parallel_mode(
+    *,
+    requested_mode: str,
+    num_tasks: int,
+    num_threads: int,
+    num_routes: int,
+) -> tuple[str, int, bool]:
+    """Select effective parallel mode and OMP thread count.
+
+    When average routes per expert is <= 2, expert-parallel with
+    single-threaded MKL can be faster than serial with full MKL
+    because small-M matmuls don't saturate multi-core BLAS.
+    """
+    if num_tasks <= 1 or num_threads <= 1:
+        return "serial", num_threads, False
+
+    avg_routes = num_routes / num_tasks if num_tasks > 0 else 0.0
+    if requested_mode == "expert_parallel":
+        if avg_routes <= 2.0:
+            return "expert_parallel", num_threads, True
+        return "serial", num_threads, False
+
+    # requested_mode == "auto": pick based on workload shape
+    if avg_routes <= 1.5:
+        return "expert_parallel", max(2, num_threads), True
+    return "serial", num_threads, False
+
+
+def _get_omp_num_threads() -> int:
+    n = os.cpu_count()
+    default = n if n is not None else 1
+    return int(os.environ.get("OMP_NUM_THREADS", default))
+
+
+def _set_omp_context(target: int) -> str:
+    """Temporarily set OMP_NUM_THREADS for the current thread."""
+    prev = os.environ.get("OMP_NUM_THREADS", str(os.cpu_count() or 1))
+    os.environ["OMP_NUM_THREADS"] = str(target)
+    return prev
 
 
 def get_cpu_expert_weights(
@@ -71,6 +113,16 @@ class TorchPackedCpuMoeBackend:
         self.max_routes = int(max_routes)
         self.strict_dtype = bool(strict_dtype)
         self.workspace: CpuMoeWorkspace | None = None
+        self._thread_pool: ThreadPoolExecutor | None = None
+        self._num_workers = 0
+
+    def _ensure_thread_pool(self, num_workers: int) -> ThreadPoolExecutor:
+        if self._thread_pool is None or self._num_workers != num_workers:
+            if self._thread_pool is not None:
+                self._thread_pool.shutdown(wait=False)
+            self._thread_pool = ThreadPoolExecutor(max_workers=num_workers)
+            self._num_workers = num_workers
+        return self._thread_pool
 
     def _get_workspace(self, hidden_states: torch.Tensor) -> CpuMoeWorkspace:
         hidden_size = int(hidden_states.shape[-1])
@@ -108,6 +160,8 @@ class TorchPackedCpuMoeBackend:
         act_fn: Callable[[torch.Tensor], torch.Tensor],
         parallel_mode: str = "serial",
         num_threads: int = 4,
+        cpu_task_expert_ids_host: list[int] | None = None,
+        cpu_task_offsets_host: list[int] | None = None,
     ) -> CpuMoeResult:
         prep_t0 = perf_counter()
         compute_dtype = hidden_states.dtype
@@ -135,9 +189,21 @@ class TorchPackedCpuMoeBackend:
             hidden_cpu.copy_(hidden_states.index_select(0, route_token_indices))
             weights_cpu.copy_(flat_weights.index_select(0, route_indices))
 
-        task_offsets_host = [int(x) for x in cpu_task_offsets.detach().to("cpu", non_blocking=False).tolist()]
-        task_expert_ids_host = [int(x) for x in cpu_task_expert_ids.detach().to("cpu", non_blocking=False).tolist()]
+        if cpu_task_expert_ids_host is not None and cpu_task_offsets_host is not None:
+            task_expert_ids_host = cpu_task_expert_ids_host
+            task_offsets_host = cpu_task_offsets_host
+        else:
+            task_offsets_host = [int(x) for x in cpu_task_offsets.detach().to("cpu", non_blocking=False).tolist()]
+            task_expert_ids_host = [int(x) for x in cpu_task_expert_ids.detach().to("cpu", non_blocking=False).tolist()]
         prep_ms = (perf_counter() - prep_t0) * 1000.0
+
+        num_tasks = len(task_expert_ids_host)
+        eff_mode, eff_threads, set_omp1 = _resolve_dynamic_parallel_mode(
+            requested_mode=parallel_mode,
+            num_tasks=num_tasks,
+            num_threads=num_threads,
+            num_routes=num_routes,
+        )
 
         def run_task(task_idx: int) -> None:
             start = task_offsets_host[task_idx]
@@ -158,11 +224,17 @@ class TorchPackedCpuMoeBackend:
             outputs_cpu[start:end].copy_(out)
 
         compute_t0 = perf_counter()
-        num_tasks = len(task_expert_ids_host)
-        can_parallel = parallel_mode == "expert_parallel" and num_threads > 1 and num_tasks > 1
+        can_parallel = eff_mode == "expert_parallel" and eff_threads > 1 and num_tasks > 1
         if can_parallel:
-            with ThreadPoolExecutor(max_workers=min(num_threads, num_tasks)) as pool:
+            if set_omp1:
+                prev_omp = _get_omp_num_threads()
+                _set_omp_context(1)
+            try:
+                pool = self._ensure_thread_pool(min(eff_threads, num_tasks))
                 list(pool.map(run_task, range(num_tasks)))
+            finally:
+                if set_omp1:
+                    _set_omp_context(prev_omp)
         else:
             for task_idx in range(num_tasks):
                 run_task(task_idx)

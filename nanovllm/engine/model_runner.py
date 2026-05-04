@@ -89,8 +89,8 @@ class ModelRunner:
                 cpu_expert_workspace_max_routes=getattr(config, "cpu_expert_workspace_max_routes", 8192),
                 cpu_expert_packed_min_routes=getattr(config, "cpu_expert_packed_min_routes", 32),
                 cpu_expert_strict_dtype=getattr(config, "cpu_expert_strict_dtype", True),
-                cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", False),
-                cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.7),
+                cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", "auto"),
+                cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.0),
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
             self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"

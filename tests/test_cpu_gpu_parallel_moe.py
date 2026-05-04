@@ -69,7 +69,7 @@ class TestCpuGpuParallelMoe(unittest.TestCase):
             cpu_expert_execution_enabled=True,
             cpu_expert_parallel_mode="serial",
             cpu_expert_num_threads=1,
-            cpu_gpu_parallel_execution_enabled=False,
+            cpu_gpu_parallel_execution_enabled="off",
             profile=None,
         )
 
@@ -85,7 +85,7 @@ class TestCpuGpuParallelMoe(unittest.TestCase):
             cpu_expert_execution_enabled=True,
             cpu_expert_parallel_mode="serial",
             cpu_expert_num_threads=1,
-            cpu_gpu_parallel_execution_enabled=True,
+            cpu_gpu_parallel_execution_enabled="on",
             cpu_gpu_parallel_min_cpu_route_ratio=0.0,
             profile=profile_overlap,
         )
@@ -101,7 +101,7 @@ class TestCpuGpuParallelMoe(unittest.TestCase):
             cpu_expert_execution_enabled=True,
             cpu_expert_parallel_mode="expert_parallel",
             cpu_expert_num_threads=2,
-            cpu_gpu_parallel_execution_enabled=True,
+            cpu_gpu_parallel_execution_enabled="on",
             cpu_gpu_parallel_min_cpu_route_ratio=0.0,
             profile=None,
         )
@@ -118,7 +118,7 @@ class TestCpuGpuParallelMoe(unittest.TestCase):
             cpu_expert_execution_enabled=True,
             cpu_expert_parallel_mode="serial",
             cpu_expert_num_threads=1,
-            cpu_gpu_parallel_execution_enabled=True,
+            cpu_gpu_parallel_execution_enabled="on",
             cpu_gpu_parallel_min_cpu_route_ratio=1.0,
             profile=profile_gated,
         )

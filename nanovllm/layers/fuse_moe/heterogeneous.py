@@ -24,8 +24,9 @@ def heterogeneous_moe_forward(
     cpu_expert_execution_enabled: bool = False,
     cpu_expert_parallel_mode: str = "serial",
     cpu_expert_num_threads: int = 4,
-    cpu_gpu_parallel_execution_enabled: bool = False,
-    cpu_gpu_parallel_min_cpu_route_ratio: float = 0.7,
+    cpu_gpu_parallel_execution_enabled: str = "auto",
+    cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
+    cpu_gpu_parallel_stream: torch.cuda.Stream | None = None,
     cpu_backend: TorchPackedCpuMoeBackend | None = None,
     cpu_backend_min_routes: int = 32,
     profile: dict | None = None,
@@ -65,18 +66,31 @@ def heterogeneous_moe_forward(
     if has_cpu_work and cpu_expert_pool is None and active_cpu_backend is None:
         raise RuntimeError("Missing cpu_expert_pool for uncached expert fallback.")
 
-    can_overlap_cpu_gpu = (
-        has_gpu_work
-        and has_cpu_work
-        and hidden_states.is_cuda
-        and cpu_expert_execution_enabled
-        and cpu_gpu_parallel_execution_enabled
-        and cpu_route_ratio >= float(cpu_gpu_parallel_min_cpu_route_ratio)
-    )
+    parallel_mode = cpu_gpu_parallel_execution_enabled
+    if parallel_mode == "auto":
+        can_overlap_cpu_gpu = (
+            has_gpu_work
+            and has_cpu_work
+            and hidden_states.is_cuda
+            and cpu_expert_execution_enabled
+        )
+    elif parallel_mode == "on":
+        can_overlap_cpu_gpu = (
+            has_gpu_work
+            and has_cpu_work
+            and hidden_states.is_cuda
+            and cpu_expert_execution_enabled
+            and cpu_route_ratio >= float(cpu_gpu_parallel_min_cpu_route_ratio)
+        )
+    else:
+        can_overlap_cpu_gpu = False
 
     if can_overlap_cpu_gpu:
         t_parallel0 = perf_counter()
-        gpu_stream = torch.cuda.Stream(device=hidden_states.device)
+        if cpu_gpu_parallel_stream is not None:
+            gpu_stream = cpu_gpu_parallel_stream
+        else:
+            gpu_stream = torch.cuda.Stream(device=hidden_states.device)
         current_stream = torch.cuda.current_stream(device=hidden_states.device)
         gpu_stream.wait_stream(current_stream)
         with torch.cuda.stream(gpu_stream):
@@ -101,6 +115,8 @@ def heterogeneous_moe_forward(
                 act_fn=act_fn,
                 parallel_mode=cpu_expert_parallel_mode,
                 num_threads=cpu_expert_num_threads,
+                cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
+                cpu_task_offsets_host=plan.cpu_task_offsets_host,
             )
             cpu_token_indices = cpu_result.token_indices
             cpu_outputs = cpu_result.outputs_cpu
@@ -206,6 +222,8 @@ def heterogeneous_moe_forward(
                 act_fn=act_fn,
                 cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                 cpu_expert_num_threads=cpu_expert_num_threads,
+                cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
+                cpu_task_offsets_host=plan.cpu_task_offsets_host,
             )
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
@@ -463,6 +481,8 @@ def _run_packed_cpu_expert_execution(
     act_fn: SiluAndMul,
     cpu_expert_parallel_mode: str = "serial",
     cpu_expert_num_threads: int = 4,
+    cpu_task_expert_ids_host: list[int] | None = None,
+    cpu_task_offsets_host: list[int] | None = None,
 ) -> tuple[float, float, float]:
     result = cpu_backend.forward(
         hidden_states=hidden_states,
@@ -474,6 +494,8 @@ def _run_packed_cpu_expert_execution(
         act_fn=act_fn,
         parallel_mode=cpu_expert_parallel_mode,
         num_threads=cpu_expert_num_threads,
+        cpu_task_expert_ids_host=cpu_task_expert_ids_host,
+        cpu_task_offsets_host=cpu_task_offsets_host,
     )
     merge_ms = _merge_packed_cpu_outputs(
         output=output,
