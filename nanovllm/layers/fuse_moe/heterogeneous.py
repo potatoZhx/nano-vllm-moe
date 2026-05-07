@@ -118,12 +118,11 @@ def heterogeneous_moe_forward(
                 cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
                 cpu_task_offsets_host=plan.cpu_task_offsets_host,
             )
-            cpu_token_indices = cpu_result.token_indices
             cpu_outputs = cpu_result.outputs_cpu
             prep_ms = cpu_result.prep_ms
             compute_ms = cpu_result.compute_ms
         else:
-            cpu_token_indices, cpu_outputs, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
+            cpu_token_indices_chunks, cpu_outputs_chunks, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
                 hidden_states=hidden_states,
                 flat_weights=flat_weights,
                 top_k=top_k,
@@ -136,39 +135,32 @@ def heterogeneous_moe_forward(
                 cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                 cpu_expert_num_threads=cpu_expert_num_threads,
             )
+            non_empty: list[torch.Tensor] = [o for o in cpu_outputs_chunks if o.numel() > 0]
+            cpu_outputs = torch.cat(non_empty, dim=0) if non_empty else torch.empty(0, hidden_states.shape[-1], dtype=hidden_states.dtype)
 
         torch.cuda.current_stream(device=hidden_states.device).wait_stream(gpu_stream)
 
+        # Unified deterministic accumulation (same order as standard mode)
         t_scatter0 = perf_counter()
-        output.index_add_(0, gpu_token_indices, gpu_expert_out)
-        scatter_ms = (perf_counter() - t_scatter0) * 1000.0
-
-        if active_cpu_backend is not None:
-            merge_ms = _merge_packed_cpu_outputs(
-                output=output,
-                token_indices=cpu_token_indices,
-                outputs_cpu=cpu_outputs,
-                output_dtype=hidden_states.dtype,
-                output_device=hidden_states.device,
-            )
-        else:
-            merge_ms = _merge_real_cpu_outputs(
-                output=output,
-                token_indices=cpu_token_indices,
-                cpu_outputs=cpu_outputs,
-                output_dtype=hidden_states.dtype,
-                output_device=hidden_states.device,
-            )
+        _accumulate_mixed_routes_deterministic(
+            output=output,
+            top_k=top_k,
+            gpu_route_indices=plan.gpu_route_indices,
+            gpu_expert_out=gpu_expert_out,
+            cpu_route_indices=cpu_indices,
+            cpu_outputs=cpu_outputs,
+        )
+        merge_ms = (perf_counter() - t_scatter0) * 1000.0
 
         gpu_core_ms = gpu_gather_ms + gpu_compute_ms
         cpu_core_ms = prep_ms + compute_ms
         overlap_est_ms = min(gpu_core_ms, cpu_core_ms)
-        critical_path_est_ms = max(gpu_core_ms, cpu_core_ms) + scatter_ms + merge_ms
+        critical_path_est_ms = max(gpu_core_ms, cpu_core_ms) + merge_ms
         parallel_wall_ms = (perf_counter() - t_parallel0) * 1000.0
 
         _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
         _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
-        _prof_add(profile, "scatter_ms", scatter_ms / 1000.0)
+        _prof_add(profile, "scatter_ms", merge_ms / 1000.0)
         _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
         _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
         _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
@@ -182,8 +174,10 @@ def heterogeneous_moe_forward(
         return output
 
     # GPU path: cached experts are remapped to contiguous slot buffers.
+    gpu_route_indices_save: torch.Tensor | None = None
+    gpu_expert_out_save: torch.Tensor | None = None
     if has_gpu_work:
-        gpu_token_indices, gpu_expert_out, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
+        gpu_token_indices, gpu_expert_out_save, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
             hidden_states=hidden_states,
             flat_weights=flat_weights,
             top_k=top_k,
@@ -192,46 +186,47 @@ def heterogeneous_moe_forward(
             expert_cache=expert_cache,
             act_fn=act_fn,
         )
+        gpu_route_indices_save = plan.gpu_route_indices
         _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
         _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
 
-        t_scatter0 = perf_counter()
         if not has_cpu_work:
+            t_scatter0 = perf_counter()
             _accumulate_gpu_routes_deterministic(
                 output=output,
-                gpu_route_indices=plan.gpu_route_indices,
-                gpu_expert_out=gpu_expert_out,
+                gpu_route_indices=gpu_route_indices_save,
+                gpu_expert_out=gpu_expert_out_save,
                 top_k=top_k,
             )
-        else:
-            output.index_add_(0, gpu_token_indices, gpu_expert_out)
-        _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
+            _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
 
     # CPU path for uncached experts.
+    cpu_route_indices_save: torch.Tensor | None = None
+    cpu_outputs_save: torch.Tensor | None = None
     if has_cpu_work:
         if cpu_expert_execution_enabled and active_cpu_backend is not None:
-            prep_ms, compute_ms, merge_ms = _run_packed_cpu_expert_execution(
+            cpu_result = active_cpu_backend.forward(
                 hidden_states=hidden_states,
-                output=output,
                 flat_weights=flat_weights,
                 top_k=top_k,
                 cpu_indices=cpu_indices,
                 cpu_task_expert_ids=plan.cpu_task_expert_ids,
                 cpu_task_offsets=plan.cpu_task_offsets,
-                cpu_backend=active_cpu_backend,
                 act_fn=act_fn,
-                cpu_expert_parallel_mode=cpu_expert_parallel_mode,
-                cpu_expert_num_threads=cpu_expert_num_threads,
+                parallel_mode=cpu_expert_parallel_mode,
+                num_threads=cpu_expert_num_threads,
                 cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
                 cpu_task_offsets_host=plan.cpu_task_offsets_host,
             )
+            cpu_route_indices_save = cpu_indices
+            cpu_outputs_save = cpu_result.outputs_cpu
+            prep_ms = cpu_result.prep_ms
+            compute_ms = cpu_result.compute_ms
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
-            _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
         elif cpu_expert_execution_enabled:
-            prep_ms, compute_ms, merge_ms = _run_real_cpu_expert_execution(
+            token_indices_chunks, cpu_outputs_chunks, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
                 hidden_states=hidden_states,
-                output=output,
                 flat_weights=flat_weights,
                 top_k=top_k,
                 cpu_indices=cpu_indices,
@@ -243,13 +238,16 @@ def heterogeneous_moe_forward(
                 cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                 cpu_expert_num_threads=cpu_expert_num_threads,
             )
+            cpu_route_indices_save = cpu_indices
+            # Flatten per-expert output chunks into a single tensor
+            non_empty: list[torch.Tensor] = [o for o in cpu_outputs_chunks if o.numel() > 0]
+            cpu_outputs_save = torch.cat(non_empty, dim=0) if non_empty else torch.empty(0, hidden_states.shape[-1], dtype=hidden_states.dtype)
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
-            _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
         else:
-            _run_legacy_gpu_fallback(
+            cpu_route_indices_save = cpu_indices
+            cpu_outputs_save, prep_ms, compute_ms = _compute_gpu_fallback_outputs(
                 hidden_states=hidden_states,
-                output=output,
                 flat_weights=flat_weights,
                 top_k=top_k,
                 cpu_indices=cpu_indices,
@@ -257,6 +255,21 @@ def heterogeneous_moe_forward(
                 cpu_expert_pool=cpu_expert_pool,
                 act_fn=act_fn,
             )
+            _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
+            _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
+
+        # Unified deterministic accumulation
+        t_scatter0 = perf_counter()
+        _accumulate_mixed_routes_deterministic(
+            output=output,
+            top_k=top_k,
+            gpu_route_indices=gpu_route_indices_save if gpu_route_indices_save is not None else torch.empty(0, dtype=torch.int64, device=hidden_states.device),
+            gpu_expert_out=gpu_expert_out_save if gpu_expert_out_save is not None else torch.empty(0, hidden_states.shape[-1], dtype=hidden_states.dtype, device=hidden_states.device),
+            cpu_route_indices=cpu_route_indices_save,
+            cpu_outputs=cpu_outputs_save,
+        )
+        merge_ms = (perf_counter() - t_scatter0) * 1000.0
+        _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
 
     return output
 
@@ -273,8 +286,85 @@ def _accumulate_gpu_routes_deterministic(
 
     num_tokens, hidden_dim = output.shape
     num_routes = num_tokens * top_k
-    route_buffer = torch.zeros((num_routes, hidden_dim), dtype=gpu_expert_out.dtype, device=output.device)
+    route_buffer = _get_route_buffer_cache().get(num_routes, hidden_dim, gpu_expert_out.dtype, output.device)
     route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
+    token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+    output.add_(token_output.to(dtype=output.dtype))
+
+
+class _RouteBufferCache:
+    """Pre-allocated route buffer reused across calls to avoid per-layer allocation."""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self) -> None:
+        self._buffer: torch.Tensor | None = None
+
+    def get(
+        self,
+        num_routes: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        b = self._buffer
+        if (
+            b is None
+            or b.numel() < num_routes * hidden_dim
+            or b.dtype != dtype
+            or b.device != device
+        ):
+            self._buffer = torch.zeros((num_routes, hidden_dim), dtype=dtype, device=device)
+            return self._buffer
+        # Reuse: zero only the rows that will be read by view().sum().
+        # index_copy_ overwrites filled positions; unfilled positions must be zero.
+        b[:num_routes].zero_()
+        return b[:num_routes]
+
+
+_route_buffer_cache: _RouteBufferCache | None = None
+
+
+def _get_route_buffer_cache() -> _RouteBufferCache:
+    global _route_buffer_cache
+    if _route_buffer_cache is None:
+        _route_buffer_cache = _RouteBufferCache()
+    return _route_buffer_cache
+
+
+def _accumulate_mixed_routes_deterministic(
+    output: torch.Tensor,
+    top_k: int,
+    gpu_route_indices: torch.Tensor,
+    gpu_expert_out: torch.Tensor,
+    cpu_route_indices: torch.Tensor,
+    cpu_outputs: torch.Tensor,
+) -> None:
+    """Accumulate GPU+CPU route outputs using view+sum to match standard mode.
+
+    Standard mode (Qwen3MoeFusedSparseMoeBlock) uses:
+        expert_output.view(M, top_k, hidden_dim).sum(dim=1)
+
+    This function uses a reusable route buffer to restore token-major order
+    regardless of whether outputs come from GPU (sorted by slot) or CPU
+    (sorted by expert), ensuring identical BF16 accumulation to standard mode.
+    """
+    num_tokens, hidden_dim = output.shape
+    device = output.device
+    dtype = output.dtype
+
+    has_gpu = gpu_route_indices.numel() > 0
+    has_cpu = cpu_route_indices is not None and cpu_route_indices.numel() > 0
+
+    if not has_gpu and not has_cpu:
+        return
+
+    num_routes = num_tokens * top_k
+    route_buffer = _get_route_buffer_cache().get(num_routes, hidden_dim, dtype, device)
+    if has_gpu:
+        route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out.to(dtype=dtype))
+    if has_cpu:
+        route_buffer.index_copy_(0, cpu_route_indices.to(torch.int64), cpu_outputs.to(dtype=dtype, device=device))
     token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
     output.add_(token_output.to(dtype=output.dtype))
 
@@ -532,6 +622,39 @@ def _run_legacy_gpu_fallback(
         out = F.linear(act_fn(gate_up), down_weight)
         out = out * cpu_weights[expert_mask].unsqueeze(-1)
         output.index_add_(0, cpu_token_indices[expert_mask], out)
+
+
+def _compute_gpu_fallback_outputs(
+    hidden_states: torch.Tensor,
+    flat_weights: torch.Tensor,
+    top_k: int,
+    cpu_indices: torch.Tensor,
+    flat_selected_original: torch.Tensor,
+    cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
+    act_fn: SiluAndMul,
+) -> tuple[torch.Tensor, float, float]:
+    """Compute GPU fallback outputs for uncached experts without accumulating."""
+    prep_t0 = perf_counter()
+    cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
+    cpu_hidden = hidden_states[cpu_token_indices]
+    cpu_experts = flat_selected_original.index_select(0, cpu_indices)
+    cpu_weights = flat_weights.index_select(0, cpu_indices)
+    prep_ms = (perf_counter() - prep_t0) * 1000.0
+
+    result = torch.zeros(cpu_indices.numel(), hidden_states.shape[-1], dtype=hidden_states.dtype, device=hidden_states.device)
+    compute_t0 = perf_counter()
+    for expert_idx in cpu_experts.unique().tolist():
+        expert_mask = cpu_experts == expert_idx
+        h = cpu_hidden[expert_mask]
+        params = cpu_expert_pool[expert_idx]
+        gate_up_weight = params["gate_up"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
+        down_weight = params["down"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
+        gate_up = F.linear(h, gate_up_weight)
+        out = F.linear(act_fn(gate_up), down_weight)
+        out = out * cpu_weights[expert_mask].unsqueeze(-1)
+        result[expert_mask] = out
+    compute_ms = (perf_counter() - compute_t0) * 1000.0
+    return result, prep_ms, compute_ms
 
 
 def _prof_add(profile: dict | None, key: str, dt_sec: float) -> None:
