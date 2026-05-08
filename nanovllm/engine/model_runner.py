@@ -23,6 +23,34 @@ from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
+from nanovllm.layers.fuse_moe.heterogeneous import GpuFallbackWorkspace
+
+
+def _create_gpu_fallback_workspace(
+    cpu_expert_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
+    hf_config,
+) -> GpuFallbackWorkspace | None:
+    """Create a single shared GPU fallback workspace sized for all experts."""
+    if not cpu_expert_pool:
+        return None
+    first_layer_pool = next(iter(cpu_expert_pool.values()))
+    if not first_layer_pool:
+        return None
+    sample = next(iter(first_layer_pool.values()))
+    gate_up_shape = tuple(sample["gate_up"].shape)
+    down_shape = tuple(sample["down"].shape)
+    num_experts = getattr(hf_config, "num_experts", 0)
+    if num_experts <= 0 and hasattr(hf_config, "num_experts_per_tok"):
+        num_experts = len(first_layer_pool)
+    if num_experts <= 0:
+        num_experts = len(first_layer_pool)
+    return GpuFallbackWorkspace(
+        max_experts=num_experts,
+        gate_up_shape=gate_up_shape,
+        down_shape=down_shape,
+        device=torch.device("cuda"),
+        dtype=hf_config.torch_dtype,
+    )
 
 
 class ModelRunner:
@@ -79,6 +107,12 @@ class ModelRunner:
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
             self.layer_caches = layer_caches
             self.cpu_expert_pool = cpu_expert_pool
+            # Create shared GPU fallback workspace for unified Triton grouped-GEMM.
+            # Pre-allocate one buffer pool for all layers so uncached expert routes
+            # use the same kernel as cached routes (deterministic alignment).
+            gpu_fallback_workspace = _create_gpu_fallback_workspace(
+                cpu_expert_pool, hf_config
+            )
             self.model.enable_heterogeneous_mode(
                 layer_caches,
                 cpu_expert_pool,
@@ -91,6 +125,12 @@ class ModelRunner:
                 cpu_expert_strict_dtype=getattr(config, "cpu_expert_strict_dtype", True),
                 cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", "auto"),
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.0),
+                gpu_fallback_workspace=gpu_fallback_workspace,
+                kt_weight_path=getattr(config, "model", ""),
+                kt_method=getattr(config, "kt_method", "BF16"),
+                kt_num_threads=getattr(config, "kt_num_threads", 0),
+                kt_threadpool_count=getattr(config, "kt_threadpool_count", 1),
+                kt_chunked_prefill_size=getattr(config, "kt_chunked_prefill_size", 4096),
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
             self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"

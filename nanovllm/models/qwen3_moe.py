@@ -19,7 +19,8 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
 from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
-from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
+from nanovllm.layers.fuse_moe.kt_backend import KtKernelCpuMoeBackend
+from nanovllm.layers.fuse_moe.heterogeneous import GpuFallbackWorkspace, heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu
@@ -311,6 +312,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
+        self.gpu_fallback_workspace: GpuFallbackWorkspace | None = None
 
     def enable_heterogeneous(
         self,
@@ -325,6 +327,12 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
+        gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
+        kt_weight_path: str = "",
+        kt_method: str = "BF16",
+        kt_num_threads: int = 0,
+        kt_threadpool_count: int = 1,
+        kt_chunked_prefill_size: int = 4096,
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
@@ -333,6 +341,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_num_threads = int(cpu_expert_num_threads)
         self.cpu_expert_backend_name = cpu_expert_backend
         self.cpu_expert_packed_min_routes = int(cpu_expert_packed_min_routes)
+        self.gpu_fallback_workspace = gpu_fallback_workspace
         if cpu_expert_backend == "torch_packed":
             self.cpu_backend = TorchPackedCpuMoeBackend(
                 layer_idx=self.layer_idx,
@@ -347,6 +356,27 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 max_routes=cpu_expert_workspace_max_routes,
                 moe_intermediate_size=self.moe_intermediate_size,
                 strict_dtype=cpu_expert_strict_dtype,
+            )
+        elif cpu_expert_backend == "kt_kernel":
+            hidden_size = expert_cache.gate_up_buffer.shape[2]
+            moe_int_size = expert_cache.gate_up_buffer.shape[1] // 2
+            gpu_mask = torch.zeros(self.num_experts, dtype=torch.bool)
+            expert_cache_snapshot = expert_cache.get_cached_expert_mask()
+            gpu_mask.copy_(expert_cache_snapshot.detach().to("cpu", dtype=torch.bool))
+            self.cpu_backend = KtKernelCpuMoeBackend(
+                layer_idx=self.layer_idx,
+                cpu_expert_pool=cpu_expert_pool,
+                max_routes=cpu_expert_workspace_max_routes,
+                moe_intermediate_size=moe_int_size,
+                hidden_size=hidden_size,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.num_selected,
+                gpu_expert_mask=gpu_mask,
+                weight_path=kt_weight_path,
+                kt_method=kt_method,
+                kt_num_threads=kt_num_threads,
+                kt_threadpool_count=kt_threadpool_count,
+                kt_chunked_prefill_size=kt_chunked_prefill_size,
             )
         elif cpu_expert_backend == "torch":
             self.cpu_backend = None
@@ -450,6 +480,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             cpu_gpu_parallel_stream=self._get_parallel_stream(),
             cpu_backend=self.cpu_backend,
             cpu_backend_min_routes=self.cpu_expert_packed_min_routes,
+            gpu_fallback_workspace=self.gpu_fallback_workspace,
             profile=profile,
         )
         if (
@@ -645,6 +676,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
+        gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
+        kt_weight_path: str = "",
+        kt_method: str = "BF16",
+        kt_num_threads: int = 0,
+        kt_threadpool_count: int = 1,
+        kt_chunked_prefill_size: int = 4096,
     ):
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
@@ -662,6 +699,12 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_expert_strict_dtype=cpu_expert_strict_dtype,
                     cpu_gpu_parallel_execution_enabled=cpu_gpu_parallel_execution_enabled,
                     cpu_gpu_parallel_min_cpu_route_ratio=cpu_gpu_parallel_min_cpu_route_ratio,
+                    gpu_fallback_workspace=gpu_fallback_workspace,
+                    kt_weight_path=kt_weight_path,
+                    kt_method=kt_method,
+                    kt_num_threads=kt_num_threads,
+                    kt_threadpool_count=kt_threadpool_count,
+                    kt_chunked_prefill_size=kt_chunked_prefill_size,
                 )
 
     def set_speculative_execution_mode(

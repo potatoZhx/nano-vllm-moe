@@ -162,6 +162,8 @@ class TorchPackedCpuMoeBackend:
         num_threads: int = 4,
         cpu_task_expert_ids_host: list[int] | None = None,
         cpu_task_offsets_host: list[int] | None = None,
+        selected_experts: torch.Tensor | None = None,
+        routing_weights: torch.Tensor | None = None,
     ) -> CpuMoeResult:
         prep_t0 = perf_counter()
         compute_dtype = hidden_states.dtype
@@ -325,6 +327,8 @@ class FusedTorchCpuMoeBackend:
         num_threads: int = 4,
         cpu_task_expert_ids_host: list[int] | None = None,
         cpu_task_offsets_host: list[int] | None = None,
+        selected_experts: torch.Tensor | None = None,
+        routing_weights: torch.Tensor | None = None,
     ) -> CpuMoeResult:
         prep_t0 = perf_counter()
         compute_dtype = hidden_states.dtype

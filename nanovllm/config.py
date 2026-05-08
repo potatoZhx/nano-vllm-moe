@@ -50,7 +50,7 @@ class Config:
     engine_profile: bool = False
     engine_profile_cuda_sync: bool = True
     heterogeneous_slots_per_layer: int = 0
-    cpu_expert_pin_memory: bool = True
+    cpu_expert_pin_memory: bool = False  # pin_memory adds ~60s for 61GB model
     cpu_expert_execution_enabled: bool = False
     cpu_expert_backend: str = "torch"
     cpu_expert_workspace_max_routes: int = 8192
@@ -60,6 +60,10 @@ class Config:
     cpu_expert_parallel_mode: str = "serial"
     cpu_gpu_parallel_execution_enabled: str = "auto"  # "off" | "on" | "auto"
     cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0  # only used when mode="on"
+    kt_method: str = "BF16"                # kt-kernel backend method
+    kt_num_threads: int = 0                # kt-kernel CPU threads (0=auto)
+    kt_threadpool_count: int = 1           # kt-kernel NUMA sub-pools
+    kt_chunked_prefill_size: int = 4096    # kt-kernel prefill chunk size
     gpu_plan_builder_enabled: bool = False
     gpu_plan_builder_fallback: bool = True
     draft_cuda_graph_enabled: bool = True
@@ -109,7 +113,7 @@ class Config:
         assert 0.0 <= self.prefetch_history_decay <= 1.0
         assert self.prefetch_history_ttl_steps >= 1
         assert self.prefetch_runtime_mode == "baseline_staging"
-        assert self.cpu_expert_backend in {"torch", "torch_packed", "fused"}
+        assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}
         assert self.cpu_expert_workspace_max_routes >= 1
         assert self.cpu_expert_packed_min_routes >= 1
         assert self.cpu_expert_num_threads >= 1
