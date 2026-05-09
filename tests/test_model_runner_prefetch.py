@@ -20,7 +20,7 @@ class TestModelRunnerPrefetch(unittest.TestCase):
         modes = []
         mr._set_speculative_execution_mode = lambda mode: modes.append(mode)
         mr._can_use_draft_cudagraph = lambda _bs: False
-        mr.run = lambda seqs, is_prefill: [101 for _ in seqs]
+        mr.run = lambda seqs, is_prefill, return_logits=False: [101 for _ in seqs]
 
         handle = SimpleNamespace(buffer_bytes=256)
         recorder = MagicMock()
@@ -36,7 +36,7 @@ class TestModelRunnerPrefetch(unittest.TestCase):
 
         self.assertEqual(out, [101])
         self.assertIn("prefetch_step_id", aux)
-        runtime.publish_ready.assert_called()
+        runtime.publish_ready.assert_not_called()
         runtime.submit_from_global_queue.assert_called()
         runtime.observe_draft.assert_called_once()
         recorder.arm.assert_called_once()

@@ -2,6 +2,8 @@
 
 本文档完整回顾前面对话、附件方案、KTransformers/kt-kernel 调研结果，并给出一个可实施、可回退、逐步测试的优化路线。核心原则是：
 
+> **2026-05-08 修订提示**：A100 节点 `gpu11-A100-E1-3U` 上的实测表明，本文后续 Phase 4 中把 kt-kernel BF16 作为优先 backend 的路线不可靠。未强制 AVX2 BF16 class 时 kt-kernel 会选择不受当前 CPU 支持的 AMX BF16 路径并在 forward 中 `Illegal instruction`；即使强制 AVX2，当前 nano-vllm-moe 的 shared-wrapper layer reload 端到端 spec smoke 仍会在 `NativeMoEWrapper.load_weights()` 中 segfault。后续实现应先参考 `docs/cpu_expert_ktransformers_operator_research_20260508.md`，把 kt-kernel BF16 降级为实验 backend，并优先验证 KTransformers legacy CPU expert operator 或 nano-local C++ backend。
+
 1. **正确性优先**：默认只实施不改变推理数值语义的优化。量化、expert deferral、近似替换、预测性跳过等可能影响精度的方案全部放入实验分支。
 2. **兼容性优先**：不绕开 nano-vllm-moe 现有 heterogeneous MoE 架构，不重写 router、GPU fused MoE、speculative engine、prefetch runtime。
 3. **逐项优化、逐项测试**：每个优化点完成后必须跑 correctness、regression、microbenchmark 和 end-to-end benchmark，不能一次改很多再统一测试。

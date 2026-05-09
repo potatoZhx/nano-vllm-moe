@@ -20,7 +20,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
 from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
 from nanovllm.layers.fuse_moe.kt_backend import KtKernelCpuMoeBackend
-from nanovllm.layers.fuse_moe.heterogeneous import GpuFallbackWorkspace, heterogeneous_moe_forward
+from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu

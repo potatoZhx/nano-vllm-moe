@@ -22,7 +22,7 @@ class Config:
     enable_speculative: bool = False
     max_draft_tokens: int = 8
     draft_top_c: int = 2
-    acceptance_strategy: str = "greedy"
+    acceptance_strategy: str = "standard_sampling"
     acceptance_threshold: float = 0.7
     draft_scheduler: str = "simple"
     spec_verify_eager: bool = True
@@ -113,6 +113,7 @@ class Config:
         assert 0.0 <= self.prefetch_history_decay <= 1.0
         assert self.prefetch_history_ttl_steps >= 1
         assert self.prefetch_runtime_mode == "baseline_staging"
+        assert self.acceptance_strategy in {"greedy", "standard", "standard_sampling", "sampling", "spec_sampling"}
         assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}
         assert self.cpu_expert_workspace_max_routes >= 1
         assert self.cpu_expert_packed_min_routes >= 1

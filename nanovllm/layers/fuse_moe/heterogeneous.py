@@ -13,6 +13,37 @@ from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend, get_c
 from nanovllm.layers.fuse_moe.functional import fused_moe_linear
 
 
+class GpuFallbackWorkspace:
+    """Pre-allocated GPU buffer pool for unified expert fallback."""
+
+    def __init__(self, max_experts, gate_up_shape, down_shape, device, dtype):
+        self.max_experts = max_experts
+        self.gate_up = torch.empty((max_experts, *gate_up_shape), device=device, dtype=dtype)
+        self.down = torch.empty((max_experts, *down_shape), device=device, dtype=dtype)
+        self._expert_to_slot: dict[int, int] = {}
+        self._slot_free = [True] * max_experts
+
+    def acquire_slots(self, expert_ids, cpu_expert_pool):
+        self.release_all()
+        mapping = {}
+        for eid in expert_ids:
+            for i, free in enumerate(self._slot_free):
+                if free:
+                    self._slot_free[i] = False
+                    self._expert_to_slot[eid] = i
+                    mapping[eid] = i
+                    params = cpu_expert_pool[eid]
+                    self.gate_up[i].copy_(params["gate_up"], non_blocking=True)
+                    self.down[i].copy_(params["down"], non_blocking=True)
+                    break
+        return mapping
+
+    def release_all(self):
+        for slot in self._expert_to_slot.values():
+            self._slot_free[slot] = True
+        self._expert_to_slot.clear()
+
+
 def heterogeneous_moe_forward(
     hidden_states: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -29,6 +60,7 @@ def heterogeneous_moe_forward(
     cpu_gpu_parallel_stream: torch.cuda.Stream | None = None,
     cpu_backend: TorchPackedCpuMoeBackend | None = None,
     cpu_backend_min_routes: int = 32,
+    gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
     profile: dict | None = None,
 ) -> torch.Tensor:
     """Run MoE with GPU cached experts + fallback path for uncached experts."""
@@ -117,6 +149,8 @@ def heterogeneous_moe_forward(
                 num_threads=cpu_expert_num_threads,
                 cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
                 cpu_task_offsets_host=plan.cpu_task_offsets_host,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
             )
             cpu_outputs = cpu_result.outputs_cpu
             prep_ms = cpu_result.prep_ms
@@ -364,9 +398,17 @@ def _accumulate_mixed_routes_deterministic(
     if has_gpu:
         route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out.to(dtype=dtype))
     if has_cpu:
-        route_buffer.index_copy_(0, cpu_route_indices.to(torch.int64), cpu_outputs.to(dtype=dtype, device=device))
-    token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
-    output.add_(token_output.to(dtype=output.dtype))
+        # kt_kernel returns per-token output, not per-route
+        if cpu_outputs.shape == output.shape:
+            output.add_(cpu_outputs.to(dtype=output.dtype, device=device))
+        else:
+            route_buffer.index_copy_(0, cpu_route_indices.to(torch.int64), cpu_outputs.to(dtype=dtype, device=device))
+    if has_cpu and cpu_outputs.shape != output.shape:
+        token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+        output.add_(token_output.to(dtype=output.dtype))
+    elif has_gpu:
+        token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+        output.add_(token_output.to(dtype=output.dtype))
 
 
 def _run_gpu_cached_expert_path(
@@ -515,7 +557,14 @@ def _merge_packed_cpu_outputs(
     output_device: torch.device,
 ) -> float:
     merge_t0 = perf_counter()
-    if token_indices.numel() > 0:
+    # kt_kernel returns per-token output (empty token_indices) → add directly
+    if token_indices.numel() == 0 and outputs_cpu.numel() > 0:
+        out = outputs_cpu.to(device=output_device, dtype=output_dtype, non_blocking=False)
+        if out.shape == output.shape:
+            output.add_(out)
+        else:
+            output.add_(out.to(dtype=output_dtype))
+    elif token_indices.numel() > 0:
         non_blocking = bool(output_device.type == "cuda" and outputs_cpu.is_pinned())
         out = outputs_cpu.to(device=output_device, dtype=output_dtype, non_blocking=non_blocking)
         output.index_add_(0, token_indices, out)

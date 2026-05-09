@@ -32,7 +32,7 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         mr._profile = {}
         mr._prefetch_step_id = 0
         mr._decode_graph_policy = "standard"
-        mr.run = lambda seqs, is_prefill: [7 for _ in seqs]
+        mr.run = lambda seqs, is_prefill, return_logits=False: [7 for _ in seqs]
 
         out, aux = ModelRunner.run_draft(mr, [SimpleNamespace(seq_id=1)])
 

@@ -865,7 +865,7 @@ class ModelRunner:
             return False
         return any(bucket >= bs for bucket in self.graph_bs)
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, return_logits: bool = False):
         phase = "prefill" if is_prefill else "decode"
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -938,6 +938,8 @@ class ModelRunner:
             self._flush_pending_prefetch_metadata(block=False)
 
         reset_context()
+        if return_logits and self.rank == 0:
+            return token_ids, logits
         return token_ids
 
     def _set_speculative_execution_mode(self, mode: str):
@@ -946,7 +948,7 @@ class ModelRunner:
             self.model.set_speculative_execution_mode(mode, self.draft_scheduler, draft_top_c)
 
     @torch.inference_mode()
-    def run_draft(self, seqs: list[Sequence]) -> tuple[list[int], dict[str, object]]:
+    def run_draft(self, seqs: list[Sequence], return_logits: bool = False) -> tuple:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
         self._ensure_prefetch_internal_state()
         t0 = perf_counter()
@@ -971,9 +973,6 @@ class ModelRunner:
                 if self._can_use_draft_cudagraph(len(seqs)):
                     draft_capacity = next(x for x in self.draft_graph_bs if x >= len(seqs))
 
-                with self._prefetch_runtime_lock:
-                    prefetch_runtime.publish_ready(step_id=step_id)
-                    prefetch_runtime.submit_from_global_queue(step_id=step_id, phase="before_draft")
                 self._wait_for_prefetch_device_reuse(mode="draft", token_capacity=draft_capacity)
                 runtime_meta_recorder.arm(
                     mode="draft",
@@ -995,7 +994,12 @@ class ModelRunner:
                     )
 
             core_run_t0 = perf_counter()
-            token_ids = self.run(seqs, False)
+            run_result = self.run(seqs, False, return_logits=return_logits)
+            if return_logits and self.rank == 0:
+                token_ids, draft_logits = run_result
+            else:
+                token_ids = run_result
+                draft_logits = None
             core_run_ms = (perf_counter() - core_run_t0) * 1000.0
             if self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
@@ -1030,6 +1034,8 @@ class ModelRunner:
                 )
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
+            if return_logits and self.rank == 0:
+                return token_ids, {"prefetch_step_id": step_id}, draft_logits
             return token_ids, {"prefetch_step_id": step_id}
         finally:
             self._decode_graph_policy = "standard"
@@ -1046,8 +1052,10 @@ class ModelRunner:
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         if prefetch_runtime is None:
             return {}
-        metadata_drain_ms = self._wait_for_prefetch_async_drain() if getattr(self, "_prefetch_async_enabled", False) else 0.0
-        self._flush_pending_prefetch_metadata(block=True)
+        # Keep prefetch fully opportunistic: verify should consume only transfers
+        # that are already complete instead of draining metadata work on the main path.
+        metadata_drain_ms = 0.0
+        self._flush_pending_prefetch_metadata(block=False)
         t0 = perf_counter()
         with self._prefetch_runtime_lock:
             prefetch_runtime.wait_for_verify(
@@ -1069,8 +1077,13 @@ class ModelRunner:
         }
 
     @torch.inference_mode()
-    def run_verify(self, seqs: list[Sequence], verify_lengths: list[int]) -> list[list[int]]:
-        """Run one-shot verify in prefill-like mode and return per-sequence argmax traces."""
+    def run_verify(
+        self,
+        seqs: list[Sequence],
+        verify_lengths: list[int],
+        return_logits: bool = False,
+    ):
+        """Run one-shot verify in prefill-like mode and return traces or logits."""
         self._ensure_prefetch_internal_state()
         total_t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
@@ -1173,12 +1186,15 @@ class ModelRunner:
             self._profile["run_verify_count"] += 1
             self._profile["verify_tokens_in_total"] += int(input_ids.numel())
 
-        verify_tokens_per_seq: list[list[int]] = []
+        verify_outputs = []
         offset = 0
         for length in verify_lengths:
             seq_logits = logits[offset:offset + length]
             offset += length
-            verify_tokens_per_seq.append(seq_logits.argmax(dim=-1).tolist())
+            if return_logits:
+                verify_outputs.append(seq_logits)
+            else:
+                verify_outputs.append(seq_logits.argmax(dim=-1).tolist())
 
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
             host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
@@ -1202,7 +1218,7 @@ class ModelRunner:
             )
             runtime_meta_recorder.reset()
             self._flush_pending_prefetch_metadata(block=False)
-        return verify_tokens_per_seq
+        return verify_outputs
 
     @torch.inference_mode()
     def capture_cudagraph(self):

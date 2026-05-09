@@ -258,11 +258,10 @@ class TorchPackedCpuMoeBackend:
 
 
 class FusedTorchCpuMoeBackend:
-    """Fused CPU MoE backend using pre-allocated FP32 buffers.
+    """CPU MoE backend using pre-allocated intermediate buffers.
 
-    Eliminates per-expert intermediate allocations by using workspace
-    buffers for gate_up and activation results.  Computation is done in
-    FP32 to reduce per-call dtype conversion inside F.linear.
+    This keeps the same dtype as the model weights and avoids allocating
+    gate/up, activation, and output temporaries for each expert task.
     """
 
     def __init__(
@@ -332,7 +331,6 @@ class FusedTorchCpuMoeBackend:
     ) -> CpuMoeResult:
         prep_t0 = perf_counter()
         compute_dtype = hidden_states.dtype
-        use_fp32 = compute_dtype != torch.float32
         num_routes = int(cpu_indices.numel())
         if num_routes > self.max_routes:
             raise RuntimeError(f"CPU MoE routes {num_routes} exceed max_routes={self.max_routes}")
@@ -344,6 +342,9 @@ class FusedTorchCpuMoeBackend:
         outputs_cpu = workspace.outputs_cpu[:num_routes]
         gate_up_buf = workspace.gate_up_buf
         act_buf = workspace.act_buf
+        out_buf = workspace.out_fp32_buf
+        if gate_up_buf is None or act_buf is None or out_buf is None:
+            raise RuntimeError("Fused CPU MoE workspace is missing intermediate buffers")
 
         if hidden_states.is_cuda:
             route_token_indices = token_indices.to(device=hidden_states.device, non_blocking=True)
@@ -395,14 +396,18 @@ class FusedTorchCpuMoeBackend:
             o_slice = outputs_cpu[start:end]
             I = self.intermediate_size
 
-            # gate_up = hidden @ gate_up_w^T  →  [M, 2I]
-            gate_up = torch.mm(h_chunk, gate_up_w.t())
-            gate_up = gate_up.to(device="cpu")
-            # silu_and_mul → [M, I]
-            act_out = torch.mul(F.silu(gate_up[:, :I]), gate_up[:, I:])
-            act_out = act_out.to(device="cpu")
-            # output = act @ down_w^T  →  [M, H]
-            expert_out = torch.mm(act_out, down_w.t())
+            gate_up = gate_up_buf[start:end]
+            act_out = act_buf[start:end]
+            expert_out = out_buf[start:end]
+
+            # SiluAndMul computes silu(first_half) * second_half.
+            torch.mm(h_chunk, gate_up_w.t(), out=gate_up)
+            gate = gate_up[:, :I]
+            up = gate_up[:, I:]
+            torch.sigmoid(gate, out=act_out)
+            act_out.mul_(gate)
+            act_out.mul_(up)
+            torch.mm(act_out, down_w.t(), out=expert_out)
             expert_out.mul_(w_chunk.unsqueeze(-1))
             o_slice.copy_(expert_out)
 

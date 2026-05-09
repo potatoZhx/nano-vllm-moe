@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+from random import Random
+from statistics import mean
+from time import perf_counter
+from typing import Any
+
+
+BASE_PROMPTS = [
+    "Summarize why sparse MoE inference can reduce memory traffic compared with dense inference.",
+    "Explain top-k expert routing with a short example and one deployment caveat.",
+    "Describe a practical GPU expert cache policy for a memory-limited inference server.",
+    "Give a compact checklist for validating speculative decoding after a kernel change.",
+]
+
+
+VERIFY_LAYER_EVENTS: list[dict[str, Any]] = []
+SYNC_LAYER_TIMING = True
+
+
+def str2bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid bool value: {value}")
+
+
+def _make_prompts(num_seqs: int, input_len: int, seed: int) -> list[str]:
+    rng = Random(seed)
+    prompts: list[str] = []
+    for i in range(num_seqs):
+        base = BASE_PROMPTS[i % len(BASE_PROMPTS)]
+        words: list[str] = []
+        while len(words) < input_len:
+            score = rng.randint(0, 100)
+            words.extend(
+                (
+                    f"case {i}",
+                    f"score {score}",
+                    "cache pressure verify routing latency expert balance",
+                )
+            )
+        context = " ".join(words[:input_len])
+        prompts.append(f"Task: {base}\nContext: {context}\nAnswer briefly.")
+    return prompts
+
+
+def _install_verify_layer_probe(sync_layer_timing: bool) -> None:
+    global SYNC_LAYER_TIMING
+    SYNC_LAYER_TIMING = bool(sync_layer_timing)
+
+    import torch
+    from nanovllm.models import qwen3_moe
+
+    cls = qwen3_moe.Qwen3MoeHeterogeneousSparseMoeBlock
+    if getattr(cls, "_verify_count_stats_patched", False):
+        return
+
+    original_forward = cls.forward
+
+    def patched_forward(self, hidden_states):  # type: ignore[no-untyped-def]
+        is_verify = getattr(self, "execution_mode", "normal") == "verify"
+        if is_verify and SYNC_LAYER_TIMING and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = perf_counter()
+        out = original_forward(self, hidden_states)
+        if is_verify:
+            if SYNC_LAYER_TIMING and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            prof = dict(getattr(self, "_last_profile", {}) or {})
+            VERIFY_LAYER_EVENTS.append(
+                {
+                    "layer_idx": int(getattr(self, "layer_idx", -1)),
+                    "token_count": int(hidden_states.shape[0]),
+                    "total_expert_count": int(round(float(prof.get("activated_expert_set_size_sum", 0.0)))),
+                    "cpu_expert_count": int(round(float(prof.get("realized_cpu_expert_count_sum", 0.0)))),
+                    "layer_moe_wall_ms": (perf_counter() - t0) * 1000.0,
+                    "route_ms": float(prof.get("route_ms", 0.0)),
+                    "plan_ms": float(prof.get("plan_ms", 0.0)),
+                    "gpu_compute_ms": float(prof.get("gpu_compute_ms", 0.0)),
+                    "cpu_prepare_ms": float(prof.get("cpu_prepare_ms", 0.0)),
+                    "cpu_compute_ms": float(prof.get("cpu_compute_ms", 0.0)),
+                    "cpu_to_gpu_merge_ms": float(prof.get("cpu_to_gpu_merge_ms", 0.0)),
+                    "cpu_route_ratio": float(prof.get("cpu_route_ratio_sum", 0.0)),
+                }
+            )
+        return out
+
+    cls.forward = patched_forward
+    cls._verify_count_stats_patched = True
+
+
+def _stat(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0}
+    return {
+        "avg_ms": float(mean(values)),
+        "min_ms": float(min(values)),
+        "max_ms": float(max(values)),
+    }
+
+
+def _hist_by(events: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, ...], list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        grouped[tuple(int(event[k]) for k in keys)].append(event)
+
+    total = len(events)
+    rows: list[dict[str, Any]] = []
+    for key_values, group in sorted(grouped.items()):
+        row = {k: v for k, v in zip(keys, key_values)}
+        row["frequency"] = len(group)
+        row["percent"] = float(len(group) / total * 100.0) if total else 0.0
+        row["layer_moe_wall"] = _stat([float(x["layer_moe_wall_ms"]) for x in group])
+        row["cpu_compute"] = _stat([float(x["cpu_compute_ms"]) for x in group])
+        row["gpu_compute"] = _stat([float(x["gpu_compute_ms"]) for x in group])
+        row["plan"] = _stat([float(x["plan_ms"]) for x in group])
+        row["route"] = _stat([float(x["route_ms"]) for x in group])
+        rows.append(row)
+    return rows
+
+
+def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
+    traces = engine_profile.get("spec_step_traces", [])
+    drafted = 0
+    accepted = 0
+    accepted_dist: Counter[int] = Counter()
+    drafted_dist: Counter[int] = Counter()
+    rejection_count = 0
+    step_count = 0
+    for step in traces:
+        for seq in step.get("sequences", []):
+            d = int(seq.get("drafted_tokens", 0) or 0)
+            a = int(seq.get("accepted_draft_tokens", 0) or 0)
+            drafted += d
+            accepted += a
+            accepted_dist[a] += 1
+            drafted_dist[d] += 1
+            rejection_count += int(bool(seq.get("rejected", False)))
+            step_count += 1
+    return {
+        "step_sequence_count": step_count,
+        "drafted_tokens_total": drafted,
+        "accepted_draft_tokens_total": accepted,
+        "acceptance_rate": float(accepted / drafted) if drafted else 0.0,
+        "rejection_count": int(rejection_count),
+        "rejection_rate_per_step": float(rejection_count / step_count) if step_count else 0.0,
+        "accepted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(accepted_dist.items())},
+        "drafted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(drafted_dist.items())},
+    }
+
+
+def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> dict[str, Any]:
+    ep = raw.get("engine_profile", {})
+    pair_hist = _hist_by(layer_events, ("total_expert_count", "cpu_expert_count"))
+    total_hist = _hist_by(layer_events, ("total_expert_count",))
+    cpu_hist = _hist_by(layer_events, ("cpu_expert_count",))
+    verify_calls = int(ep.get("spec_run_verify_calls", 0) or 0)
+    generated_tokens = int(raw.get("generated_output_tokens", 0) or 0)
+    spec_step_ms_total = float(ep.get("spec_spec_step_ms", 0.0) or 0.0)
+    return {
+        "case": raw.get("case", {}),
+        "elapsed_sec": float(raw.get("elapsed_sec", 0.0)),
+        "generated_output_tokens": generated_tokens,
+        "throughput_output_tok_s": float(raw.get("throughput_output_tok_s", 0.0)),
+        "decode_phase_output_tok_s": (
+            float(generated_tokens / (spec_step_ms_total / 1000.0)) if spec_step_ms_total > 0 else 0.0
+        ),
+        "outputs_digest": raw.get("outputs_digest", ""),
+        "verify_calls": verify_calls,
+        "verify_forward_ms_avg": float(ep.get("verify_forward_ms", 0.0)),
+        "verify_forward_ms_total": float(ep.get("spec_run_verify_infer_ms_total", 0.0)),
+        "draft_forward_ms_avg": float(ep.get("draft_forward_ms", 0.0)),
+        "draft_forward_ms_total": float(ep.get("spec_run_draft_infer_ms_total", 0.0)),
+        "prefill_forward_ms_total": float(ep.get("prefill_runner_ms", 0.0)),
+        "spec_step_ms_total": spec_step_ms_total,
+        "cuda_graph": {
+            "draft_replay_count": int(ep.get("model_draft_graph_replay_count", 0) or 0),
+            "standard_replay_count": int(ep.get("model_standard_graph_replay_count", 0) or 0),
+            "total_replay_count": int(ep.get("model_graph_replay_count", 0) or 0),
+            "hit_rate": float(ep.get("model_graph_hit_rate", 0.0) or 0.0),
+        },
+        "prefetch": {
+            "enabled": bool(raw.get("case", {}).get("prefetch_enabled", False)),
+            "submit_count": int(ep.get("model_prefetch_submit_count", 0) or 0),
+            "completed_count": int(ep.get("model_prefetch_completed_count", 0) or 0),
+            "consumed_count": int(ep.get("model_prefetch_consumed_count", 0) or 0),
+            "wait_ms_total": float(ep.get("model_prefetch_wait_ms", 0.0)),
+            "verify_wait_ms_total": float(ep.get("spec_verify_prefetch_wait_ms", 0.0)),
+        },
+        "acceptance": _acceptance_stats(ep),
+        "verify_layer_event_count": len(layer_events),
+        "hist_by_total_and_cpu_experts": pair_hist,
+        "hist_by_total_experts": total_hist,
+        "hist_by_cpu_experts": cpu_hist,
+    }
+
+
+def run_single_case(args: argparse.Namespace) -> None:
+    _install_verify_layer_probe(sync_layer_timing=args.sync_layer_timing)
+
+    import torch
+    from nanovllm import LLM, SamplingParams
+    from transformers import AutoConfig
+
+    VERIFY_LAYER_EVENTS.clear()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    hf_config = AutoConfig.from_pretrained(args.model_path)
+    num_experts = int(getattr(hf_config, "num_experts"))
+    slots = int(args.slots_per_layer)
+    if slots <= 0:
+        slots = int(round(num_experts * args.cache_ratio))
+
+    case_info = {
+        "cache_ratio": float(args.cache_ratio),
+        "slots_per_layer": slots,
+        "prefetch_enabled": bool(args.prefetch_enabled),
+        "acceptance_strategy": args.acceptance_strategy,
+        "temperature": float(args.temperature),
+        "num_seqs": int(args.num_seqs),
+        "input_len": int(args.input_len),
+        "output_len": int(args.output_len),
+        "max_draft_tokens": int(args.max_draft_tokens),
+        "draft_top_c": int(args.draft_top_c),
+        "cpu_expert_backend": args.cpu_expert_backend,
+        "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
+    }
+
+    llm = LLM(
+        args.model_path,
+        dist_port=args.dist_port,
+        enforce_eager=args.enforce_eager,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        inference_mode="spec",
+        enable_heterogeneous=True,
+        enable_speculative=True,
+        heterogeneous_slots_per_layer=slots,
+        max_draft_tokens=args.max_draft_tokens,
+        draft_top_c=args.draft_top_c,
+        acceptance_strategy=args.acceptance_strategy,
+        acceptance_threshold=args.acceptance_threshold,
+        cpu_expert_execution_enabled=True,
+        cpu_expert_pin_memory=args.cpu_expert_pin_memory,
+        cpu_expert_backend=args.cpu_expert_backend,
+        cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
+        cpu_expert_packed_min_routes=args.cpu_expert_packed_min_routes,
+        cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
+        cpu_expert_num_threads=args.cpu_expert_num_threads,
+        cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
+        cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
+        spec_profile=True,
+        engine_profile=True,
+        engine_profile_cuda_sync=True,
+        spec_enable_prefetch=args.prefetch_enabled,
+        cache_strategy=args.cache_strategy,
+        prefetch_strategy=args.prefetch_strategy,
+        prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
+        prefetch_max_inflight=args.prefetch_max_inflight,
+        prefetch_step_budget=args.prefetch_step_budget,
+        cache_eviction_budget_per_step=args.cache_eviction_budget_per_step,
+        prefetch_verify_wait_ms=args.prefetch_verify_wait_ms,
+        prefetch_global_queue_capacity=args.prefetch_global_queue_capacity,
+        prefetch_history_decay=args.prefetch_history_decay,
+        prefetch_history_ttl_steps=args.prefetch_history_ttl_steps,
+        prefetch_source_weight_prefill=args.prefetch_source_weight_prefill,
+        prefetch_source_weight_verify=args.prefetch_source_weight_verify,
+        prefetch_source_weight_draft=args.prefetch_source_weight_draft,
+        prefetch_activation_count_weight=args.prefetch_activation_count_weight,
+        prefetch_age_penalty=args.prefetch_age_penalty,
+        prefetch_use_prefill_history=args.prefetch_use_prefill_history,
+        prefetch_use_verify_history=args.prefetch_use_verify_history,
+        prefetch_use_draft_live=args.prefetch_use_draft_live,
+    )
+
+    prompts = _make_prompts(args.num_seqs, args.input_len, args.seed)
+    sampling = [
+        SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=args.output_len)
+        for _ in range(args.num_seqs)
+    ]
+
+    warmup_params = SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=4)
+    llm.generate(["Warmup request for verify layer profile."], warmup_params, use_tqdm=False)
+    llm.get_profile(reset=True)
+    VERIFY_LAYER_EVENTS.clear()
+
+    t0 = time.time()
+    outputs = llm.generate(prompts, sampling, use_tqdm=False)
+    elapsed = time.time() - t0
+    profile = llm.get_profile(reset=True)
+
+    llm.exit()
+
+    token_ids = [x["token_ids"] for x in outputs]
+    generated_output_tokens = sum(len(x) for x in token_ids)
+    digest_payload = "|".join(",".join(str(t) for t in seq) for seq in token_ids).encode("utf-8")
+    import hashlib
+
+    raw = {
+        "case": case_info,
+        "elapsed_sec": elapsed,
+        "generated_output_tokens": generated_output_tokens,
+        "throughput_output_tok_s": generated_output_tokens / elapsed if elapsed > 0 else 0.0,
+        "outputs_digest": hashlib.sha256(digest_payload).hexdigest(),
+        "generated_token_ids": token_ids,
+        "engine_profile": profile,
+        "verify_layer_events": list(VERIFY_LAYER_EVENTS),
+    }
+    summary = _summarize_case(raw, list(VERIFY_LAYER_EVENTS))
+    raw["summary"] = summary
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(raw, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=True, indent=2))
+
+
+def _case_name(ratio: float, prefetch: bool, backend: str) -> str:
+    ratio_pct = int(round(ratio * 100))
+    safe_backend = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in backend)
+    return f"{safe_backend}_ratio{ratio_pct}_prefetch_{'on' if prefetch else 'off'}"
+
+
+def _write_markdown(summary: dict[str, Any], path: Path) -> None:
+    lines = [
+        "# Spec verify expert-count statistics",
+        "",
+        f"- model: `{summary['metadata']['model_path']}`",
+        f"- timestamp: `{summary['metadata']['timestamp']}`",
+        f"- output_dir: `{summary['metadata']['output_dir']}`",
+        f"- layer timing: synchronized per verify MoE layer = `{summary['metadata']['sync_layer_timing']}`",
+        f"- draft_top_c: `{summary['metadata']['draft_top_c']}`",
+        f"- acceptance_strategy: `{summary['metadata']['acceptance_strategy']}`",
+        f"- temperature: `{summary['metadata']['temperature']}`",
+        f"- cpu expert backends: `{', '.join(summary['metadata']['cpu_expert_backends'])}`",
+        "",
+        "## Case summary",
+        "",
+        "| backend | cache ratio | prefetch | slots | verify calls | layer events | accept rate | rejects | drafted | accepted | draft graph replays | verify avg ms | draft avg ms | layer MoE avg ms | prefetch consumed | decode tok/s | e2e tok/s |",
+        "|:---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for case in summary["cases"]:
+        c = case["case"]
+        acc = case["acceptance"]
+        layer_avg = 0.0
+        all_times = []
+        for row in case["hist_by_total_and_cpu_experts"]:
+            all_times.extend([row["layer_moe_wall"]["avg_ms"]] * row["frequency"])
+        if all_times:
+            layer_avg = float(mean(all_times))
+        lines.append(
+            "| "
+            f"{c['cpu_expert_backend']} | "
+            f"{c['cache_ratio']:.2f} | "
+            f"{'on' if c['prefetch_enabled'] else 'off'} | "
+            f"{c['slots_per_layer']} | "
+            f"{case['verify_calls']} | "
+            f"{case['verify_layer_event_count']} | "
+            f"{acc['acceptance_rate']:.4f} | "
+            f"{acc['rejection_count']} | "
+            f"{acc['drafted_tokens_total']} | "
+            f"{acc['accepted_draft_tokens_total']} | "
+            f"{case['cuda_graph']['draft_replay_count']} | "
+            f"{case['verify_forward_ms_avg']:.3f} | "
+            f"{case['draft_forward_ms_avg']:.3f} | "
+            f"{layer_avg:.3f} | "
+            f"{case['prefetch']['consumed_count']} | "
+            f"{case['decode_phase_output_tok_s']:.3f} | "
+            f"{case['throughput_output_tok_s']:.3f} |"
+        )
+
+    for case in summary["cases"]:
+        c = case["case"]
+        lines.extend(
+            [
+                "",
+                f"## backend={c['cpu_expert_backend']}, ratio={c['cache_ratio']:.2f}, prefetch={'on' if c['prefetch_enabled'] else 'off'}",
+                "",
+                "### By total expert count and CPU expert count",
+                "",
+                "| total experts | CPU experts | freq | percent | layer wall avg/min/max ms | CPU compute avg/min/max ms | GPU compute avg/min/max ms |",
+                "|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in case["hist_by_total_and_cpu_experts"]:
+            wall = row["layer_moe_wall"]
+            cpu = row["cpu_compute"]
+            gpu = row["gpu_compute"]
+            lines.append(
+                "| "
+                f"{row['total_expert_count']} | {row['cpu_expert_count']} | "
+                f"{row['frequency']} | {row['percent']:.2f} | "
+                f"{wall['avg_ms']:.3f}/{wall['min_ms']:.3f}/{wall['max_ms']:.3f} | "
+                f"{cpu['avg_ms']:.3f}/{cpu['min_ms']:.3f}/{cpu['max_ms']:.3f} | "
+                f"{gpu['avg_ms']:.3f}/{gpu['min_ms']:.3f}/{gpu['max_ms']:.3f} |"
+            )
+        lines.extend(
+            [
+                "",
+                "### Marginal by total experts",
+                "",
+                "| total experts | freq | percent | layer wall avg/min/max ms |",
+                "|---:|---:|---:|---:|",
+            ]
+        )
+        for row in case["hist_by_total_experts"]:
+            wall = row["layer_moe_wall"]
+            lines.append(
+                f"| {row['total_expert_count']} | {row['frequency']} | {row['percent']:.2f} | "
+                f"{wall['avg_ms']:.3f}/{wall['min_ms']:.3f}/{wall['max_ms']:.3f} |"
+            )
+        lines.extend(
+            [
+                "",
+                "### Marginal by CPU experts",
+                "",
+                "| CPU experts | freq | percent | layer wall avg/min/max ms |",
+                "|---:|---:|---:|---:|",
+            ]
+        )
+        for row in case["hist_by_cpu_experts"]:
+            wall = row["layer_moe_wall"]
+            lines.append(
+                f"| {row['cpu_expert_count']} | {row['frequency']} | {row['percent']:.2f} | "
+                f"{wall['avg_ms']:.3f}/{wall['min_ms']:.3f}/{wall['max_ms']:.3f} |"
+            )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_suite(args: argparse.Namespace) -> None:
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    ratios = [float(x) for x in args.cache_ratios.split(",")]
+    prefetch_values = [False, True] if args.prefetch_order == "off,on" else [True, False]
+    backend_values = [x.strip() for x in args.cpu_expert_backends.split(",") if x.strip()]
+    if not backend_values:
+        backend_values = [args.cpu_expert_backend]
+    invalid_backends = sorted(set(backend_values) - {"torch", "torch_packed", "fused", "kt_kernel"})
+    if invalid_backends:
+        raise ValueError(f"Invalid CPU expert backend(s): {invalid_backends}")
+    script_path = Path(__file__).resolve()
+    cases: list[dict[str, Any]] = []
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2]) + os.pathsep + env.get("PYTHONPATH", "")
+
+    case_index = 0
+    for backend in backend_values:
+        for ratio in ratios:
+            for prefetch in prefetch_values:
+                name = _case_name(ratio, prefetch, backend)
+                case_json = outdir / f"{name}.json"
+                case_log = outdir / f"{name}.log"
+                cmd = [
+                    sys.executable,
+                    str(script_path),
+                    "--single-case",
+                    "--model-path",
+                    args.model_path,
+                    "--cache-ratio",
+                    str(ratio),
+                    "--slots-per-layer",
+                    "0",
+                    "--prefetch-enabled",
+                    str(prefetch).lower(),
+                    "--output",
+                    str(case_json),
+                    "--dist-port",
+                    str(args.dist_port_base + case_index),
+                    "--num-seqs",
+                    str(args.num_seqs),
+                    "--input-len",
+                    str(args.input_len),
+                    "--output-len",
+                    str(args.output_len),
+                    "--max-draft-tokens",
+                    str(args.max_draft_tokens),
+                    "--draft-top-c",
+                    str(args.draft_top_c),
+                    "--temperature",
+                    str(args.temperature),
+                    "--acceptance-strategy",
+                    args.acceptance_strategy,
+                    "--acceptance-threshold",
+                    str(args.acceptance_threshold),
+                    "--cpu-expert-backend",
+                    backend,
+                    "--cpu-expert-pin-memory",
+                    str(args.cpu_expert_pin_memory).lower(),
+                    "--cpu-expert-workspace-max-routes",
+                    str(args.cpu_expert_workspace_max_routes),
+                    "--cpu-expert-packed-min-routes",
+                    str(args.cpu_expert_packed_min_routes),
+                    "--cpu-expert-parallel-mode",
+                    args.cpu_expert_parallel_mode,
+                    "--cpu-expert-num-threads",
+                    str(args.cpu_expert_num_threads),
+                    "--cpu-gpu-parallel-execution-enabled",
+                    args.cpu_gpu_parallel_execution_enabled,
+                    "--cpu-gpu-parallel-min-cpu-route-ratio",
+                    str(args.cpu_gpu_parallel_min_cpu_route_ratio),
+                    "--max-num-batched-tokens",
+                    str(args.max_num_batched_tokens),
+                    "--max-num-seqs",
+                    str(args.max_num_seqs),
+                    "--max-model-len",
+                    str(args.max_model_len),
+                    "--gpu-memory-utilization",
+                    str(args.gpu_memory_utilization),
+                    "--enforce-eager",
+                    str(args.enforce_eager).lower(),
+                    "--prefetch-verify-wait-ms",
+                    str(args.prefetch_verify_wait_ms),
+                    "--prefetch-step-budget",
+                    str(args.prefetch_step_budget),
+                    "--prefetch-max-inflight",
+                    str(args.prefetch_max_inflight),
+                    "--prefetch-staging-slots-per-layer",
+                    str(args.prefetch_staging_slots_per_layer),
+                    "--cache-eviction-budget-per-step",
+                    str(args.cache_eviction_budget_per_step),
+                    "--prefetch-global-queue-capacity",
+                    str(args.prefetch_global_queue_capacity),
+                    "--prefetch-history-decay",
+                    str(args.prefetch_history_decay),
+                    "--prefetch-history-ttl-steps",
+                    str(args.prefetch_history_ttl_steps),
+                    "--prefetch-source-weight-prefill",
+                    str(args.prefetch_source_weight_prefill),
+                    "--prefetch-source-weight-verify",
+                    str(args.prefetch_source_weight_verify),
+                    "--prefetch-source-weight-draft",
+                    str(args.prefetch_source_weight_draft),
+                    "--prefetch-activation-count-weight",
+                    str(args.prefetch_activation_count_weight),
+                    "--prefetch-age-penalty",
+                    str(args.prefetch_age_penalty),
+                    "--prefetch-use-prefill-history",
+                    str(args.prefetch_use_prefill_history).lower(),
+                    "--prefetch-use-verify-history",
+                    str(args.prefetch_use_verify_history).lower(),
+                    "--prefetch-use-draft-live",
+                    str(args.prefetch_use_draft_live).lower(),
+                    "--seed",
+                    str(args.seed),
+                    "--sync-layer-timing",
+                    str(args.sync_layer_timing).lower(),
+                ]
+                print(f"[{time.strftime('%H:%M:%S')}] running {name}", flush=True)
+                t0 = time.time()
+                with case_log.open("w", encoding="utf-8") as log_f:
+                    proc = subprocess.run(
+                        cmd,
+                        cwd=Path(__file__).resolve().parents[2],
+                        env=env,
+                        stdout=log_f,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=args.case_timeout_sec,
+                    )
+                dt = time.time() - t0
+                print(f"[{time.strftime('%H:%M:%S')}] {name} exit={proc.returncode} elapsed={dt:.1f}s", flush=True)
+                if proc.returncode != 0:
+                    tail = case_log.read_text(encoding="utf-8", errors="replace")[-4000:]
+                    raise RuntimeError(f"case failed: {name}\n{tail}")
+                raw = json.loads(case_json.read_text(encoding="utf-8"))
+                cases.append(raw["summary"])
+                case_index += 1
+
+    summary = {
+        "metadata": {
+            "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+            "model_path": args.model_path,
+            "output_dir": str(outdir),
+            "cache_ratios": ratios,
+            "cpu_expert_backends": backend_values,
+            "draft_top_c": int(args.draft_top_c),
+            "acceptance_strategy": args.acceptance_strategy,
+            "temperature": float(args.temperature),
+            "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
+            "prefetch_order": args.prefetch_order,
+            "sync_layer_timing": bool(args.sync_layer_timing),
+            "argv": sys.argv,
+        },
+        "cases": cases,
+    }
+    summary_json = outdir / "summary.json"
+    summary_md = outdir / "summary.md"
+    summary_json.write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    _write_markdown(summary, summary_md)
+    print(f"summary_json={summary_json}")
+    print(f"summary_md={summary_md}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Collect verify-phase per-layer expert-count statistics in spec mode.")
+    p.add_argument("--single-case", action="store_true")
+    p.add_argument("--model-path", default="/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B")
+    p.add_argument("--output-dir", default="")
+    p.add_argument("--output", default="")
+    p.add_argument("--cache-ratios", default="0.75,0.50,0.25")
+    p.add_argument("--cache-ratio", type=float, default=0.75)
+    p.add_argument("--slots-per-layer", type=int, default=0)
+    p.add_argument("--prefetch-order", choices=["off,on", "on,off"], default="off,on")
+    p.add_argument("--prefetch-enabled", type=str2bool, default=False)
+    p.add_argument("--num-seqs", type=int, default=1)
+    p.add_argument("--input-len", type=int, default=12)
+    p.add_argument("--output-len", type=int, default=24)
+    p.add_argument("--max-draft-tokens", type=int, default=4)
+    p.add_argument("--draft-top-c", type=int, default=0)
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--acceptance-strategy", default="standard_sampling")
+    p.add_argument("--acceptance-threshold", type=float, default=0.7)
+    p.add_argument("--cpu-expert-backend", default="fused")
+    p.add_argument(
+        "--cpu-expert-backends",
+        default="fused,torch",
+        help="Comma-separated backend list for suite mode. Single-case mode uses --cpu-expert-backend.",
+    )
+    p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=8192)
+    p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
+    p.add_argument("--cpu-expert-packed-min-routes", type=int, default=1)
+    p.add_argument("--cpu-expert-parallel-mode", default="serial")
+    p.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    p.add_argument("--cpu-gpu-parallel-execution-enabled", default="auto")
+    p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.0)
+    p.add_argument("--max-num-batched-tokens", type=int, default=512)
+    p.add_argument("--max-num-seqs", type=int, default=1)
+    p.add_argument("--max-model-len", type=int, default=512)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    p.add_argument("--enforce-eager", type=str2bool, default=False)
+    p.add_argument("--cache-strategy", default="lru")
+    p.add_argument("--prefetch-strategy", default="history_window")
+    p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
+    p.add_argument("--prefetch-max-inflight", type=int, default=8)
+    p.add_argument("--prefetch-step-budget", type=int, default=4)
+    p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
+    p.add_argument("--prefetch-verify-wait-ms", type=float, default=0.0)
+    p.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
+    p.add_argument("--prefetch-history-decay", type=float, default=0.9)
+    p.add_argument("--prefetch-history-ttl-steps", type=int, default=64)
+    p.add_argument("--prefetch-source-weight-prefill", type=float, default=1.0)
+    p.add_argument("--prefetch-source-weight-verify", type=float, default=1.2)
+    p.add_argument("--prefetch-source-weight-draft", type=float, default=1.5)
+    p.add_argument("--prefetch-activation-count-weight", type=float, default=0.1)
+    p.add_argument("--prefetch-age-penalty", type=float, default=0.02)
+    p.add_argument("--prefetch-use-prefill-history", type=str2bool, default=True)
+    p.add_argument("--prefetch-use-verify-history", type=str2bool, default=True)
+    p.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
+    p.add_argument("--dist-port", type=int, default=12345)
+    p.add_argument("--dist-port-base", type=int, default=26500)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--sync-layer-timing", type=str2bool, default=True)
+    p.add_argument("--case-timeout-sec", type=int, default=1800)
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.single_case:
+        if not args.output:
+            raise SystemExit("--output is required with --single-case")
+        run_single_case(args)
+    else:
+        if not args.output_dir:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            args.output_dir = f"/home/mumura/moe_spec/logs/spec_verify_expert_count_stats_{ts}"
+        run_suite(args)
+
+
+if __name__ == "__main__":
+    main()

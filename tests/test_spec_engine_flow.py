@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from nanovllm.engine.speculative.spec_engine import SpeculativeEngine
 
 
@@ -96,6 +98,43 @@ class _DummyModelRunner:
         raise RuntimeError(name)
 
 
+class _SamplingModelRunner:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, name, *args):
+        self.calls.append((name, args))
+        if name == "run":
+            raise AssertionError("standard_sampling should not fall back to baseline sampling")
+        if name == "run_draft":
+            seqs = args[0]
+            return_logits = bool(args[1]) if len(args) > 1 else False
+            self.assert_return_logits = return_logits
+            logits = torch.full((len(seqs), 16), -1000.0)
+            logits[:, 11] = 0.0
+            return [11 for _ in seqs], {"prefetch_step_id": 3}, logits
+        if name == "wait_prefetch_for_verify":
+            return {"verify_prefetch_wait_ms": 0.0}
+        if name == "run_verify":
+            seqs = args[0]
+            return_logits = bool(args[2]) if len(args) > 2 else False
+            self.assert_verify_return_logits = return_logits
+            logits = torch.full((2, 16), -1000.0)
+            logits[0, 11] = 0.0
+            logits[1, 13] = 0.0
+            return [logits for _ in seqs]
+        raise RuntimeError(name)
+
+
+class _SamplingLegacyDraftTupleModelRunner(_SamplingModelRunner):
+    def call(self, name, *args):
+        result = super().call(name, *args)
+        if name == "run_draft":
+            token_ids, _prefetch_state, logits = result
+            return token_ids, logits
+        return result
+
+
 class TestSpecEngineFlow(unittest.TestCase):
     def test_draft_verify_accept_flow(self):
         seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
@@ -148,6 +187,43 @@ class TestSpecEngineFlow(unittest.TestCase):
         self.assertEqual(model_runner.draft_calls, 1)
         self.assertEqual(model_runner.verify_calls, 1)
         self.assertEqual(model_runner.last_verify_lengths, [2])
+
+    def test_standard_sampling_uses_logits_for_sampling_temperature(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=1.0, max_tokens=4)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _SamplingModelRunner()
+        config = SimpleNamespace(
+            max_draft_tokens=1,
+            acceptance_strategy="standard_sampling",
+            acceptance_threshold=0.7,
+        )
+
+        engine = SpeculativeEngine(model_runner=model_runner, scheduler=scheduler, config=config)
+        token_ids = engine.speculative_step([seq])
+
+        self.assertEqual(token_ids, [13])
+        self.assertEqual(seq.token_ids, [1, 2, 3, 11, 13])
+        self.assertTrue(model_runner.assert_return_logits)
+        self.assertTrue(model_runner.assert_verify_return_logits)
+        self.assertNotIn("run", [name for name, _ in model_runner.calls])
+
+    def test_standard_sampling_accepts_legacy_draft_logits_tuple(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=1.0, max_tokens=4)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _SamplingLegacyDraftTupleModelRunner()
+        config = SimpleNamespace(
+            max_draft_tokens=1,
+            acceptance_strategy="standard_sampling",
+            acceptance_threshold=0.7,
+        )
+
+        engine = SpeculativeEngine(model_runner=model_runner, scheduler=scheduler, config=config)
+        token_ids = engine.speculative_step([seq])
+
+        self.assertEqual(token_ids, [13])
+        self.assertEqual(seq.token_ids, [1, 2, 3, 11, 13])
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ from collections import defaultdict
 from copy import deepcopy
 from time import perf_counter
 
+import torch
+
 from nanovllm.engine.sequence import SequenceStatus
 from nanovllm.engine.speculative.acceptance import create_acceptance_strategy
 
@@ -21,6 +23,7 @@ class SpeculativeEngine:
         self.config = config
         self.max_draft_tokens = getattr(config, "max_draft_tokens", 5)
         strategy_name = getattr(config, "acceptance_strategy", "greedy")
+        self.acceptance_strategy_name = str(strategy_name).strip().lower()
         threshold = getattr(config, "acceptance_threshold", 0.7)
         self.acceptance_strategy = create_acceptance_strategy(strategy_name, threshold=threshold)
         self.profile_enabled = getattr(config, "spec_profile", False)
@@ -67,9 +70,15 @@ class SpeculativeEngine:
         if not seqs:
             return []
 
-        # Sampling mode fallback: keep baseline decode semantics for now.
-        if any(getattr(seq, "temperature", 1.0) > 1e-10 for seq in seqs):
+        has_sampling = any(getattr(seq, "temperature", 1.0) > 1e-10 for seq in seqs)
+        use_sampling_accept = self.acceptance_strategy_name in {
+            "standard_sampling",
+            "sampling",
+            "spec_sampling",
+        }
+        if has_sampling and not use_sampling_accept:
             return self.model_runner.call("run", seqs, False)
+        return_logits = bool(has_sampling and use_sampling_accept)
 
         step_t0 = perf_counter()
         self._profile["spec_step_count"] += 1
@@ -107,22 +116,30 @@ class SpeculativeEngine:
         self._profile["start_draft_ms"] += (perf_counter() - t0) * 1000.0
 
         draft_tokens_map = {seq.seq_id: [] for seq in seqs}
+        draft_logits_map = {seq.seq_id: [] for seq in seqs}
         draft_prefetch_state = None
         t0 = perf_counter()
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
-            draft_result = self.model_runner.call("run_draft", seqs)
+            draft_result = self.model_runner.call("run_draft", seqs, return_logits)
             self._profile["run_draft_infer_ms_total"] += (perf_counter() - infer_t0) * 1000.0
+            draft_logits = None
             if isinstance(draft_result, tuple):
                 token_ids = draft_result[0]
                 if len(draft_result) > 1 and isinstance(draft_result[1], dict):
                     draft_prefetch_state = draft_result[1]
+                elif len(draft_result) > 1 and isinstance(draft_result[1], torch.Tensor):
+                    draft_logits = draft_result[1]
+                if len(draft_result) > 2 and isinstance(draft_result[2], torch.Tensor):
+                    draft_logits = draft_result[2]
             else:
                 token_ids = draft_result
 
-            for seq, token_id in zip(seqs, token_ids):
+            for row_idx, (seq, token_id) in enumerate(zip(seqs, token_ids)):
                 seq.append_draft_token(token_id)
                 draft_tokens_map[seq.seq_id].append(token_id)
+                if draft_logits is not None:
+                    draft_logits_map[seq.seq_id].append(draft_logits[row_idx])
 
             # schedule() already reserved the first decode append slot.
             # For multi-draft decoding, reserve the next slot between iterations.
@@ -166,23 +183,34 @@ class SpeculativeEngine:
                     self._profile[key] += float(value)
 
         infer_t0 = perf_counter()
-        verify_traces = self.model_runner.call("run_verify", seqs, verify_lengths)
+        verify_results = self.model_runner.call("run_verify", seqs, verify_lengths, return_logits)
         infer_ms = (perf_counter() - infer_t0) * 1000.0
         self._profile["verify_ms"] += infer_ms
         self._profile["run_verify_infer_ms_total"] += infer_ms
         self._profile["run_verify_calls"] += 1
 
-        verify_tokens_map = {}
-        for seq, trace in zip(seqs, verify_traces):
-            verify_tokens_map[seq.seq_id] = trace
-            self._profile["verify_trace_tokens_total"] += len(trace)
+        verify_results_map = {}
+        for seq, verify_result in zip(seqs, verify_results):
+            verify_results_map[seq.seq_id] = verify_result
+            trace_len = int(verify_result.size(0)) if isinstance(verify_result, torch.Tensor) else len(verify_result)
+            self._profile["verify_trace_tokens_total"] += trace_len
 
         final_token_ids = []
         t0 = perf_counter()
         for seq in seqs:
             draft_tokens = draft_tokens_map[seq.seq_id]
-            verify_tokens = verify_tokens_map[seq.seq_id]
-            accept_result = self.acceptance_strategy.accept(draft_tokens, verify_tokens, seq.temperature)
+            verify_result = verify_results_map[seq.seq_id]
+            draft_logits = (
+                torch.stack(draft_logits_map[seq.seq_id], dim=0)
+                if draft_logits_map[seq.seq_id]
+                else None
+            )
+            accept_result = self.acceptance_strategy.accept(
+                draft_tokens,
+                verify_result,
+                seq.temperature,
+                draft_logits,
+            )
             num_accepted = int(accept_result["num_accepted"])
 
             # Keep accepted draft prefix in KV, then append one verify token in token list.
@@ -193,23 +221,31 @@ class SpeculativeEngine:
                 remaining_budget = max_tokens - start_completion
                 keep_after_start = max(0, min(keep_after_start, remaining_budget - 1))
 
-            if len(verify_tokens) == 0:
+            verify_trace_len = int(verify_result.size(0)) if isinstance(verify_result, torch.Tensor) else len(verify_result)
+            if verify_trace_len == 0:
                 seq.finish_draft()
                 self._maybe_mark_finished(seq)
                 final_token_ids.append(seq.last_token)
                 seq.num_cached_tokens = original_cached_tokens[seq.seq_id]
                 continue
 
-            # Next token must follow the actually kept draft prefix.
-            next_pos = min(keep_after_start, len(verify_tokens) - 1)
-            next_token = verify_tokens[next_pos]
+            # Deterministic acceptors return traces; sampling acceptors return a sampled token.
+            if return_logits:
+                next_token = int(accept_result["next_token"])
+            else:
+                next_pos = min(keep_after_start, verify_trace_len - 1)
+                next_token = verify_result[next_pos]
 
             for seq_trace in step_trace["sequences"]:
                 if seq_trace["seq_id"] == int(seq.seq_id):
                     seq_trace["drafted_tokens"] = int(len(draft_tokens))
-                    seq_trace["verify_trace_len"] = int(len(verify_tokens))
+                    seq_trace["verify_trace_len"] = int(verify_trace_len)
                     seq_trace["accepted_draft_tokens"] = int(keep_after_start)
                     seq_trace["next_token"] = int(next_token)
+                    seq_trace["acceptance_mode"] = str(accept_result.get("mode", self.acceptance_strategy_name))
+                    seq_trace["rejected"] = bool(accept_result.get("rejected", keep_after_start < len(draft_tokens)))
+                    reject_position = accept_result.get("reject_position")
+                    seq_trace["reject_position"] = int(reject_position) if reject_position is not None else None
                     break
 
             self.scheduler.accept_draft_kv(seq, keep_after_start)
