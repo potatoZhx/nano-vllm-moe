@@ -120,6 +120,7 @@ class ModelRunner:
                 cpu_expert_parallel_mode=getattr(config, "cpu_expert_parallel_mode", "serial"),
                 cpu_expert_num_threads=getattr(config, "cpu_expert_num_threads", 4),
                 cpu_expert_backend=getattr(config, "cpu_expert_backend", "torch"),
+                draft_cuda_graph_cpu_backend=getattr(config, "draft_cuda_graph_cpu_backend", "none"),
                 cpu_expert_workspace_max_routes=getattr(config, "cpu_expert_workspace_max_routes", 8192),
                 cpu_expert_packed_min_routes=getattr(config, "cpu_expert_packed_min_routes", 32),
                 cpu_expert_strict_dtype=getattr(config, "cpu_expert_strict_dtype", True),
@@ -819,11 +820,18 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-        graph.replay()
         if self.profile_enabled and self.rank == 0:
+            replay_t0 = perf_counter()
+            graph.replay()
+            if self.profile_cuda_sync:
+                torch.cuda.synchronize()
+            replay_ms = (perf_counter() - replay_t0) * 1000.0
             self._profile["graph_replay_count"] += 1
             self._profile["graph_hit_count"] += 1
             self._profile["standard_graph_replay_count"] += 1
+            self._profile["standard_graph_replay_ms"] += replay_ms
+        else:
+            graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _replay_draft_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -838,11 +846,18 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-        graph.replay()
         if self.profile_enabled and self.rank == 0:
+            replay_t0 = perf_counter()
+            graph.replay()
+            if self.profile_cuda_sync:
+                torch.cuda.synchronize()
+            replay_ms = (perf_counter() - replay_t0) * 1000.0
             self._profile["graph_replay_count"] += 1
             self._profile["graph_hit_count"] += 1
             self._profile["draft_graph_replay_count"] += 1
+            self._profile["draft_graph_replay_ms"] += replay_ms
+        else:
+            graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
@@ -850,13 +865,21 @@ class ModelRunner:
             return False
         if self.enforce_eager:
             return False
-        if getattr(self.config, "draft_top_c", 0) != 0:
+        if getattr(self.config, "draft_top_c", 0) != 0 and not self._can_use_draft_cpu_cudagraph():
             return False
         if bs > getattr(self.config, "draft_cuda_graph_max_bs", 512):
             return False
         if not hasattr(self, "draft_graphs") or not self.draft_graphs:
             return False
         return any(bucket >= bs for bucket in self.draft_graph_bs)
+
+    def _can_use_draft_cpu_cudagraph(self) -> bool:
+        return (
+            getattr(self.config, "draft_top_c", 0) > 0
+            and getattr(self.config, "draft_cuda_graph_cpu_backend", "none") in {"fused", "fused_sync"}
+            and getattr(self.config, "cpu_expert_backend", "torch") == "fused"
+            and bool(getattr(self.config, "cpu_expert_execution_enabled", False))
+        )
 
     def _can_use_standard_cudagraph(self, bs: int) -> bool:
         if self.enforce_eager:
@@ -960,6 +983,9 @@ class ModelRunner:
 
         mode_set_t0 = perf_counter()
         self._set_speculative_execution_mode("draft")
+        draft_cpu_graph_mode = self._can_use_draft_cpu_cudagraph()
+        if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
+            self.model.set_draft_cpu_graph_mode(True)
         self._decode_graph_policy = "draft"
         mode_set_ms = (perf_counter() - mode_set_t0) * 1000.0
         if self.profile_enabled and self.rank == 0:
@@ -1039,6 +1065,8 @@ class ModelRunner:
             return token_ids, {"prefetch_step_id": step_id}
         finally:
             self._decode_graph_policy = "standard"
+            if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
+                self.model.set_draft_cpu_graph_mode(False)
             self._set_speculative_execution_mode("normal")
             if self.profile_enabled:
                 if self.profile_cuda_sync:
@@ -1265,8 +1293,9 @@ class ModelRunner:
 
         if not getattr(self.config, "draft_cuda_graph_enabled", True):
             return
-        if getattr(self.config, "draft_top_c", 0) != 0:
-            # Graph-safe subset: draft graph capture is only enabled for top_c == 0.
+        draft_cpu_graph = self._can_use_draft_cpu_cudagraph()
+        if getattr(self.config, "draft_top_c", 0) != 0 and not draft_cpu_graph:
+            # Default graph-safe subset: top_c>0 requires an explicit CPU graph bridge.
             return
 
         config = self.config
@@ -1290,6 +1319,8 @@ class ModelRunner:
             return
 
         self._set_speculative_execution_mode("draft")
+        if hasattr(self.model, "set_draft_cpu_graph_mode"):
+            self.model.set_draft_cpu_graph_mode(draft_cpu_graph)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         try:
             for bs in reversed(self.draft_graph_bs):
@@ -1303,16 +1334,24 @@ class ModelRunner:
                         logical_token_count=bs,
                     )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                if draft_cpu_graph:
+                    torch.cuda.synchronize()
+                    if hasattr(self.model, "check_draft_cpu_graph_errors"):
+                        self.model.check_draft_cpu_graph_errors()
                 with torch.cuda.graph(graph, self.draft_graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 if self.draft_graph_pool is None:
                     self.draft_graph_pool = graph.pool()
                 self.draft_graphs[bs] = graph
                 torch.cuda.synchronize()
+                if hasattr(self.model, "check_draft_cpu_graph_errors"):
+                    self.model.check_draft_cpu_graph_errors()
                 if runtime_meta_recorder is not None:
                     runtime_meta_recorder.reset()
                 reset_context()
         finally:
+            if hasattr(self.model, "set_draft_cpu_graph_mode"):
+                self.model.set_draft_cpu_graph_mode(False)
             self._set_speculative_execution_mode("normal")
 
         self.draft_graph_vars = dict(

@@ -19,6 +19,33 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.cache_strategy, "lru")
         self.assertEqual(cfg.prefetch_strategy, "history_window")
         self.assertEqual(cfg.prefetch_runtime_mode, "baseline_staging")
+        self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
+
+    def test_draft_cuda_graph_cpu_backend_accepts_fused(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            draft_cuda_graph_cpu_backend="fused",
+            cpu_expert_backend="fused",
+        )
+        self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "fused")
+
+    def test_draft_cuda_graph_cpu_backend_accepts_fused_sync(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            draft_cuda_graph_cpu_backend="fused_sync",
+            cpu_expert_backend="fused",
+        )
+        self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "fused_sync")
+
+    def test_invalid_draft_cuda_graph_cpu_backend_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_cuda_graph_cpu_backend="torch",
+            )
 
     def test_invalid_cache_strategy_fails(self):
         with self.assertRaises(AssertionError):

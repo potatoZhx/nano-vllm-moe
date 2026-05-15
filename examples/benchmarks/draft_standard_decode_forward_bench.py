@@ -71,6 +71,7 @@ def run_case(
 ) -> tuple[dict, int]:
     max_retry = max(0, int(getattr(args, "port_retry", 8)))
     timeout_sec = max(1, int(getattr(args, "case_timeout_sec", 1800)))
+    timeout_arg = None if int(getattr(args, "case_timeout_sec", 1800)) <= 0 else timeout_sec
     last_error: Exception | None = None
 
     for retry in range(max_retry + 1):
@@ -102,6 +103,14 @@ def run_case(
             str(args.max_draft_tokens),
             "--draft-top-c",
             str(args.draft_top_c),
+            "--draft-cuda-graph-bucket-steps",
+            args.draft_cuda_graph_bucket_steps,
+            "--cpu-expert-execution-enabled",
+            str(args.cpu_expert_execution_enabled).lower(),
+            "--cpu-expert-backend",
+            args.cpu_expert_backend,
+            "--draft-cuda-graph-cpu-backend",
+            args.draft_cuda_graph_cpu_backend,
             "--dist-port",
             str(current_port),
             "--seed",
@@ -135,7 +144,7 @@ def run_case(
             output_path.parent.mkdir(parents=True, exist_ok=True)
             cmd.extend(["--output", str(output_path)])
         try:
-            proc = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
+            proc = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_arg)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"Case timeout: mode={mode}, dist_port={current_port}, timeout_sec={timeout_sec}. "
@@ -188,6 +197,7 @@ def extract_standard_decode_metrics(case_result: dict) -> dict:
             "sample_decode_ms_per_call": _per_call(profile, "model_sample_decode_ms", decode_step_count),
             "graph_hit_rate": float(profile.get("model_graph_hit_rate", profile.get("graph_hit_rate", 0.0))),
             "graph_replay_count": int(profile.get("model_standard_graph_replay_count", 0)),
+            "standard_graph_replay_ms_per_call": _per_call(profile, "model_standard_graph_replay_ms", decode_step_count),
         },
     }
 
@@ -243,6 +253,7 @@ def extract_draft_forward_metrics(case_result: dict) -> dict:
             "prefetch_async_hidden_ratio": float(profile.get("model_prefetch_async_hidden_ratio", 0.0)),
             "prefetch_trace_event_count": int(len(profile.get("model_prefetch_trace_events", []))),
             "graph_replay_count": int(profile.get("model_draft_graph_replay_count", 0)),
+            "draft_graph_replay_ms_per_call": _per_call(profile, "model_draft_graph_replay_ms", draft_calls),
             "prefetch_submit_count": int(profile.get("model_prefetch_submit_count", 0)),
             "prefetch_completed_count": int(profile.get("model_prefetch_completed_count", 0)),
             "metadata_offload_count": int(profile.get("model_metadata_offload_count", 0)),
@@ -298,7 +309,7 @@ def validate_cuda_graph_usage(standard_result: dict, spec_result: dict, enforce_
         )
     if draft_replays <= 0:
         raise RuntimeError(
-            "Draft CUDA Graph was not replayed under draft_top_c=0. "
+            "Draft CUDA Graph was not replayed. "
             "Possible causes: draft graph capture failed, policy gate blocked graph, or draft batch missed templates."
         )
 
@@ -387,6 +398,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     parser.add_argument("--max-draft-tokens", type=int, default=4)
     parser.add_argument("--draft-top-c", type=int, default=0)
+    parser.add_argument("--draft-cuda-graph-bucket-steps", type=str, default="")
+    parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
+    parser.add_argument("--cpu-expert-backend", type=str, default="torch")
+    parser.add_argument("--draft-cuda-graph-cpu-backend", type=str, default="none",
+                        choices=["none", "fused", "fused_sync"])
     parser.add_argument("--dist-port-base", type=int, default=29100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -473,6 +489,7 @@ def main() -> None:
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_draft_tokens": args.max_draft_tokens,
             "draft_top_c": args.draft_top_c,
+            "draft_cuda_graph_bucket_steps": args.draft_cuda_graph_bucket_steps,
             "seed": args.seed,
             "temperature": args.temperature,
             "enforce_eager": args.enforce_eager,

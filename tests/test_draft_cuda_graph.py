@@ -16,6 +16,7 @@ class TestDraftCudaGraphPolicy(unittest.TestCase):
         mr.config = SimpleNamespace(
             draft_cuda_graph_enabled=True,
             draft_top_c=1,
+            draft_cuda_graph_cpu_backend="none",
             draft_cuda_graph_max_bs=128,
         )
         mr.enforce_eager = False
@@ -23,6 +24,38 @@ class TestDraftCudaGraphPolicy(unittest.TestCase):
         mr.draft_graph_bs = [1, 2, 4]
 
         self.assertFalse(ModelRunner._can_use_draft_cudagraph(mr, 1))
+
+    def test_can_use_draft_cudagraph_allows_fused_cpu_bridge(self):
+        mr = object.__new__(ModelRunner)
+        mr.config = SimpleNamespace(
+            draft_cuda_graph_enabled=True,
+            draft_top_c=2,
+            draft_cuda_graph_cpu_backend="fused",
+            cpu_expert_backend="fused",
+            cpu_expert_execution_enabled=True,
+            draft_cuda_graph_max_bs=128,
+        )
+        mr.enforce_eager = False
+        mr.draft_graphs = {1: object(), 4: object()}
+        mr.draft_graph_bs = [1, 4]
+
+        self.assertTrue(ModelRunner._can_use_draft_cudagraph(mr, 3))
+
+    def test_can_use_draft_cudagraph_allows_fused_sync_cpu_bridge(self):
+        mr = object.__new__(ModelRunner)
+        mr.config = SimpleNamespace(
+            draft_cuda_graph_enabled=True,
+            draft_top_c=2,
+            draft_cuda_graph_cpu_backend="fused_sync",
+            cpu_expert_backend="fused",
+            cpu_expert_execution_enabled=True,
+            draft_cuda_graph_max_bs=128,
+        )
+        mr.enforce_eager = False
+        mr.draft_graphs = {1: object(), 4: object()}
+        mr.draft_graph_bs = [1, 4]
+
+        self.assertTrue(ModelRunner._can_use_draft_cudagraph(mr, 3))
 
     def test_can_use_draft_cudagraph_requires_templates(self):
         mr = object.__new__(ModelRunner)

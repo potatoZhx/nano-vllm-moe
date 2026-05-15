@@ -56,6 +56,18 @@ def str2bool(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid bool value: {value}")
 
 
+def parse_int_list(value: str) -> list[int] | None:
+    value = value.strip()
+    if not value:
+        return None
+    items = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not items:
+        return None
+    if any(item < 1 for item in items):
+        raise argparse.ArgumentTypeError("bucket steps must be positive integers")
+    return items
+
+
 def _hash_token_ids(token_ids: list[int]) -> str:
     # Use a stable digest to compare outputs across runs without dumping huge payloads.
     payload = ",".join(str(token) for token in token_ids).encode("utf-8")
@@ -85,6 +97,7 @@ def run_case(args: argparse.Namespace) -> dict:
         enable_heterogeneous = mode in {"heter", "spec"}
     else:
         enable_heterogeneous = str2bool(args.enable_heterogeneous)
+    draft_cuda_graph_bucket_steps = args.draft_cuda_graph_bucket_steps or [1, 2, 4, 8]
 
     llm = LLM(
         args.model_path,
@@ -98,8 +111,10 @@ def run_case(args: argparse.Namespace) -> dict:
         enable_heterogeneous=enable_heterogeneous,
         enable_speculative=(mode == "spec"),
         draft_top_c=args.draft_top_c,
+        draft_cuda_graph_bucket_steps=draft_cuda_graph_bucket_steps,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_backend=args.cpu_expert_backend,
+        draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
         cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
         cpu_expert_packed_min_routes=args.cpu_expert_packed_min_routes,
         cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
@@ -174,6 +189,10 @@ def run_case(args: argparse.Namespace) -> dict:
         "enable_heterogeneous": enable_heterogeneous,
         "slots_per_layer": args.slots_per_layer,
         "max_draft_tokens": args.max_draft_tokens,
+        "draft_top_c": args.draft_top_c,
+        "draft_cuda_graph_bucket_steps": draft_cuda_graph_bucket_steps,
+        "cpu_expert_backend": args.cpu_expert_backend,
+        "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
         "num_seqs": args.num_seqs,
         "input_len": args.input_len,
         "output_len": args.output_len,
@@ -220,8 +239,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--draft-top-c", type=int, default=2)
+    parser.add_argument("--draft-cuda-graph-bucket-steps", type=parse_int_list, default=None)
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-backend", type=str, default="torch")
+    parser.add_argument("--draft-cuda-graph-cpu-backend", type=str, default="none",
+                        choices=["none", "fused", "fused_sync"])
     parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=8192)
     parser.add_argument("--cpu-expert-packed-min-routes", type=int, default=32)
     parser.add_argument("--cpu-expert-parallel-mode", type=str, default="serial")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
@@ -76,18 +77,52 @@ def heterogeneous_moe_forward(
     cpu_indices = plan.cpu_route_indices
     has_cpu_work = cpu_indices is not None and cpu_indices.numel() > 0
     cpu_route_ratio = (float(cpu_indices.numel()) / float(flat_selected.numel())) if has_cpu_work else 0.0
-    active_cpu_backend = cpu_backend if has_cpu_work and int(cpu_indices.numel()) >= int(cpu_backend_min_routes) else None
+    cpu_routes = int(cpu_indices.numel()) if has_cpu_work else 0
+    if has_cpu_work and bool(getattr(plan, "cpu_graph_enabled", False)):
+        active_cpu_backend = cpu_backend
+    else:
+        active_cpu_backend = cpu_backend if has_cpu_work and int(cpu_indices.numel()) >= int(cpu_backend_min_routes) else None
+    graph_cpu_enabled = (
+        bool(getattr(plan, "cpu_graph_enabled", False))
+        and hidden_states.is_cuda
+        and active_cpu_backend is not None
+        and hasattr(active_cpu_backend, "forward_graph")
+    )
+    effective_flat_weights = (
+        plan.gpu_route_weights
+        if getattr(plan, "gpu_route_weights", None) is not None
+        else flat_weights
+    )
 
     if profile is not None:
-        profile["cpu_route_ratio_sum"] = float(cpu_route_ratio)
-        if has_cpu_work:
+        is_stream_capturing = bool(hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+        if graph_cpu_enabled and plan.cpu_route_mask is not None:
+            if is_stream_capturing:
+                profile["cpu_route_ratio_sum"] = 0.0
+                profile["cpu_routes_sum"] = 0.0
+                profile["cpu_weight_mass_ratio_sum"] = 0.0
+            else:
+                cpu_route_count = float(plan.cpu_route_mask.sum().item())
+                total_routes = float(flat_selected.numel())
+                cpu_weight_mass = float(flat_weights.masked_select(plan.cpu_route_mask).sum().item())
+                total_weight_mass = float(flat_weights.sum().item())
+                profile["cpu_route_ratio_sum"] = cpu_route_count / total_routes if total_routes > 0 else 0.0
+                profile["cpu_routes_sum"] = cpu_route_count
+                profile["cpu_weight_mass_ratio_sum"] = (
+                    cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
+                )
+        else:
+            profile["cpu_route_ratio_sum"] = float(cpu_route_ratio)
+            profile["cpu_routes_sum"] = float(cpu_routes)
+        if has_cpu_work and not graph_cpu_enabled:
             cpu_weight_mass = float(flat_weights.index_select(0, cpu_indices).sum().item())
             total_weight_mass = float(flat_weights.sum().item())
             profile["cpu_weight_mass_ratio_sum"] = (
                 cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
             )
-        else:
+        elif not has_cpu_work:
             profile["cpu_weight_mass_ratio_sum"] = 0.0
+            profile["cpu_routes_sum"] = 0.0
         if plan.cpu_task_expert_ids is not None:
             profile["realized_cpu_expert_count_sum"] = float(plan.cpu_task_expert_ids.numel())
         else:
@@ -117,6 +152,82 @@ def heterogeneous_moe_forward(
     else:
         can_overlap_cpu_gpu = False
 
+    if graph_cpu_enabled:
+        t_parallel0 = perf_counter()
+        cpu_graph_state = None
+        graph_async = bool(getattr(plan, "cpu_graph_async", False))
+        async_sidecar_enabled = os.getenv(
+            "NANOVLLM_DRAFT_GRAPH_FUSED_ASYNC_SIDE_COMPUTE",
+            "0",
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        submit_cpu_graph = (not graph_async) or async_sidecar_enabled
+        if submit_cpu_graph and hasattr(active_cpu_backend, "begin_forward_graph") and hasattr(active_cpu_backend, "finish_forward_graph"):
+            cpu_graph_state = active_cpu_backend.begin_forward_graph(
+                hidden_states=hidden_states,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                cpu_route_mask=plan.cpu_route_mask,
+                top_k=top_k,
+                async_sidecar=graph_async,
+            )
+        gpu_token_indices, gpu_expert_out, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
+            hidden_states=hidden_states,
+            flat_weights=effective_flat_weights,
+            top_k=top_k,
+            gpu_route_indices=plan.gpu_route_indices,
+            gpu_m_sizes=plan.gpu_m_sizes,
+            expert_cache=expert_cache,
+            act_fn=act_fn,
+        )
+        if graph_async:
+            t_scatter0 = perf_counter()
+            _accumulate_gpu_routes_deterministic(
+                output=output,
+                gpu_route_indices=plan.gpu_route_indices,
+                gpu_expert_out=gpu_expert_out,
+                top_k=top_k,
+            )
+            merge_ms = (perf_counter() - t_scatter0) * 1000.0
+            _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
+            _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
+            _prof_add(profile, "scatter_ms", merge_ms / 1000.0)
+            _prof_add(profile, "parallel_wall_ms", (perf_counter() - t_parallel0) / 1000.0)
+            if profile is not None:
+                profile["cpu_graph_bridge_count"] = float(profile.get("cpu_graph_bridge_count", 0.0) + 1.0)
+                profile["cpu_graph_async_count"] = float(profile.get("cpu_graph_async_count", 0.0) + 1.0)
+                if not async_sidecar_enabled:
+                    profile["cpu_graph_async_sidecar_skipped_count"] = float(
+                        profile.get("cpu_graph_async_sidecar_skipped_count", 0.0) + 1.0
+                    )
+            return output
+        if cpu_graph_state is not None:
+            cpu_result = active_cpu_backend.finish_forward_graph(cpu_graph_state)
+        else:
+            cpu_result = active_cpu_backend.forward_graph(
+                hidden_states=hidden_states,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                cpu_route_mask=plan.cpu_route_mask,
+                top_k=top_k,
+            )
+        t_scatter0 = perf_counter()
+        _accumulate_graph_cpu_route_deltas(
+            output=output,
+            top_k=top_k,
+            gpu_route_indices=plan.gpu_route_indices,
+            gpu_expert_out=gpu_expert_out,
+            cpu_route_deltas=cpu_result.outputs_cpu,
+        )
+        merge_ms = (perf_counter() - t_scatter0) * 1000.0
+        _prof_add(profile, "gpu_gather_ms", gpu_gather_ms / 1000.0)
+        _prof_add(profile, "gpu_compute_ms", gpu_compute_ms / 1000.0)
+        _prof_add(profile, "scatter_ms", merge_ms / 1000.0)
+        _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
+        _prof_add(profile, "parallel_wall_ms", (perf_counter() - t_parallel0) / 1000.0)
+        if profile is not None:
+            profile["cpu_graph_bridge_count"] = float(profile.get("cpu_graph_bridge_count", 0.0) + 1.0)
+        return output
+
     if can_overlap_cpu_gpu:
         t_parallel0 = perf_counter()
         if cpu_gpu_parallel_stream is not None:
@@ -128,7 +239,7 @@ def heterogeneous_moe_forward(
         with torch.cuda.stream(gpu_stream):
             gpu_token_indices, gpu_expert_out, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
                 hidden_states=hidden_states,
-                flat_weights=flat_weights,
+                flat_weights=effective_flat_weights,
                 top_k=top_k,
                 gpu_route_indices=plan.gpu_route_indices,
                 gpu_m_sizes=plan.gpu_m_sizes,
@@ -213,7 +324,7 @@ def heterogeneous_moe_forward(
     if has_gpu_work:
         gpu_token_indices, gpu_expert_out_save, gpu_gather_ms, gpu_compute_ms = _run_gpu_cached_expert_path(
             hidden_states=hidden_states,
-            flat_weights=flat_weights,
+            flat_weights=effective_flat_weights,
             top_k=top_k,
             gpu_route_indices=plan.gpu_route_indices,
             gpu_m_sizes=plan.gpu_m_sizes,
@@ -409,6 +520,31 @@ def _accumulate_mixed_routes_deterministic(
     elif has_gpu:
         token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
         output.add_(token_output.to(dtype=output.dtype))
+
+
+def _accumulate_graph_cpu_route_deltas(
+    output: torch.Tensor,
+    top_k: int,
+    gpu_route_indices: torch.Tensor,
+    gpu_expert_out: torch.Tensor,
+    cpu_route_deltas: torch.Tensor,
+) -> None:
+    """Accumulate fixed-shape graph CPU route deltas without overwriting GPU rows.
+
+    The fused CPU graph backend returns a route-major tensor with zeros for
+    non-CPU routes. The graph-safe plan also runs every route on the GPU side,
+    with CPU-selected route weights zeroed. Therefore CPU output must be added
+    to the route buffer as deltas; using index_copy_ over all route indices
+    would overwrite valid non-CPU GPU routes with zero CPU rows.
+    """
+    num_tokens, hidden_dim = output.shape
+    num_routes = num_tokens * top_k
+    route_buffer = _get_route_buffer_cache().get(num_routes, hidden_dim, output.dtype, output.device)
+    if gpu_route_indices.numel() > 0:
+        route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out.to(dtype=output.dtype))
+    route_buffer.add_(cpu_route_deltas.to(dtype=output.dtype, device=output.device))
+    token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+    output.add_(token_output.to(dtype=output.dtype))
 
 
 def _run_gpu_cached_expert_path(

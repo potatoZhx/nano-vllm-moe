@@ -70,6 +70,95 @@ class TestPlacementSpec(unittest.TestCase):
         self.assertIsNotNone(plan.cpu_route_indices)
         self.assertEqual(plan.cpu_route_indices.tolist(), [2])
 
+    def test_draft_plan_graph_safe_topc_keeps_fixed_routes(self):
+        cache = self._build_cache()
+        selected = torch.tensor([0, 4, 5, 2], dtype=torch.int64)
+        routing_w = torch.tensor([[0.9, 0.1], [0.6, 0.4]], dtype=torch.float32)
+        scheduler = SimpleDraftScheduler()
+        plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=1,
+            graph_safe_cpu=True,
+        )
+        eager_plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=1,
+            graph_safe_cpu=False,
+        )
+
+        self.assertTrue(plan.cpu_graph_enabled)
+        self.assertEqual(plan.gpu_route_indices.numel(), selected.numel())
+        self.assertEqual(plan.cpu_route_indices.tolist(), [0, 1, 2, 3])
+        self.assertEqual(plan.cpu_route_mask.tolist(), [False, False, True, False])
+        self.assertTrue(torch.equal(plan.substitution_lut, eager_plan.substitution_lut))
+        self.assertEqual(int(plan.substitution_lut[4].item()), 0)
+        self.assertIsNotNone(plan.gpu_route_weights)
+        self.assertEqual(float(plan.gpu_route_weights[2].item()), 0.0)
+        self.assertIsNone(plan.cpu_task_expert_ids_host)
+        self.assertIsNone(plan.cpu_task_offsets_host)
+
+    def test_draft_plan_graph_async_uses_topc0_gpu_fallback(self):
+        cache = self._build_cache()
+        selected = torch.tensor([0, 4, 5, 2], dtype=torch.int64)
+        routing_w = torch.tensor([[0.9, 0.1], [0.6, 0.4]], dtype=torch.float32)
+        scheduler = SimpleDraftScheduler()
+        topc0_plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=0,
+        )
+        plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=1,
+            graph_safe_cpu=True,
+            graph_async_cpu=True,
+        )
+
+        self.assertTrue(plan.cpu_graph_enabled)
+        self.assertTrue(plan.cpu_graph_async)
+        self.assertIsNone(plan.gpu_route_weights)
+        self.assertEqual(plan.cpu_route_mask.tolist(), [False, False, True, False])
+        self.assertTrue(torch.equal(plan.substitution_lut, topc0_plan.substitution_lut))
+        self.assertTrue(torch.equal(plan.flat_selected_effective, topc0_plan.flat_selected_effective))
+
+    def test_draft_plan_graph_safe_topc_ignores_inactive_bucket_rows(self):
+        cache = self._build_cache()
+        selected = torch.tensor([[0, 4], [5, 6]], dtype=torch.int64)
+        routing_w = torch.tensor([[0.9, 0.1], [100.0, 0.2]], dtype=torch.float32)
+        scheduler = SimpleDraftScheduler()
+        plan = build_draft_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            draft_scheduler=scheduler,
+            num_experts=8,
+            top_c=1,
+            graph_safe_cpu=True,
+            active_token_mask=torch.tensor([True, False]),
+        )
+
+        self.assertEqual(plan.cpu_route_mask.tolist(), [False, True, False, False])
+
     def test_draft_plan_topc_zero_prefers_gpu_substitution(self):
         cache = self._build_cache()
         selected = torch.tensor([0, 4, 5, 2], dtype=torch.int64)

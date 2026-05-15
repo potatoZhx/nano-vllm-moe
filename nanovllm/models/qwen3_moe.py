@@ -25,6 +25,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
+from nanovllm.utils.context import get_context
 
 if TYPE_CHECKING:
     from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
@@ -305,6 +306,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_parallel_mode = "serial"
         self.cpu_expert_num_threads = 4
         self.cpu_expert_backend_name = "torch"
+        self.draft_cuda_graph_cpu_backend = "none"
+        self.draft_cpu_graph_mode = False
         self.cpu_expert_packed_min_routes = 32
         self.cpu_backend: TorchPackedCpuMoeBackend | None = None
         self.cpu_gpu_parallel_execution_enabled = "auto"
@@ -322,6 +325,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
         cpu_expert_backend: str = "torch",
+        draft_cuda_graph_cpu_backend: str = "none",
         cpu_expert_workspace_max_routes: int = 8192,
         cpu_expert_packed_min_routes: int = 32,
         cpu_expert_strict_dtype: bool = True,
@@ -340,6 +344,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_expert_parallel_mode = cpu_expert_parallel_mode
         self.cpu_expert_num_threads = int(cpu_expert_num_threads)
         self.cpu_expert_backend_name = cpu_expert_backend
+        self.draft_cuda_graph_cpu_backend = str(draft_cuda_graph_cpu_backend)
         self.cpu_expert_packed_min_routes = int(cpu_expert_packed_min_routes)
         self.gpu_fallback_workspace = gpu_fallback_workspace
         if cpu_expert_backend == "torch_packed":
@@ -402,6 +407,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
     ) -> None:
         self.runtime_meta_recorder = recorder
 
+    def set_draft_cpu_graph_mode(self, enabled: bool) -> None:
+        self.draft_cpu_graph_mode = bool(enabled)
+
     def _get_parallel_stream(self) -> torch.cuda.Stream | None:
         if self.cpu_gpu_parallel_execution_enabled == "off":
             return None
@@ -434,6 +442,26 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         if self.execution_mode == "draft":
             if self.draft_scheduler is None:
                 raise RuntimeError("Draft execution requires a draft scheduler.")
+            graph_safe_cpu = (
+                self.draft_cpu_graph_mode
+                and self.draft_top_c > 0
+                and self.cpu_expert_backend_name == "fused"
+                and self.draft_cuda_graph_cpu_backend in {"fused", "fused_sync"}
+                and self.cpu_backend is not None
+                and hasattr(self.cpu_backend, "forward_graph")
+            )
+            active_token_mask = None
+            if graph_safe_cpu:
+                context = get_context()
+                if context.slot_mapping is not None:
+                    active_token_mask = context.slot_mapping[: hidden_states.shape[0]].ge(0)
+            async_sidecar_enabled = os.getenv(
+                "NANOVLLM_DRAFT_GRAPH_FUSED_ASYNC_SIDE_COMPUTE",
+                "0",
+            ).strip().lower() in {"1", "true", "yes", "y", "on"}
+            use_graph_cpu_plan = graph_safe_cpu and (
+                self.draft_cuda_graph_cpu_backend == "fused_sync" or async_sidecar_enabled
+            )
             plan = build_draft_plan_gpu(
                 layer_idx=self.layer_idx,
                 selected_experts=selected_experts,
@@ -441,7 +469,10 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 expert_cache=self.expert_cache,
                 draft_scheduler=self.draft_scheduler,
                 num_experts=self.num_experts,
-                top_c=self.draft_top_c,
+                top_c=self.draft_top_c if use_graph_cpu_plan else 0,
+                graph_safe_cpu=use_graph_cpu_plan,
+                graph_async_cpu=(self.draft_cuda_graph_cpu_backend == "fused" and async_sidecar_enabled),
+                active_token_mask=active_token_mask if use_graph_cpu_plan else None,
             )
         elif self.execution_mode == "verify":
             plan = build_verify_plan_gpu(
@@ -487,6 +518,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             "cpu_route_ratio_sum" not in profile
             or "cpu_weight_mass_ratio_sum" not in profile
             or "realized_cpu_expert_count_sum" not in profile
+            or "cpu_routes_sum" not in profile
         ):
             if plan is not None and plan.cpu_route_indices is not None and plan.cpu_route_indices.numel() > 0:
                 total_routes = float(flat_selected.numel())
@@ -495,6 +527,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 cpu_weight_mass = float(flat_weights.index_select(0, plan.cpu_route_indices).sum().item())
                 total_weight_mass = float(flat_weights.sum().item())
                 profile["cpu_route_ratio_sum"] = cpu_routes / total_routes if total_routes > 0 else 0.0
+                profile["cpu_routes_sum"] = cpu_routes
                 profile["cpu_weight_mass_ratio_sum"] = (
                     cpu_weight_mass / total_weight_mass if total_weight_mass > 0 else 0.0
                 )
@@ -504,6 +537,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     profile["realized_cpu_expert_count_sum"] = 0.0
             else:
                 profile["cpu_route_ratio_sum"] = 0.0
+                profile["cpu_routes_sum"] = 0.0
                 profile["cpu_weight_mass_ratio_sum"] = 0.0
                 profile["realized_cpu_expert_count_sum"] = 0.0
 
@@ -671,6 +705,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_parallel_mode: str = "serial",
         cpu_expert_num_threads: int = 4,
         cpu_expert_backend: str = "torch",
+        draft_cuda_graph_cpu_backend: str = "none",
         cpu_expert_workspace_max_routes: int = 8192,
         cpu_expert_packed_min_routes: int = 32,
         cpu_expert_strict_dtype: bool = True,
@@ -694,6 +729,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_expert_parallel_mode=cpu_expert_parallel_mode,
                     cpu_expert_num_threads=cpu_expert_num_threads,
                     cpu_expert_backend=cpu_expert_backend,
+                    draft_cuda_graph_cpu_backend=draft_cuda_graph_cpu_backend,
                     cpu_expert_workspace_max_routes=cpu_expert_workspace_max_routes,
                     cpu_expert_packed_min_routes=cpu_expert_packed_min_routes,
                     cpu_expert_strict_dtype=cpu_expert_strict_dtype,
@@ -716,6 +752,18 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_speculative_execution(mode, draft_scheduler, draft_top_c)
+
+    def set_draft_cpu_graph_mode(self, enabled: bool) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                layer.mlp.set_draft_cpu_graph_mode(enabled)
+
+    def check_draft_cpu_graph_errors(self) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                backend = getattr(layer.mlp, "cpu_backend", None)
+                if backend is not None and hasattr(backend, "check_graph_errors"):
+                    backend.check_graph_errors()
 
     def set_runtime_meta_recorder(
         self,

@@ -81,20 +81,25 @@ def _install_verify_layer_probe(sync_layer_timing: bool) -> None:
             if SYNC_LAYER_TIMING and torch.cuda.is_available():
                 torch.cuda.synchronize()
             prof = dict(getattr(self, "_last_profile", {}) or {})
+            cpu_routes = int(round(float(prof.get("cpu_routes_sum", 0.0))))
+            cpu_compute_ms = float(prof.get("cpu_compute_ms", 0.0))
+            per_route_cpu_compute_ms = cpu_compute_ms / float(cpu_routes) if cpu_routes > 0 else 0.0
             VERIFY_LAYER_EVENTS.append(
                 {
                     "layer_idx": int(getattr(self, "layer_idx", -1)),
                     "token_count": int(hidden_states.shape[0]),
                     "total_expert_count": int(round(float(prof.get("activated_expert_set_size_sum", 0.0)))),
                     "cpu_expert_count": int(round(float(prof.get("realized_cpu_expert_count_sum", 0.0)))),
+                    "cpu_route_count": cpu_routes,
                     "layer_moe_wall_ms": (perf_counter() - t0) * 1000.0,
                     "route_ms": float(prof.get("route_ms", 0.0)),
                     "plan_ms": float(prof.get("plan_ms", 0.0)),
                     "gpu_compute_ms": float(prof.get("gpu_compute_ms", 0.0)),
                     "cpu_prepare_ms": float(prof.get("cpu_prepare_ms", 0.0)),
-                    "cpu_compute_ms": float(prof.get("cpu_compute_ms", 0.0)),
+                    "cpu_compute_ms": cpu_compute_ms,
                     "cpu_to_gpu_merge_ms": float(prof.get("cpu_to_gpu_merge_ms", 0.0)),
                     "cpu_route_ratio": float(prof.get("cpu_route_ratio_sum", 0.0)),
+                    "per_route_cpu_compute_ms": per_route_cpu_compute_ms,
                 }
             )
         return out
@@ -126,6 +131,7 @@ def _hist_by(events: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[s
         row["percent"] = float(len(group) / total * 100.0) if total else 0.0
         row["layer_moe_wall"] = _stat([float(x["layer_moe_wall_ms"]) for x in group])
         row["cpu_compute"] = _stat([float(x["cpu_compute_ms"]) for x in group])
+        row["per_route_cpu_compute"] = _stat([float(x.get("per_route_cpu_compute_ms", 0.0)) for x in group])
         row["gpu_compute"] = _stat([float(x["gpu_compute_ms"]) for x in group])
         row["plan"] = _stat([float(x["plan_ms"]) for x in group])
         row["route"] = _stat([float(x["route_ms"]) for x in group])
@@ -166,6 +172,7 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
 def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> dict[str, Any]:
     ep = raw.get("engine_profile", {})
     pair_hist = _hist_by(layer_events, ("total_expert_count", "cpu_expert_count"))
+    triple_hist = _hist_by(layer_events, ("total_expert_count", "cpu_expert_count", "cpu_route_count"))
     total_hist = _hist_by(layer_events, ("total_expert_count",))
     cpu_hist = _hist_by(layer_events, ("cpu_expert_count",))
     verify_calls = int(ep.get("spec_run_verify_calls", 0) or 0)
@@ -206,6 +213,7 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
         "hist_by_total_and_cpu_experts": pair_hist,
         "hist_by_total_experts": total_hist,
         "hist_by_cpu_experts": cpu_hist,
+        "hist_by_total_cpu_and_routes": triple_hist,
     }
 
 
@@ -410,6 +418,29 @@ def _write_markdown(summary: dict[str, Any], path: Path) -> None:
                 f"{row['frequency']} | {row['percent']:.2f} | "
                 f"{wall['avg_ms']:.3f}/{wall['min_ms']:.3f}/{wall['max_ms']:.3f} | "
                 f"{cpu['avg_ms']:.3f}/{cpu['min_ms']:.3f}/{cpu['max_ms']:.3f} | "
+                f"{gpu['avg_ms']:.3f}/{gpu['min_ms']:.3f}/{gpu['max_ms']:.3f} |"
+            )
+        lines.extend(
+            [
+                "",
+                "### By total experts, CPU experts, and CPU routes (key for CPU compute stability)",
+                "",
+                "| total experts | CPU experts | CPU routes | freq | percent | layer wall avg/min/max ms | CPU compute avg/min/max ms | per-route CPU compute avg/min/max ms | gpu compute avg/min/max ms |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in case["hist_by_total_cpu_and_routes"]:
+            wall = row["layer_moe_wall"]
+            cpu = row["cpu_compute"]
+            per_route_cpu = row["per_route_cpu_compute"]
+            gpu = row["gpu_compute"]
+            lines.append(
+                "| "
+                f"{row['total_expert_count']} | {row['cpu_expert_count']} | "
+                f"{row['cpu_route_count']} | {row['frequency']} | {row['percent']:.2f} | "
+                f"{wall['avg_ms']:.3f}/{wall['min_ms']:.3f}/{wall['max_ms']:.3f} | "
+                f"{cpu['avg_ms']:.3f}/{cpu['min_ms']:.3f}/{cpu['max_ms']:.3f} | "
+                f"{per_route_cpu['avg_ms']:.3f}/{per_route_cpu['min_ms']:.3f}/{per_route_cpu['max_ms']:.3f} | "
                 f"{gpu['avg_ms']:.3f}/{gpu['min_ms']:.3f}/{gpu['max_ms']:.3f} |"
             )
         lines.extend(

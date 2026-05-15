@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable
@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 
 from nanovllm.layers.fuse_moe.cpu_workspace import CpuMoeWorkspace
+from nanovllm.layers.fuse_moe.cuda_host_callback import (
+    launch_host_callback,
+    register_host_callback,
+)
 
 
 @dataclass
@@ -18,6 +22,31 @@ class CpuMoeResult:
     outputs_cpu: torch.Tensor
     prep_ms: float
     compute_ms: float
+
+
+@dataclass
+class _FusedGraphState:
+    batch_size: int
+    top_k: int
+    hidden_size: int
+    intermediate_size: int
+    dtype: torch.dtype
+    device: torch.device
+    hidden_cpu: torch.Tensor
+    topk_ids_cpu: torch.Tensor
+    weights_cpu: torch.Tensor
+    route_mask_cpu: torch.Tensor
+    outputs_cpu: torch.Tensor
+    outputs_gpu: torch.Tensor
+    route_indices_gpu: torch.Tensor
+    gate_up_buf: torch.Tensor
+    act_buf: torch.Tensor
+    out_buf: torch.Tensor
+    submit_callback_id: int = 0
+    async_submit_callback_id: int = 0
+    sync_callback_id: int = 0
+    future: Future | None = None
+    error: BaseException | None = None
 
 
 def _resolve_dynamic_parallel_mode(
@@ -280,7 +309,9 @@ class FusedTorchCpuMoeBackend:
         self.strict_dtype = bool(strict_dtype)
         self.workspace: CpuMoeWorkspace | None = None
         self._thread_pool: ThreadPoolExecutor | None = None
+        self._graph_worker: ThreadPoolExecutor | None = None
         self._num_workers = 0
+        self._graph_states: dict[tuple[int, torch.dtype, torch.device], _FusedGraphState] = {}
 
     def _ensure_thread_pool(self, num_workers: int) -> ThreadPoolExecutor:
         if self._thread_pool is None or self._num_workers != num_workers:
@@ -310,6 +341,331 @@ class FusedTorchCpuMoeBackend:
             )
             self.workspace = workspace
         return workspace
+
+    def _ensure_graph_worker(self) -> ThreadPoolExecutor:
+        if self._graph_worker is None:
+            self._graph_worker = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"fused-graph-cpu-moe-l{self.layer_idx}",
+            )
+        return self._graph_worker
+
+    def _get_graph_state(
+        self,
+        *,
+        batch_size: int,
+        top_k: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> _FusedGraphState:
+        key = (int(batch_size), dtype, device)
+        state = self._graph_states.get(key)
+        if state is not None and state.top_k == int(top_k) and state.hidden_size == int(hidden_size):
+            return state
+
+        num_routes = int(batch_size) * int(top_k)
+        state = _FusedGraphState(
+            batch_size=int(batch_size),
+            top_k=int(top_k),
+            hidden_size=int(hidden_size),
+            intermediate_size=self.intermediate_size,
+            dtype=dtype,
+            device=device,
+            hidden_cpu=torch.empty(
+                (batch_size, hidden_size),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=True,
+            ),
+            topk_ids_cpu=torch.empty(
+                (num_routes,),
+                device="cpu",
+                dtype=torch.int64,
+                pin_memory=True,
+            ),
+            weights_cpu=torch.empty(
+                (num_routes,),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=True,
+            ),
+            route_mask_cpu=torch.empty(
+                (num_routes,),
+                device="cpu",
+                dtype=torch.bool,
+                pin_memory=True,
+            ),
+            outputs_cpu=torch.empty(
+                (num_routes, hidden_size),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=True,
+            ),
+            outputs_gpu=torch.empty(
+                (num_routes, hidden_size),
+                device=device,
+                dtype=dtype,
+            ),
+            route_indices_gpu=torch.arange(
+                num_routes,
+                device=device,
+                dtype=torch.int64,
+            ),
+            gate_up_buf=torch.empty(
+                (num_routes, self.intermediate_size * 2),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=False,
+            ),
+            act_buf=torch.empty(
+                (num_routes, self.intermediate_size),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=False,
+            ),
+            out_buf=torch.empty(
+                (num_routes, hidden_size),
+                device="cpu",
+                dtype=dtype,
+                pin_memory=False,
+            ),
+        )
+        state.submit_callback_id = register_host_callback(lambda s=state: self._submit_graph_state(s))
+        state.async_submit_callback_id = register_host_callback(lambda s=state: self._submit_graph_state_async_sidecar(s))
+        state.sync_callback_id = register_host_callback(lambda s=state: self._sync_graph_state(s))
+        self._graph_states[key] = state
+        return state
+
+    def _submit_graph_state(self, state: _FusedGraphState) -> None:
+        try:
+            if state.future is not None and not state.future.done():
+                state.future.result()
+            state.error = None
+            state.future = self._ensure_graph_worker().submit(self._compute_graph_state, state)
+        except BaseException as exc:
+            state.error = exc
+
+    def _submit_graph_state_async_sidecar(self, state: _FusedGraphState) -> None:
+        try:
+            if state.future is not None:
+                if not state.future.done():
+                    return
+                state.future.result()
+            state.error = None
+            hidden_cpu = state.hidden_cpu.clone()
+            topk_ids_cpu = state.topk_ids_cpu.clone()
+            weights_cpu = state.weights_cpu.clone()
+            route_mask_cpu = state.route_mask_cpu.clone()
+            state.future = self._ensure_graph_worker().submit(
+                self._compute_graph_sidecar,
+                hidden_cpu,
+                topk_ids_cpu,
+                weights_cpu,
+                route_mask_cpu,
+                state.top_k,
+                state.hidden_size,
+                state.intermediate_size,
+                state.dtype,
+            )
+        except BaseException as exc:
+            state.error = exc
+
+    def _sync_graph_state(self, state: _FusedGraphState) -> None:
+        try:
+            if state.future is not None:
+                state.future.result()
+        except BaseException as exc:
+            state.error = exc
+
+    def _compute_graph_sidecar(
+        self,
+        hidden_cpu: torch.Tensor,
+        topk_ids_cpu: torch.Tensor,
+        weights_cpu: torch.Tensor,
+        route_mask_cpu: torch.Tensor,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        compute_dtype: torch.dtype,
+    ) -> None:
+        with torch.inference_mode():
+            active = torch.nonzero(route_mask_cpu, as_tuple=False).flatten()
+            if active.numel() == 0:
+                return
+
+            max_routes = int(topk_ids_cpu.numel())
+            gate_up_buf = torch.empty(
+                (max_routes, intermediate_size * 2),
+                device="cpu",
+                dtype=compute_dtype,
+            )
+            act_buf = torch.empty(
+                (max_routes, intermediate_size),
+                device="cpu",
+                dtype=compute_dtype,
+            )
+            out_buf = torch.empty(
+                (max_routes, hidden_size),
+                device="cpu",
+                dtype=compute_dtype,
+            )
+
+            active_experts = topk_ids_cpu.index_select(0, active).unique(sorted=True)
+            for expert_tensor in active_experts:
+                expert_idx = int(expert_tensor.item())
+                expert_mask = route_mask_cpu & topk_ids_cpu.eq(expert_idx)
+                route_pos = torch.nonzero(expert_mask, as_tuple=False).flatten()
+                if route_pos.numel() == 0:
+                    continue
+
+                gate_up_w, down_w = get_cpu_expert_weights(
+                    self.cpu_expert_pool,
+                    expert_idx,
+                    compute_dtype,
+                    strict_packed_dtype=self.strict_dtype,
+                )
+                m = int(route_pos.numel())
+                token_pos = torch.div(route_pos, int(top_k), rounding_mode="floor")
+                hidden = hidden_cpu.index_select(0, token_pos)
+                route_weights = weights_cpu.index_select(0, route_pos)
+
+                gate_up = gate_up_buf[:m]
+                act_out = act_buf[:m]
+                expert_out = out_buf[:m]
+
+                torch.mm(hidden, gate_up_w.t(), out=gate_up)
+                gate = gate_up[:, :intermediate_size]
+                up = gate_up[:, intermediate_size:]
+                torch.sigmoid(gate, out=act_out)
+                act_out.mul_(gate)
+                act_out.mul_(up)
+                torch.mm(act_out, down_w.t(), out=expert_out)
+                expert_out.mul_(route_weights.unsqueeze(-1))
+
+    def _compute_graph_state(self, state: _FusedGraphState) -> None:
+        compute_dtype = state.dtype
+        with torch.inference_mode():
+            state.outputs_cpu.zero_()
+            active = torch.nonzero(state.route_mask_cpu, as_tuple=False).flatten()
+            if active.numel() == 0:
+                return
+
+            active_experts = state.topk_ids_cpu.index_select(0, active).unique(sorted=True)
+            for expert_tensor in active_experts:
+                expert_idx = int(expert_tensor.item())
+                expert_mask = state.route_mask_cpu & state.topk_ids_cpu.eq(expert_idx)
+                route_pos = torch.nonzero(expert_mask, as_tuple=False).flatten()
+                if route_pos.numel() == 0:
+                    continue
+
+                gate_up_w, down_w = get_cpu_expert_weights(
+                    self.cpu_expert_pool,
+                    expert_idx,
+                    compute_dtype,
+                    strict_packed_dtype=self.strict_dtype,
+                )
+                m = int(route_pos.numel())
+                token_pos = torch.div(route_pos, state.top_k, rounding_mode="floor")
+                hidden = state.hidden_cpu.index_select(0, token_pos)
+                route_weights = state.weights_cpu.index_select(0, route_pos)
+
+                gate_up = state.gate_up_buf[:m]
+                act_out = state.act_buf[:m]
+                expert_out = state.out_buf[:m]
+                interm = state.intermediate_size
+
+                torch.mm(hidden, gate_up_w.t(), out=gate_up)
+                gate = gate_up[:, :interm]
+                up = gate_up[:, interm:]
+                torch.sigmoid(gate, out=act_out)
+                act_out.mul_(gate)
+                act_out.mul_(up)
+                torch.mm(act_out, down_w.t(), out=expert_out)
+                expert_out.mul_(route_weights.unsqueeze(-1))
+                state.outputs_cpu.index_copy_(0, route_pos, expert_out)
+
+    def check_graph_errors(self) -> None:
+        for state in self._graph_states.values():
+            if state.future is not None and state.future.done():
+                try:
+                    state.future.result()
+                except BaseException as exc:
+                    state.error = exc
+            if state.error is not None:
+                error = state.error
+                state.error = None
+                raise RuntimeError(
+                    f"Fused graph CPU MoE backend failed on layer {self.layer_idx}"
+                ) from error
+
+    @torch.no_grad()
+    def begin_forward_graph(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+        cpu_route_mask: torch.Tensor,
+        top_k: int,
+        async_sidecar: bool = False,
+    ) -> CpuMoeResult:
+        if not hidden_states.is_cuda:
+            raise RuntimeError("Fused graph CPU MoE backend requires CUDA hidden states")
+
+        batch_size = int(hidden_states.shape[0])
+        hidden_size = int(hidden_states.shape[-1])
+        state = self._get_graph_state(
+            batch_size=batch_size,
+            top_k=int(top_k),
+            hidden_size=hidden_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        flat_ids = selected_experts.reshape(-1).to(torch.int64)
+        flat_weights = routing_weights.reshape(-1).to(dtype=hidden_states.dtype)
+        flat_mask = cpu_route_mask.reshape(-1).to(torch.bool)
+        state.hidden_cpu.copy_(hidden_states.contiguous(), non_blocking=True)
+        state.topk_ids_cpu.copy_(flat_ids, non_blocking=True)
+        state.weights_cpu.copy_(flat_weights, non_blocking=True)
+        state.route_mask_cpu.copy_(flat_mask, non_blocking=True)
+
+        stream = torch.cuda.current_stream(hidden_states.device).cuda_stream
+        callback_id = state.async_submit_callback_id if async_sidecar else state.submit_callback_id
+        launch_host_callback(stream, callback_id)
+        return state
+
+    def finish_forward_graph(self, state: _FusedGraphState) -> CpuMoeResult:
+        stream = torch.cuda.current_stream(state.device).cuda_stream
+        launch_host_callback(stream, state.sync_callback_id)
+        state.outputs_gpu.copy_(state.outputs_cpu, non_blocking=True)
+
+        return CpuMoeResult(
+            token_indices=state.route_indices_gpu,
+            outputs_cpu=state.outputs_gpu,
+            prep_ms=0.0,
+            compute_ms=0.0,
+        )
+
+    @torch.no_grad()
+    def forward_graph(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+        cpu_route_mask: torch.Tensor,
+        top_k: int,
+    ) -> CpuMoeResult:
+        state = self.begin_forward_graph(
+            hidden_states=hidden_states,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            cpu_route_mask=cpu_route_mask,
+            top_k=top_k,
+        )
+        return self.finish_forward_graph(state)
 
     @torch.no_grad()
     def forward(
