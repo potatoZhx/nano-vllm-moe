@@ -530,17 +530,9 @@ class FusedTorchCpuMoeBackend:
                 hidden = hidden_cpu.index_select(0, token_pos)
                 route_weights = weights_cpu.index_select(0, route_pos)
 
-                gate_up = gate_up_buf[:m]
-                act_out = act_buf[:m]
-                expert_out = out_buf[:m]
-
-                torch.mm(hidden, gate_up_w.t(), out=gate_up)
-                gate = gate_up[:, :intermediate_size]
-                up = gate_up[:, intermediate_size:]
-                torch.sigmoid(gate, out=act_out)
-                act_out.mul_(gate)
-                act_out.mul_(up)
-                torch.mm(act_out, down_w.t(), out=expert_out)
+                gate_up = F.linear(hidden, gate_up_w)
+                act_out = F.silu(gate_up[:, :intermediate_size]) * gate_up[:, intermediate_size:]
+                expert_out = F.linear(act_out, down_w)
                 expert_out.mul_(route_weights.unsqueeze(-1))
 
     def _compute_graph_state(self, state: _FusedGraphState) -> None:
@@ -570,18 +562,10 @@ class FusedTorchCpuMoeBackend:
                 hidden = state.hidden_cpu.index_select(0, token_pos)
                 route_weights = state.weights_cpu.index_select(0, route_pos)
 
-                gate_up = state.gate_up_buf[:m]
-                act_out = state.act_buf[:m]
-                expert_out = state.out_buf[:m]
+                gate_up = F.linear(hidden, gate_up_w)
                 interm = state.intermediate_size
-
-                torch.mm(hidden, gate_up_w.t(), out=gate_up)
-                gate = gate_up[:, :interm]
-                up = gate_up[:, interm:]
-                torch.sigmoid(gate, out=act_out)
-                act_out.mul_(gate)
-                act_out.mul_(up)
-                torch.mm(act_out, down_w.t(), out=expert_out)
+                act_out = F.silu(gate_up[:, :interm]) * gate_up[:, interm:]
+                expert_out = F.linear(act_out, down_w)
                 expert_out.mul_(route_weights.unsqueeze(-1))
                 state.outputs_cpu.index_copy_(0, route_pos, expert_out)
 
@@ -752,18 +736,8 @@ class FusedTorchCpuMoeBackend:
             o_slice = outputs_cpu[start:end]
             I = self.intermediate_size
 
-            gate_up = gate_up_buf[start:end]
-            act_out = act_buf[start:end]
-            expert_out = out_buf[start:end]
-
-            # SiluAndMul computes silu(first_half) * second_half.
-            torch.mm(h_chunk, gate_up_w.t(), out=gate_up)
-            gate = gate_up[:, :I]
-            up = gate_up[:, I:]
-            torch.sigmoid(gate, out=act_out)
-            act_out.mul_(gate)
-            act_out.mul_(up)
-            torch.mm(act_out, down_w.t(), out=expert_out)
+            gate_up = F.linear(h_chunk, gate_up_w)
+            expert_out = F.linear(act_fn(gate_up), down_w)
             expert_out.mul_(w_chunk.unsqueeze(-1))
             o_slice.copy_(expert_out)
 

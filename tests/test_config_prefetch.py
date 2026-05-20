@@ -20,6 +20,8 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.prefetch_strategy, "history_window")
         self.assertEqual(cfg.prefetch_runtime_mode, "baseline_staging")
         self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
+        self.assertTrue(cfg.prefetch_verify_layer_enabled)
+        self.assertGreater(cfg.prefetch_verify_layer_transfer_bandwidth_gbps, 0.0)
 
     def test_draft_cuda_graph_cpu_backend_accepts_fused(self):
         cfg = self._build_config(
@@ -61,6 +63,14 @@ class TestConfigPrefetch(unittest.TestCase):
                 enable_heterogeneous=True,
                 inference_mode="heter",
                 prefetch_history_decay=1.5,
+            )
+
+    def test_invalid_verify_layer_prefetch_bandwidth_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="heter",
+                prefetch_verify_layer_transfer_bandwidth_gbps=0.0,
             )
 
 

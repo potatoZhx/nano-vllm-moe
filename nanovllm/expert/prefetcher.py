@@ -3,11 +3,12 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from math import isfinite
 
 import torch
 
 from nanovllm.config import Config
-from nanovllm.expert.cache import LayerExpertCache, PublishedExpert, StagingReservation
+from nanovllm.expert.cache import ActiveReservation, LayerExpertCache, PublishedExpert, StagingReservation
 from nanovllm.expert.runtime_meta import LayerRuntimeMetaCPU, ModelRuntimeMetaRecorder
 from nanovllm.scheduling.cache_strategy import CacheStrategy
 from nanovllm.scheduling.prefetch_strategy import PrefetchStrategy
@@ -36,6 +37,10 @@ class PrefetchTicket:
     submit_ts_ms: float
     ready_event: object
     ready: bool = False
+    direct_active: bool = False
+    active_slot_idx: int = -1
+    active_generation: int = -1
+    active_slot_prev_expert: int = -1  # expert evicted by this prefetch (-1 if slot was empty)
 
 
 def compute_priority(
@@ -369,9 +374,177 @@ class PrefetchRuntime:
 
         return submitted
 
+    def _estimated_expert_transfer_ms(self, weights: dict[str, torch.Tensor]) -> float:
+        bandwidth_gbps = float(getattr(self.config, "prefetch_verify_layer_transfer_bandwidth_gbps", 12.0))
+        if bandwidth_gbps <= 0.0:
+            return float("inf")
+        gate_up = weights.get("gate_up")
+        down = weights.get("down")
+        if gate_up is None or down is None:
+            return float("inf")
+        num_bytes = int(gate_up.numel() * gate_up.element_size() + down.numel() * down.element_size())
+        return (float(num_bytes) / (bandwidth_gbps * 1_000_000_000.0)) * 1000.0
+
+    def _select_publish_slot(
+        self,
+        cache: LayerExpertCache,
+        *,
+        layer_idx: int,
+        expert_idx: int,
+        step_id: int,
+    ) -> int | None:
+        snapshot = cache.snapshot(layer_idx=layer_idx)
+        victim_slot = self.cache_strategy.select_victim_slot(
+            snapshot=snapshot,
+            incoming_expert_idx=expert_idx,
+            step_id=step_id,
+        )
+        if victim_slot is not None and not cache.is_active_slot_pending(int(victim_slot)):
+            return int(victim_slot)
+
+        slot_to_expert = snapshot.slot_to_expert_lut.tolist()
+        for slot_idx, slot_expert in enumerate(slot_to_expert):
+            if slot_expert < 0 and not cache.is_active_slot_pending(slot_idx):
+                return slot_idx
+        for slot_idx, _ in enumerate(slot_to_expert):
+            if not cache.is_active_slot_pending(slot_idx):
+                return slot_idx
+        return None
+
+    def _select_empty_publish_slot(
+        self,
+        cache: LayerExpertCache,
+    ) -> int | None:
+        """Select an empty (expert=-1), non-pending slot without evicting.
+
+        Used by verify-layer prefetch to avoid changing cache residency,
+        which would break deterministic output between prefetch-ON and
+        prefetch-OFF runs.
+        """
+        # Use live lookup, not snapshot, to match current GPU LUT state.
+        slot_to_expert = cache.slot_to_expert_lut.tolist()
+        for slot_idx, slot_expert in enumerate(slot_to_expert):
+            if int(slot_expert) < 0 and not cache.is_active_slot_pending(slot_idx):
+                return slot_idx
+        return None
+
+    def submit_verify_layer_prefetch(
+        self,
+        *,
+        step_id: int,
+        target_layer_idx: int,
+        available_ms: float,
+    ) -> int:
+        if not bool(getattr(self.config, "prefetch_verify_layer_enabled", True)):
+            return 0
+        if int(self.config.prefetch_step_budget) <= 0:
+            return 0
+        if available_ms <= 0.0:
+            return 0
+
+        layer_idx = int(target_layer_idx)
+        cache = self.layer_caches.get(layer_idx)
+        if cache is None:
+            return 0
+
+        self.publish_direct_active_ready(step_id=step_id)
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        if inflight_budget <= 0:
+            return 0
+
+        inflight_keys = set(self.inflight.keys())
+        ranked = self.global_queue.ranked_candidates(
+            step_id=step_id,
+            layer_caches=self.layer_caches,
+            inflight_keys=inflight_keys,
+        )
+        ranked = [c for c in self.prefetch_strategy.rank(ranked, step_id=step_id) if int(c.layer_idx) == layer_idx]
+        if not ranked:
+            return 0
+
+        max_submit = min(
+            max(0, int(self.config.prefetch_step_budget)),
+            max(0, int(getattr(self.config, "prefetch_verify_layer_max_budget", self.config.prefetch_step_budget))),
+            inflight_budget,
+        )
+        submitted = 0
+        used_budget_ms = 0.0
+
+        for candidate in ranked:
+            if submitted >= max_submit:
+                break
+            expert_idx = int(candidate.expert_idx)
+            key = (layer_idx, expert_idx)
+            if cache.is_cached_cpu(expert_idx):
+                continue
+            if key in self.inflight:
+                continue
+
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+
+            transfer_ms = self._estimated_expert_transfer_ms(weights)
+            if not isfinite(transfer_ms):
+                continue
+            if used_budget_ms + transfer_ms > available_ms:
+                self._profile["verify_layer_prefetch_budget_stop_count"] += 1
+                break
+
+            victim_slot = self._select_publish_slot(
+                cache,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                step_id=step_id,
+            )
+            if victim_slot is None:
+                continue
+
+            reservation = cache.reserve_active_slot_for_prefetch(
+                layer_idx=layer_idx,
+                active_slot_idx=victim_slot,
+                expert_idx=expert_idx,
+            )
+            if reservation is None:
+                continue
+
+            ready_event = cache.begin_async_put_to_active(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+
+            self.inflight[key] = PrefetchTicket(
+                step_id=step_id,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source="verify_layer_predict",
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=time.perf_counter() * 1000.0,
+                ready_event=ready_event,
+                ready=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+            )
+            submitted += 1
+            used_budget_ms += transfer_ms
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["verify_layer_prefetch_submit_count"] += 1
+            self._profile["verify_layer_prefetch_est_transfer_ms"] += transfer_ms
+            self._profile["verify_layer_prefetch_available_ms"] += float(available_ms)
+            self._profile["verify_layer_prefetch_used_budget_ms"] += used_budget_ms
+
+        return submitted
+
     def poll_ready_tickets(self) -> list[PrefetchTicket]:
         ready: list[PrefetchTicket] = []
         for key, ticket in list(self.inflight.items()):
+            if ticket.direct_active:
+                continue
             if ticket.ready:
                 ready.append(ticket)
                 continue
@@ -412,10 +585,10 @@ class PrefetchRuntime:
                 break
 
             cache = self.layer_caches[ticket.layer_idx]
-            snapshot = cache.snapshot(layer_idx=ticket.layer_idx)
-            victim_slot = self.cache_strategy.select_victim_slot(
-                snapshot=snapshot,
-                incoming_expert_idx=ticket.expert_idx,
+            victim_slot = self._select_publish_slot(
+                cache,
+                layer_idx=ticket.layer_idx,
+                expert_idx=ticket.expert_idx,
                 step_id=step_id,
             )
             if victim_slot is None:
@@ -445,6 +618,38 @@ class PrefetchRuntime:
         self._profile["publish_ms"] += (time.perf_counter() - t0) * 1000.0
         return published
 
+    def publish_direct_active_ready(self, step_id: int) -> int:
+        t0 = time.perf_counter()
+        published = 0
+        for key, ticket in list(self.inflight.items()):
+            if not ticket.direct_active:
+                continue
+            if not bool(ticket.ready_event.query()):
+                continue
+            cache = self.layer_caches.get(ticket.layer_idx)
+            if cache is None:
+                self.inflight.pop(key, None)
+                continue
+            reservation = ActiveReservation(
+                layer_idx=ticket.layer_idx,
+                active_slot_idx=ticket.active_slot_idx,
+                expert_idx=ticket.expert_idx,
+                generation=ticket.active_generation,
+                prev_expert=ticket.active_slot_prev_expert,
+            )
+            published_item = cache.commit_active_prefetch(reservation)
+            self.inflight.pop(key, None)
+            if published_item is None:
+                self._profile["prefetch_late_count"] += 1
+                continue
+            self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
+            published += 1
+            self._profile["prefetch_completed_count"] += 1
+            self._profile["publish_count"] += 1
+            self._profile["verify_layer_prefetch_publish_count"] += 1
+        self._profile["publish_ms"] += (time.perf_counter() - t0) * 1000.0
+        return published
+
     def _finalize_publish(self, cache: LayerExpertCache, published_item: PublishedExpert) -> None:
         if self.publish_stream is not None:
             torch.cuda.current_stream().wait_stream(self.publish_stream)
@@ -452,12 +657,16 @@ class PrefetchRuntime:
 
     def wait_for_verify(self, step_id: int, timeout_ms: float) -> None:
         t0 = time.perf_counter()
+        self.publish_direct_active_ready(step_id=step_id)
         self.publish_ready(step_id=step_id)
         self._profile["verify_ready_before_wait_count"] += self._count_ready_relevant_experts()
 
         if timeout_ms > 0.0:
             deadline = t0 + timeout_ms / 1000.0
             while time.perf_counter() < deadline:
+                published = self.publish_direct_active_ready(step_id=step_id)
+                if published > 0 or not self.inflight:
+                    break
                 published = self.publish_ready(step_id=step_id)
                 if published > 0 or not self.inflight:
                     break
@@ -578,6 +787,12 @@ class PrefetchRuntime:
             "history_prefetch_submit_count": int(self._profile.get("history_prefetch_submit_count", 0.0)),
             "verify_history_prefetch_submit_count": int(self._profile.get("verify_history_prefetch_submit_count", 0.0)),
             "draft_live_prefetch_submit_count": int(self._profile.get("draft_live_prefetch_submit_count", 0.0)),
+            "verify_layer_prefetch_submit_count": int(self._profile.get("verify_layer_prefetch_submit_count", 0.0)),
+            "verify_layer_prefetch_publish_count": int(self._profile.get("verify_layer_prefetch_publish_count", 0.0)),
+            "verify_layer_prefetch_budget_stop_count": int(self._profile.get("verify_layer_prefetch_budget_stop_count", 0.0)),
+            "verify_layer_prefetch_est_transfer_ms": float(self._profile.get("verify_layer_prefetch_est_transfer_ms", 0.0)),
+            "verify_layer_prefetch_available_ms": float(self._profile.get("verify_layer_prefetch_available_ms", 0.0)),
+            "verify_layer_prefetch_used_budget_ms": float(self._profile.get("verify_layer_prefetch_used_budget_ms", 0.0)),
             "verify_ready_before_wait_count": int(self._profile.get("verify_ready_before_wait_count", 0.0)),
             "verify_ready_after_wait_count": int(self._profile.get("verify_ready_after_wait_count", 0.0)),
         }

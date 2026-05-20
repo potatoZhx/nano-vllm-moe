@@ -45,6 +45,11 @@ class Config:
     prefetch_use_prefill_history: bool = True
     prefetch_use_verify_history: bool = True
     prefetch_use_draft_live: bool = True
+    prefetch_verify_layer_enabled: bool = True
+    prefetch_verify_layer_safety_ratio: float = 0.8
+    prefetch_verify_layer_min_compute_ms: float = 0.05
+    prefetch_verify_layer_transfer_bandwidth_gbps: float = 12.0
+    prefetch_verify_layer_max_budget: int = 2
     prefetch_runtime_mode: str = "baseline_staging"
     spec_profile: bool = False
     engine_profile: bool = False
@@ -113,6 +118,10 @@ class Config:
         assert self.prefetch_global_queue_capacity >= 0
         assert 0.0 <= self.prefetch_history_decay <= 1.0
         assert self.prefetch_history_ttl_steps >= 1
+        assert 0.0 < self.prefetch_verify_layer_safety_ratio <= 1.0
+        assert self.prefetch_verify_layer_min_compute_ms >= 0.0
+        assert self.prefetch_verify_layer_transfer_bandwidth_gbps > 0.0
+        assert self.prefetch_verify_layer_max_budget >= 0
         assert self.prefetch_runtime_mode == "baseline_staging"
         assert self.acceptance_strategy in {"greedy", "standard", "standard_sampling", "sampling", "spec_sampling"}
         assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}

@@ -22,6 +22,15 @@ class StagingReservation:
 
 
 @dataclass
+class ActiveReservation:
+    layer_idx: int
+    active_slot_idx: int
+    expert_idx: int
+    generation: int
+    prev_expert: int = -1  # expert evicted to make room; -1 if slot was empty
+
+
+@dataclass
 class PublishedExpert:
     layer_idx: int
     expert_idx: int
@@ -111,6 +120,7 @@ class LayerExpertCache:
         self.staging_slot_state = [0] * self.num_staging_slots
         self.staging_slot_to_expert = [-1] * self.num_staging_slots
         self.staging_slot_generation = [0] * self.num_staging_slots
+        self.active_slot_pending_expert = [-1] * self.num_slots
 
     def put_to_slot(
         self,
@@ -133,6 +143,7 @@ class LayerExpertCache:
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.active_slot_pending_expert[slot_idx] = -1
         self.slot_generation[slot_idx] += 1
 
     def mark_access(
@@ -315,12 +326,101 @@ class LayerExpertCache:
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.active_slot_pending_expert[slot_idx] = -1
         self.slot_generation[slot_idx] += 1
 
         sidx = published.staging_slot_idx
         if 0 <= sidx < self.num_staging_slots and self.staging_slot_generation[sidx] == published.generation:
             self.staging_slot_state[sidx] = 0
             self.staging_slot_to_expert[sidx] = -1
+
+    def is_active_slot_pending(self, slot_idx: int) -> bool:
+        if not (0 <= slot_idx < self.num_slots):
+            return False
+        return self.active_slot_pending_expert[slot_idx] >= 0
+
+    def reserve_active_slot_for_prefetch(
+        self,
+        layer_idx: int,
+        active_slot_idx: int,
+        expert_idx: int,
+    ) -> ActiveReservation | None:
+        if not (0 <= active_slot_idx < self.num_slots):
+            return None
+        if self.active_slot_pending_expert[active_slot_idx] >= 0:
+            return None
+
+        prev_expert = self.slot_to_expert[active_slot_idx]
+        if prev_expert >= 0 and prev_expert in self.expert_to_slot:
+            del self.expert_to_slot[prev_expert]
+            self.expert_to_slot_lut[prev_expert] = -1
+            self.cached_expert_mask[prev_expert] = False
+
+        self.slot_to_expert[active_slot_idx] = -1
+        self.slot_to_expert_lut[active_slot_idx] = -1
+        self.active_slot_pending_expert[active_slot_idx] = int(expert_idx)
+        self.slot_generation[active_slot_idx] += 1
+        return ActiveReservation(
+            layer_idx=int(layer_idx),
+            active_slot_idx=int(active_slot_idx),
+            expert_idx=int(expert_idx),
+            generation=int(self.slot_generation[active_slot_idx]),
+            prev_expert=int(prev_expert) if prev_expert is not None else -1,
+        )
+
+    def begin_async_put_to_active(
+        self,
+        reservation: ActiveReservation,
+        gate_up_cpu: torch.Tensor,
+        down_cpu: torch.Tensor,
+        stream: torch.cuda.Stream | None,
+    ) -> torch.cuda.Event | _ImmediateEvent:
+        idx = reservation.active_slot_idx
+        if not (0 <= idx < self.num_slots):
+            raise RuntimeError("invalid active prefetch reservation slot")
+        if self.slot_generation[idx] != reservation.generation:
+            raise RuntimeError("stale active prefetch reservation")
+        if self.active_slot_pending_expert[idx] != reservation.expert_idx:
+            raise RuntimeError("invalid active prefetch reservation state")
+
+        target_gate_up = self.gate_up_buffer[idx]
+        target_down = self.down_buffer[idx]
+        if target_gate_up.is_cuda:
+            active_stream = stream if stream is not None else torch.cuda.current_stream()
+            with torch.cuda.stream(active_stream):
+                target_gate_up.copy_(gate_up_cpu, non_blocking=True)
+                target_down.copy_(down_cpu, non_blocking=True)
+                event = torch.cuda.Event(blocking=False)
+                event.record(active_stream)
+            return event
+
+        target_gate_up.copy_(gate_up_cpu)
+        target_down.copy_(down_cpu)
+        return _ImmediateEvent()
+
+    def commit_active_prefetch(self, reservation: ActiveReservation) -> PublishedExpert | None:
+        slot_idx = reservation.active_slot_idx
+        expert_idx = reservation.expert_idx
+        if not (0 <= slot_idx < self.num_slots):
+            return None
+        if self.slot_generation[slot_idx] != reservation.generation:
+            return None
+        if self.active_slot_pending_expert[slot_idx] != expert_idx:
+            return None
+
+        self.slot_to_expert[slot_idx] = expert_idx
+        self.slot_to_expert_lut[slot_idx] = expert_idx
+        self.expert_to_slot[expert_idx] = slot_idx
+        self.expert_to_slot_lut[expert_idx] = slot_idx
+        self.cached_expert_mask[expert_idx] = True
+        self.active_slot_pending_expert[slot_idx] = -1
+        return PublishedExpert(
+            layer_idx=reservation.layer_idx,
+            expert_idx=expert_idx,
+            active_slot_idx=slot_idx,
+            staging_slot_idx=-1,
+            generation=reservation.generation,
+        )
 
     def get_slot_idx(self, expert_idx: int) -> int:
         return self.expert_to_slot.get(expert_idx, -1)

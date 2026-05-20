@@ -93,6 +93,11 @@ class ModelRunner:
         self._prefetch_worker_error: BaseException | None = None
         self._prefetch_worker_thread: threading.Thread | None = None
         self._prefetch_trace_events: list[dict[str, object]] = []
+        self._verify_prefetch_active = False
+        self._current_verify_prefetch_step_id = -1
+        self._verify_layer_compute_ms_ema: dict[int, float] = {}
+        self._verify_layer_timing_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
+        self._verify_layer_active_timing: dict[int, object] = {}
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -265,6 +270,16 @@ class ModelRunner:
             self._prefetch_worker_thread = None
         if not hasattr(self, "_prefetch_trace_events"):
             self._prefetch_trace_events = []
+        if not hasattr(self, "_verify_prefetch_active"):
+            self._verify_prefetch_active = False
+        if not hasattr(self, "_current_verify_prefetch_step_id"):
+            self._current_verify_prefetch_step_id = -1
+        if not hasattr(self, "_verify_layer_compute_ms_ema"):
+            self._verify_layer_compute_ms_ema = {}
+        if not hasattr(self, "_verify_layer_timing_events"):
+            self._verify_layer_timing_events = []
+        if not hasattr(self, "_verify_layer_active_timing"):
+            self._verify_layer_active_timing = {}
 
     def _record_profile(self, key: str, dt_sec: float) -> None:
         self._ensure_prefetch_internal_state()
@@ -647,6 +662,7 @@ class ModelRunner:
         self._ensure_prefetch_internal_state()
         if self.rank != 0:
             return {}
+        self._poll_verify_layer_timing_events()
         self._flush_pending_prefetch_metadata(block=True)
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
@@ -702,7 +718,52 @@ class ModelRunner:
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
+        self._warmup_verify_layer_timings()
         torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def _warmup_verify_layer_timings(self) -> None:
+        self._ensure_prefetch_internal_state()
+        if not bool(getattr(self.config, "prefetch_verify_layer_enabled", True)):
+            return
+        if not getattr(self, "layer_caches", None):
+            return
+        if not hasattr(self.model, "set_verify_prefetch_controller"):
+            return
+
+        verify_tokens = max(1, int(getattr(self.config, "max_draft_tokens", 1)) + 1)
+        verify_tokens = min(verify_tokens, int(self.config.max_model_len))
+        num_seqs = max(1, min(self.config.max_num_seqs, self.config.max_num_batched_tokens // verify_tokens))
+        seqs = [Sequence([0] * verify_tokens) for _ in range(num_seqs)]
+
+        self._set_speculative_execution_mode("verify")
+        self._verify_prefetch_active = True
+        self._current_verify_prefetch_step_id = self._next_prefetch_step_id()
+        self.model.set_verify_prefetch_controller(self)
+        # Suppress prefetch during warmup: collect timing EMAs only, do not
+        # modify GPU cache (publish/submit would permanently change active
+        # slot contents and evict experts, breaking determinism between
+        # prefetch-ON and prefetch-OFF runs).
+        _saved_prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if _saved_prefetch_runtime is not None:
+            self.prefetch_runtime = None  # type: ignore[assignment]
+        try:
+            input_ids, positions = self.prepare_prefill(seqs)
+            _ = self.model(input_ids, positions)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._poll_verify_layer_timing_events()
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_layer_timing_warmup_count"] += 1
+        finally:
+            if _saved_prefetch_runtime is not None:
+                self.prefetch_runtime = _saved_prefetch_runtime  # type: ignore[assignment]
+            self.model.set_verify_prefetch_controller(None)
+            self._verify_prefetch_active = False
+            self._current_verify_prefetch_step_id = -1
+            self._set_speculative_execution_mode("normal")
+            reset_context()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -1104,6 +1165,89 @@ class ModelRunner:
             "verify_prefetch_wait_ms": verify_wait_ms,
         }
 
+    def _poll_verify_layer_timing_events(self) -> None:
+        self._ensure_prefetch_internal_state()
+        pending = getattr(self, "_verify_layer_timing_events", [])
+        if not pending:
+            return
+        remaining: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
+        for layer_idx, start_event, end_event in pending:
+            if not bool(end_event.query()):
+                remaining.append((layer_idx, start_event, end_event))
+                continue
+            compute_ms = float(start_event.elapsed_time(end_event))
+            prev = self._verify_layer_compute_ms_ema.get(layer_idx)
+            self._verify_layer_compute_ms_ema[layer_idx] = compute_ms if prev is None else 0.8 * prev + 0.2 * compute_ms
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_layer_timing_sample_count"] += 1
+                    self._profile["verify_layer_compute_ms_sample_sum"] += compute_ms
+        self._verify_layer_timing_events = remaining
+
+    def _record_verify_layer_timing_start(self, layer_idx: int) -> None:
+        self._ensure_prefetch_internal_state()
+        if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream())
+            self._verify_layer_active_timing[int(layer_idx)] = start_event
+            return
+        self._verify_layer_active_timing[int(layer_idx)] = perf_counter()
+
+    def _record_verify_layer_timing_end(self, layer_idx: int) -> None:
+        self._ensure_prefetch_internal_state()
+        start = self._verify_layer_active_timing.pop(int(layer_idx), None)
+        if start is None:
+            return
+        if isinstance(start, torch.cuda.Event):
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream())
+            self._verify_layer_timing_events.append((int(layer_idx), start, end_event))
+            return
+        compute_ms = (perf_counter() - float(start)) * 1000.0
+        prev = self._verify_layer_compute_ms_ema.get(int(layer_idx))
+        self._verify_layer_compute_ms_ema[int(layer_idx)] = compute_ms if prev is None else 0.8 * prev + 0.2 * compute_ms
+
+    def before_verify_layer(self, layer_idx: int) -> None:
+        self._ensure_prefetch_internal_state()
+        if not bool(getattr(self, "_verify_prefetch_active", False)):
+            return
+
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is None:
+            self._record_verify_layer_timing_start(layer_idx)
+            return
+
+        self._poll_verify_layer_timing_events()
+        step_id = int(getattr(self, "_current_verify_prefetch_step_id", -1))
+        with self._prefetch_runtime_lock:
+            prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+        target_layer_idx = int(layer_idx) + 1
+        submitted = 0
+        available_ms = 0.0
+        if target_layer_idx in getattr(self, "layer_caches", {}):
+            compute_ms = float(self._verify_layer_compute_ms_ema.get(int(layer_idx), 0.0))
+            safety_ratio = float(getattr(self.config, "prefetch_verify_layer_safety_ratio", 0.8))
+            min_compute_ms = float(getattr(self.config, "prefetch_verify_layer_min_compute_ms", 0.05))
+            if compute_ms >= min_compute_ms:
+                available_ms = compute_ms * safety_ratio
+                with self._prefetch_runtime_lock:
+                    submitted = prefetch_runtime.submit_verify_layer_prefetch(
+                        step_id=step_id,
+                        target_layer_idx=target_layer_idx,
+                        available_ms=available_ms,
+                    )
+
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_layer_prefetch_hook_count"] += 1
+                self._profile["verify_layer_prefetch_hook_available_ms"] += available_ms
+                self._profile["verify_layer_prefetch_hook_submit_count"] += submitted
+
+        self._record_verify_layer_timing_start(layer_idx)
+
+    def after_verify_layer(self, layer_idx: int) -> None:
+        self._record_verify_layer_timing_end(layer_idx)
+
     @torch.inference_mode()
     def run_verify(
         self,
@@ -1133,6 +1277,17 @@ class ModelRunner:
                 token_capacity=token_count,
                 logical_token_count=token_count,
             )
+
+        verify_layer_prefetch_enabled = (
+            prefetch_runtime is not None
+            and runtime_meta_recorder is not None
+            and bool(getattr(self.config, "prefetch_verify_layer_enabled", True))
+            and hasattr(self.model, "set_verify_prefetch_controller")
+        )
+        if verify_layer_prefetch_enabled:
+            self._verify_prefetch_active = True
+            self._current_verify_prefetch_step_id = int(step_id)
+            self.model.set_verify_prefetch_controller(self)
 
         # compute_logits() slices prefill outputs to last token per sequence.
         # Verify needs logits for every queried token position.
@@ -1202,6 +1357,10 @@ class ModelRunner:
                 torch.cuda.synchronize()
             self._record_profile("verify_forward_ms", perf_counter() - t0)
         finally:
+            if verify_layer_prefetch_enabled:
+                self.model.set_verify_prefetch_controller(None)
+                self._verify_prefetch_active = False
+                self._current_verify_prefetch_step_id = -1
             self._set_speculative_execution_mode("normal")
 
         reset_context()
@@ -1225,6 +1384,8 @@ class ModelRunner:
                 verify_outputs.append(seq_logits.argmax(dim=-1).tolist())
 
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.publish_direct_active_ready(step_id=step_id)
             host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
                 mode="verify",
                 token_capacity=int(input_ids.numel()),

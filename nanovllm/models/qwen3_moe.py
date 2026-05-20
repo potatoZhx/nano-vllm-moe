@@ -567,6 +567,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
+        self.layer_idx = int(layer_idx)
         rope_theta = getattr(config, "rope_theta", None)
         rope_scaling = getattr(config, "rope_scaling", None)
         if isinstance(rope_scaling, dict):
@@ -648,6 +649,10 @@ class Qwen3MoeModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.verify_prefetch_controller = None
+
+    def set_verify_prefetch_controller(self, controller) -> None:
+        self.verify_prefetch_controller = controller
 
     def forward(
         self,
@@ -656,10 +661,16 @@ class Qwen3MoeModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         for decoder_layer in self.layers:
+            controller = self.verify_prefetch_controller
+            layer_idx = decoder_layer.layer_idx
+            if controller is not None:
+                controller.before_verify_layer(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 position_ids,
             )
+            if controller is not None:
+                controller.after_verify_layer(layer_idx)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -757,6 +768,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_draft_cpu_graph_mode(enabled)
+
+    def set_verify_prefetch_controller(self, controller) -> None:
+        if hasattr(self.model, "set_verify_prefetch_controller"):
+            self.model.set_verify_prefetch_controller(controller)
 
     def check_draft_cpu_graph_errors(self) -> None:
         for layer in self.model.layers:

@@ -399,6 +399,7 @@ def heterogeneous_moe_forward(
                 flat_selected_original=plan.flat_selected_original,
                 cpu_expert_pool=cpu_expert_pool,
                 act_fn=act_fn,
+                gpu_fallback_workspace=gpu_fallback_workspace,
             )
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
@@ -455,7 +456,8 @@ class _RouteBufferCache:
         b = self._buffer
         if (
             b is None
-            or b.numel() < num_routes * hidden_dim
+            or b.size(0) < num_routes
+            or b.size(1) != hidden_dim
             or b.dtype != dtype
             or b.device != device
         ):
@@ -817,27 +819,69 @@ def _compute_gpu_fallback_outputs(
     flat_selected_original: torch.Tensor,
     cpu_expert_pool: dict[int, dict[str, torch.Tensor]],
     act_fn: SiluAndMul,
+    gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
 ) -> tuple[torch.Tensor, float, float]:
-    """Compute GPU fallback outputs for uncached experts without accumulating."""
+    """Compute GPU fallback outputs using the same fused_moe_linear path
+    as the cached expert path, avoiding F.linear vs Triton precision skew."""
     prep_t0 = perf_counter()
     cpu_token_indices = torch.div(cpu_indices, top_k, rounding_mode="floor")
     cpu_hidden = hidden_states[cpu_token_indices]
     cpu_experts = flat_selected_original.index_select(0, cpu_indices)
     cpu_weights = flat_weights.index_select(0, cpu_indices)
+    unique_experts = cpu_experts.unique()
+    num_uniq = int(unique_experts.numel())
     prep_ms = (perf_counter() - prep_t0) * 1000.0
 
     result = torch.zeros(cpu_indices.numel(), hidden_states.shape[-1], dtype=hidden_states.dtype, device=hidden_states.device)
     compute_t0 = perf_counter()
-    for expert_idx in cpu_experts.unique().tolist():
-        expert_mask = cpu_experts == expert_idx
-        h = cpu_hidden[expert_mask]
-        params = cpu_expert_pool[expert_idx]
-        gate_up_weight = params["gate_up"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
-        down_weight = params["down"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
-        gate_up = F.linear(h, gate_up_weight)
-        out = F.linear(act_fn(gate_up), down_weight)
-        out = out * cpu_weights[expert_mask].unsqueeze(-1)
-        result[expert_mask] = out
+
+    if gpu_fallback_workspace is not None and num_uniq > 0:
+        # Use Triton grouped GEMM (same as cached path) via workspace buffers.
+        slot_map = gpu_fallback_workspace.acquire_slots(
+            unique_experts.tolist(), cpu_expert_pool
+        )
+        # Map each route to its workspace slot
+        expert_to_slot_t = torch.full(
+            (int(flat_selected_original.max()) + 1,), -1, dtype=torch.int64, device=cpu_experts.device
+        )
+        for eid, sid in slot_map.items():
+            expert_to_slot_t[eid] = sid
+        cpu_slots = expert_to_slot_t.index_select(0, cpu_experts)
+        # Build grouped layout by workspace slot.
+        # m_sizes must have one entry per workspace slot (max_experts).
+        m_sizes = torch.zeros(gpu_fallback_workspace.max_experts, dtype=torch.int32, device=cpu_experts.device)
+        for sid, cnt in [(s, int((cpu_slots == s).sum().item())) for s in sorted(slot_map.values())]:
+            m_sizes[sid] = cnt
+        sort_idx = cpu_slots.argsort(stable=True)
+        inv_sort_idx = sort_idx.argsort(stable=True)
+        sorted_hidden = cpu_hidden.index_select(0, sort_idx)
+
+        # Fused gate_up projection (same kernel as cached path)
+        sorted_gate_up = fused_moe_linear(sorted_hidden, gpu_fallback_workspace.gate_up, m_sizes)
+        # Apply activation
+        sorted_act = act_fn(sorted_gate_up)
+        # Fused down projection
+        sorted_out = fused_moe_linear(sorted_act, gpu_fallback_workspace.down, m_sizes)
+        # Multiply by routing weights
+        sorted_out.mul_(cpu_weights.index_select(0, sort_idx).unsqueeze(-1))
+
+        # Reorder to original route order
+        result = sorted_out.index_select(0, inv_sort_idx)
+
+        gpu_fallback_workspace.release_all()
+    else:
+        # Fallback: per-expert F.linear (legacy path, may introduce precision skew)
+        for expert_idx in unique_experts.tolist():
+            expert_mask = cpu_experts == expert_idx
+            h = cpu_hidden[expert_mask]
+            params = cpu_expert_pool[expert_idx]
+            gate_up_weight = params["gate_up"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
+            down_weight = params["down"].to(device=hidden_states.device, dtype=hidden_states.dtype, non_blocking=True)
+            gate_up = F.linear(h, gate_up_weight)
+            out = F.linear(act_fn(gate_up), down_weight)
+            out = out * cpu_weights[expert_mask].unsqueeze(-1)
+            result[expert_mask] = out
+
     compute_ms = (perf_counter() - compute_t0) * 1000.0
     return result, prep_ms, compute_ms
 
