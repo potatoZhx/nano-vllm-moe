@@ -125,6 +125,22 @@ def run_case(
             str(args.engine_profile_cuda_sync).lower(),
             "--spec-enable-prefetch",
             str(args.spec_enable_prefetch).lower(),
+            "--prefetch-runtime-mode",
+            args.prefetch_runtime_mode,
+            "--prefetch-metadata-host-buffer-pool-size",
+            str(args.prefetch_metadata_host_buffer_pool_size),
+            "--draft-prefetch-frontier-granularity",
+            args.draft_prefetch_frontier_granularity,
+            "--draft-prefetch-segment-size",
+            str(args.draft_prefetch_segment_size),
+            "--draft-prefetch-segment-host-buffer-pool-size",
+            str(args.draft_prefetch_segment_host_buffer_pool_size),
+            "--draft-prefetch-visible-budget-ms",
+            str(args.draft_prefetch_visible_budget_ms),
+            "--draft-prefetch-min-per-boundary",
+            str(args.draft_prefetch_min_per_boundary),
+            "--draft-prefetch-max-per-boundary",
+            str(args.draft_prefetch_max_per_boundary),
             "--prefetch-verify-wait-ms",
             str(args.prefetch_verify_wait_ms),
             "--prefetch-step-budget",
@@ -254,8 +270,23 @@ def extract_draft_forward_metrics(case_result: dict) -> dict:
             "prefetch_trace_event_count": int(len(profile.get("model_prefetch_trace_events", []))),
             "graph_replay_count": int(profile.get("model_draft_graph_replay_count", 0)),
             "draft_graph_replay_ms_per_call": _per_call(profile, "model_draft_graph_replay_ms", draft_calls),
+            "draft_segment_graph_replay_count": int(profile.get("model_draft_segment_graph_replay_count", 0)),
+            "draft_segment_graph_replay_ms": float(profile.get("model_draft_segment_graph_replay_ms", 0.0)),
+            "draft_segment_metadata_enqueue_count": int(profile.get("model_draft_segment_metadata_enqueue_count", 0)),
+            "draft_segment_metadata_enqueue_ms": float(profile.get("model_draft_segment_metadata_enqueue_ms", 0.0)),
             "prefetch_submit_count": int(profile.get("model_prefetch_submit_count", 0)),
             "prefetch_completed_count": int(profile.get("model_prefetch_completed_count", 0)),
+            "staging_prefetch_publish_ms": float(profile.get("model_staging_prefetch_publish_ms", 0.0)),
+            "direct_active_prefetch_publish_ms": float(profile.get("model_direct_active_prefetch_publish_ms", 0.0)),
+            "draft_direct_active_prefetch_submit_count": int(profile.get("model_draft_direct_active_prefetch_submit_count", 0)),
+            "draft_direct_active_prefetch_publish_count": int(profile.get("model_draft_direct_active_prefetch_publish_count", 0)),
+            "draft_direct_active_prefetch_consumed_count": int(profile.get("model_draft_direct_active_prefetch_consumed_count", 0)),
+            "draft_direct_active_prefetch_skipped_by_frontier_count": int(profile.get("model_draft_direct_active_prefetch_skipped_by_frontier_count", 0)),
+            "draft_direct_active_prefetch_skipped_by_budget_count": int(profile.get("model_draft_direct_active_prefetch_skipped_by_budget_count", 0)),
+            "draft_direct_active_prefetch_skipped_by_pending_count": int(profile.get("model_draft_direct_active_prefetch_skipped_by_pending_count", 0)),
+            "draft_direct_active_prefetch_adaptive_budget": int(profile.get("model_draft_direct_active_prefetch_adaptive_budget", 0)),
+            "draft_direct_active_prefetch_visible_overhead_ms": float(profile.get("model_draft_direct_active_prefetch_visible_overhead_ms", 0.0)),
+            "draft_direct_active_prefetch_est_transfer_ms": float(profile.get("model_draft_direct_active_prefetch_est_transfer_ms", 0.0)),
             "metadata_offload_count": int(profile.get("model_metadata_offload_count", 0)),
         },
     }
@@ -368,6 +399,10 @@ def summarize_repeats(rows: list[dict]) -> dict:
             "prefetch_async_hidden_ratio": _median_nested(rows, "draft_forward", "prefetch_async_hidden_ratio"),
             "prefetch_async_exposed_wait_ms_total": _median_nested(rows, "draft_forward", "prefetch_async_exposed_wait_ms_total"),
             "prefetch_async_hidden_ms_total": _median_nested(rows, "draft_forward", "prefetch_async_hidden_ms_total"),
+            "staging_prefetch_publish_ms": _median_nested(rows, "draft_forward", "staging_prefetch_publish_ms"),
+            "direct_active_prefetch_publish_ms": _median_nested(rows, "draft_forward", "direct_active_prefetch_publish_ms"),
+            "draft_direct_active_prefetch_visible_overhead_ms": _median_nested(rows, "draft_forward", "draft_direct_active_prefetch_visible_overhead_ms"),
+            "draft_segment_metadata_enqueue_ms": _median_nested(rows, "draft_forward", "draft_segment_metadata_enqueue_ms"),
         },
         "verify_breakdown_median": {
             "verify_forward_ms_per_call": _median_nested(rows, "verify_path", "verify_forward_ms_per_call"),
@@ -409,6 +444,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", type=str2bool, default=False)
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--spec-enable-prefetch", type=str2bool, default=True)
+    parser.add_argument("--prefetch-runtime-mode", type=str, default="baseline_staging",
+                        choices=["baseline_staging", "draft_direct_active"])
+    parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
+    parser.add_argument("--draft-prefetch-frontier-granularity", type=str, default="segment",
+                        choices=["iteration", "segment", "layer"])
+    parser.add_argument("--draft-prefetch-segment-size", type=int, default=12)
+    parser.add_argument("--draft-prefetch-segment-host-buffer-pool-size", type=int, default=0)
+    parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
+    parser.add_argument("--draft-prefetch-min-per-boundary", type=int, default=0)
+    parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=4)
     parser.add_argument("--prefetch-verify-wait-ms", type=float, default=1.0)
     parser.add_argument("--prefetch-step-budget", type=int, default=4)
     parser.add_argument("--prefetch-max-inflight", type=int, default=8)
@@ -495,6 +540,14 @@ def main() -> None:
             "enforce_eager": args.enforce_eager,
             "engine_profile_cuda_sync": args.engine_profile_cuda_sync,
             "spec_enable_prefetch": args.spec_enable_prefetch,
+            "prefetch_runtime_mode": args.prefetch_runtime_mode,
+            "prefetch_metadata_host_buffer_pool_size": args.prefetch_metadata_host_buffer_pool_size,
+            "draft_prefetch_frontier_granularity": args.draft_prefetch_frontier_granularity,
+            "draft_prefetch_segment_size": args.draft_prefetch_segment_size,
+            "draft_prefetch_segment_host_buffer_pool_size": args.draft_prefetch_segment_host_buffer_pool_size,
+            "draft_prefetch_visible_budget_ms": args.draft_prefetch_visible_budget_ms,
+            "draft_prefetch_min_per_boundary": args.draft_prefetch_min_per_boundary,
+            "draft_prefetch_max_per_boundary": args.draft_prefetch_max_per_boundary,
             "prefetch_verify_wait_ms": args.prefetch_verify_wait_ms,
             "prefetch_step_budget": args.prefetch_step_budget,
             "prefetch_max_inflight": args.prefetch_max_inflight,

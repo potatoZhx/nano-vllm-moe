@@ -188,11 +188,15 @@ class GlobalWarmStartQueue:
         step_id: int,
         layer_caches: dict[int, LayerExpertCache],
         inflight_keys: set[tuple[int, int]],
+        max_layer_idx: int | None = None,
     ) -> list[PrefetchCandidate]:
         self.prune(step_id, layer_caches)
+        max_layer = None if max_layer_idx is None else int(max_layer_idx)
         ranked: list[PrefetchCandidate] = []
         for key, entry in self.entries.items():
             layer_idx, expert_idx = key
+            if max_layer is not None and int(layer_idx) > max_layer:
+                continue
             if key in inflight_keys:
                 continue
             cache = layer_caches.get(layer_idx)
@@ -238,6 +242,14 @@ class PrefetchRuntime:
         self.inflight: dict[tuple[int, int], PrefetchTicket] = {}
         self._profile = defaultdict(float)
         self._recent_published: dict[tuple[int, int], int] = {}
+        self._recent_published_source: dict[tuple[int, int], str] = {}
+        self._draft_direct_active_budget = self._initial_draft_direct_active_budget()
+
+    def _initial_draft_direct_active_budget(self) -> int:
+        return max(
+            0,
+            int(getattr(self.config, "draft_prefetch_max_per_boundary", getattr(self.config, "prefetch_step_budget", 0))),
+        )
 
     def observe_runtime_meta(
         self,
@@ -365,6 +377,7 @@ class PrefetchRuntime:
             )
             submitted += 1
             self._profile["prefetch_submit_count"] += 1
+            self._profile["staging_prefetch_submit_count"] += 1
             if candidate.source == "prefill_history":
                 self._profile["history_prefetch_submit_count"] += 1
             elif candidate.source == "verify_history":
@@ -372,6 +385,174 @@ class PrefetchRuntime:
             elif candidate.source == "draft_live":
                 self._profile["draft_live_prefetch_submit_count"] += 1
 
+        return submitted
+
+    def _record_source_submit(self, source: str) -> None:
+        if source == "prefill_history":
+            self._profile["history_prefetch_submit_count"] += 1
+        elif source == "verify_history":
+            self._profile["verify_history_prefetch_submit_count"] += 1
+        elif source == "draft_live":
+            self._profile["draft_live_prefetch_submit_count"] += 1
+
+    def _adjust_draft_direct_active_budget(self, visible_ms: float) -> None:
+        min_budget = max(0, int(getattr(self.config, "draft_prefetch_min_per_boundary", 0)))
+        max_budget = max(
+            min_budget,
+            int(getattr(self.config, "draft_prefetch_max_per_boundary", self.config.prefetch_step_budget)),
+        )
+        current = max(min_budget, min(max_budget, int(self._draft_direct_active_budget)))
+        budget_ms = float(getattr(self.config, "draft_prefetch_visible_budget_ms", 3.0))
+        if budget_ms <= 0.0:
+            self._draft_direct_active_budget = current
+            self._profile["draft_direct_active_prefetch_adaptive_budget"] = float(current)
+            return
+
+        if visible_ms > budget_ms and current > min_budget:
+            current -= 1
+            self._profile["draft_direct_active_prefetch_budget_decrease_count"] += 1
+        elif visible_ms < budget_ms * 0.5 and current < max_budget:
+            current += 1
+            self._profile["draft_direct_active_prefetch_budget_increase_count"] += 1
+        self._draft_direct_active_budget = current
+        self._profile["draft_direct_active_prefetch_adaptive_budget"] = float(current)
+
+    def submit_draft_direct_active_prefetch(
+        self,
+        *,
+        step_id: int,
+        phase: str,
+        frontier_layer_idx: int | None,
+        visible_budget_ms: float | None = None,
+    ) -> int:
+        _ = phase
+        if int(self.config.prefetch_step_budget) <= 0:
+            return 0
+
+        submit_t0 = time.perf_counter()
+        min_submit = max(0, int(getattr(self.config, "draft_prefetch_min_per_boundary", 0)))
+        configured_max = max(
+            min_submit,
+            int(getattr(self.config, "draft_prefetch_max_per_boundary", self.config.prefetch_step_budget)),
+        )
+        adaptive_budget = max(min_submit, min(configured_max, int(self._draft_direct_active_budget)))
+        max_submit = min(max(0, int(self.config.prefetch_step_budget)), adaptive_budget)
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        if max_submit <= 0:
+            self._profile["draft_direct_active_prefetch_skipped_by_budget_count"] += 1
+            self._adjust_draft_direct_active_budget(visible_ms=0.0)
+            return 0
+        if inflight_budget <= 0:
+            self._profile["draft_direct_active_prefetch_skipped_by_pending_count"] += 1
+            return 0
+        dispatch_budget = min(max_submit, inflight_budget)
+
+        frontier = None if frontier_layer_idx is None else int(frontier_layer_idx)
+        transfer_budget_ms = (
+            float(visible_budget_ms)
+            if visible_budget_ms is not None
+            else float(getattr(self.config, "draft_prefetch_visible_budget_ms", 3.0))
+        )
+        inflight_keys = set(self.inflight.keys())
+        ranked = self.global_queue.ranked_candidates(
+            step_id=step_id,
+            layer_caches=self.layer_caches,
+            inflight_keys=inflight_keys,
+            max_layer_idx=frontier,
+        )
+        ranked = self.prefetch_strategy.rank(ranked, step_id=step_id)
+
+        submitted = 0
+        used_transfer_ms = 0.0
+
+        for candidate in ranked:
+            if submitted >= dispatch_budget:
+                break
+
+            layer_idx = int(candidate.layer_idx)
+            expert_idx = int(candidate.expert_idx)
+            if frontier is not None and layer_idx > frontier:
+                self._profile["draft_direct_active_prefetch_skipped_by_frontier_count"] += 1
+                continue
+
+            key = (layer_idx, expert_idx)
+            cache = self.layer_caches.get(layer_idx)
+            if cache is None:
+                continue
+            if cache.is_cached_cpu(expert_idx):
+                continue
+            if key in self.inflight:
+                self._profile["draft_direct_active_prefetch_skipped_by_pending_count"] += 1
+                continue
+
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+
+            transfer_ms = self._estimated_expert_transfer_ms(weights)
+            if not isfinite(transfer_ms):
+                continue
+            if (
+                transfer_budget_ms > 0.0
+                and submitted >= min_submit
+                and used_transfer_ms + transfer_ms > transfer_budget_ms
+            ):
+                self._profile["draft_direct_active_prefetch_skipped_by_budget_count"] += 1
+                break
+
+            victim_slot = self._select_publish_slot(
+                cache,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                step_id=step_id,
+            )
+            if victim_slot is None:
+                self._profile["draft_direct_active_prefetch_skipped_by_pending_count"] += 1
+                continue
+
+            reservation = cache.reserve_active_slot_for_prefetch(
+                layer_idx=layer_idx,
+                active_slot_idx=victim_slot,
+                expert_idx=expert_idx,
+            )
+            if reservation is None:
+                self._profile["draft_direct_active_prefetch_skipped_by_pending_count"] += 1
+                continue
+
+            ready_event = cache.begin_async_put_to_active(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+
+            self.inflight[key] = PrefetchTicket(
+                step_id=step_id,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source="draft_direct_active",
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=time.perf_counter() * 1000.0,
+                ready_event=ready_event,
+                ready=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+            )
+            submitted += 1
+            used_transfer_ms += transfer_ms
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile["draft_direct_active_prefetch_submit_count"] += 1
+            self._profile["draft_direct_active_prefetch_est_transfer_ms"] += transfer_ms
+            self._record_source_submit(candidate.source)
+
+        visible_ms = (time.perf_counter() - submit_t0) * 1000.0
+        self._profile["draft_direct_active_prefetch_visible_overhead_ms"] += visible_ms
+        self._profile["draft_direct_active_prefetch_used_transfer_budget_ms"] += used_transfer_ms
+        self._adjust_draft_direct_active_budget(visible_ms)
         return submitted
 
     def _estimated_expert_transfer_ms(self, weights: dict[str, torch.Tensor]) -> float:
@@ -533,6 +714,7 @@ class PrefetchRuntime:
             submitted += 1
             used_budget_ms += transfer_ms
             self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
             self._profile["verify_layer_prefetch_submit_count"] += 1
             self._profile["verify_layer_prefetch_est_transfer_ms"] += transfer_ms
             self._profile["verify_layer_prefetch_available_ms"] += float(available_ms)
@@ -612,20 +794,40 @@ class PrefetchRuntime:
             self._finalize_publish(cache, published_item)
             self.inflight.pop((ticket.layer_idx, ticket.expert_idx), None)
             self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
+            self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
             published += 1
             self._profile["publish_count"] += 1
+            self._profile["staging_prefetch_publish_count"] += 1
 
-        self._profile["publish_ms"] += (time.perf_counter() - t0) * 1000.0
+        publish_ms = (time.perf_counter() - t0) * 1000.0
+        self._profile["publish_ms"] += publish_ms
+        self._profile["staging_prefetch_publish_ms"] += publish_ms
         return published
 
-    def publish_direct_active_ready(self, step_id: int) -> int:
+    def publish_direct_active_ready(
+        self,
+        step_id: int,
+        *,
+        layer_idx: int | None = None,
+        source: str | None = None,
+    ) -> int:
         t0 = time.perf_counter()
         published = 0
         for key, ticket in list(self.inflight.items()):
             if not ticket.direct_active:
                 continue
+            if layer_idx is not None and int(ticket.layer_idx) != int(layer_idx):
+                continue
+            if source is not None and str(ticket.source) != str(source):
+                continue
+            self._profile["direct_active_prefetch_ready_scan_count"] += 1
             if not bool(ticket.ready_event.query()):
                 continue
+            self._profile["direct_active_prefetch_ready_count"] += 1
+            if ticket.source == "draft_direct_active":
+                self._profile["draft_direct_active_prefetch_ready_count"] += 1
+            elif ticket.source == "verify_layer_predict":
+                self._profile["verify_layer_prefetch_ready_count"] += 1
             cache = self.layer_caches.get(ticket.layer_idx)
             if cache is None:
                 self.inflight.pop(key, None)
@@ -643,11 +845,40 @@ class PrefetchRuntime:
                 self._profile["prefetch_late_count"] += 1
                 continue
             self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
+            self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
             published += 1
             self._profile["prefetch_completed_count"] += 1
             self._profile["publish_count"] += 1
-            self._profile["verify_layer_prefetch_publish_count"] += 1
-        self._profile["publish_ms"] += (time.perf_counter() - t0) * 1000.0
+            self._profile["direct_active_prefetch_publish_count"] += 1
+            if ticket.source == "draft_direct_active":
+                self._profile["draft_direct_active_prefetch_publish_count"] += 1
+            elif ticket.source == "verify_layer_predict":
+                self._profile["verify_layer_prefetch_publish_count"] += 1
+        publish_ms = (time.perf_counter() - t0) * 1000.0
+        self._profile["publish_ms"] += publish_ms
+        self._profile["direct_active_prefetch_publish_ms"] += publish_ms
+        return published
+
+    def drain_direct_active_ready(self, step_id: int, *, source: str | None = None) -> int:
+        t0 = time.perf_counter()
+        waited = 0
+        draft_waited = 0
+        for ticket in list(self.inflight.values()):
+            if not ticket.direct_active:
+                continue
+            if source is not None and str(ticket.source) != str(source):
+                continue
+            ticket.ready_event.synchronize()
+            waited += 1
+            if ticket.source == "draft_direct_active":
+                draft_waited += 1
+        published = self.publish_direct_active_ready(step_id=step_id, source=source)
+        drain_ms = (time.perf_counter() - t0) * 1000.0
+        self._profile["direct_active_prefetch_drain_count"] += waited
+        self._profile["direct_active_prefetch_drain_ms"] += drain_ms
+        if source == "draft_direct_active" or source is None:
+            self._profile["draft_direct_active_prefetch_drain_count"] += draft_waited
+            self._profile["draft_direct_active_prefetch_drain_ms"] += drain_ms
         return published
 
     def _finalize_publish(self, cache: LayerExpertCache, published_item: PublishedExpert) -> None:
@@ -714,6 +945,11 @@ class PrefetchRuntime:
                     continue
                 if cache.is_cached_cpu(expert_idx):
                     consumed += 1
+                    source = self._recent_published_source.get(key, "")
+                    if source == "draft_direct_active":
+                        self._profile["draft_direct_active_prefetch_consumed_count"] += 1
+                    elif source == "verify_layer_predict":
+                        self._profile["verify_layer_prefetch_consumed_count"] += 1
         self._profile["prefetch_consumed_count"] += consumed
 
         stale = []
@@ -723,6 +959,7 @@ class PrefetchRuntime:
                 stale.append(key)
         for key in stale:
             self._recent_published.pop(key, None)
+            self._recent_published_source.pop(key, None)
 
     def record_metadata_offload(
         self,
@@ -784,18 +1021,48 @@ class PrefetchRuntime:
             "metadata_offload_verify_count": int(self._profile.get("metadata_offload_verify_count", 0.0)),
             "metadata_offload_verify_ms": float(self._profile.get("metadata_offload_verify_ms", 0.0)),
             "metadata_offload_verify_bytes": float(self._profile.get("metadata_offload_verify_bytes", 0.0)),
+            "staging_prefetch_submit_count": int(self._profile.get("staging_prefetch_submit_count", 0.0)),
+            "staging_prefetch_publish_count": int(self._profile.get("staging_prefetch_publish_count", 0.0)),
+            "staging_prefetch_publish_ms": float(self._profile.get("staging_prefetch_publish_ms", 0.0)),
+            "direct_active_prefetch_submit_count": int(self._profile.get("direct_active_prefetch_submit_count", 0.0)),
+            "direct_active_prefetch_ready_scan_count": int(self._profile.get("direct_active_prefetch_ready_scan_count", 0.0)),
+            "direct_active_prefetch_ready_count": int(self._profile.get("direct_active_prefetch_ready_count", 0.0)),
+            "direct_active_prefetch_publish_count": int(self._profile.get("direct_active_prefetch_publish_count", 0.0)),
+            "direct_active_prefetch_publish_ms": float(self._profile.get("direct_active_prefetch_publish_ms", 0.0)),
+            "direct_active_prefetch_drain_count": int(self._profile.get("direct_active_prefetch_drain_count", 0.0)),
+            "direct_active_prefetch_drain_ms": float(self._profile.get("direct_active_prefetch_drain_ms", 0.0)),
             "history_prefetch_submit_count": int(self._profile.get("history_prefetch_submit_count", 0.0)),
             "verify_history_prefetch_submit_count": int(self._profile.get("verify_history_prefetch_submit_count", 0.0)),
             "draft_live_prefetch_submit_count": int(self._profile.get("draft_live_prefetch_submit_count", 0.0)),
             "verify_layer_prefetch_submit_count": int(self._profile.get("verify_layer_prefetch_submit_count", 0.0)),
+            "verify_layer_prefetch_ready_count": int(self._profile.get("verify_layer_prefetch_ready_count", 0.0)),
             "verify_layer_prefetch_publish_count": int(self._profile.get("verify_layer_prefetch_publish_count", 0.0)),
+            "verify_layer_prefetch_consumed_count": int(self._profile.get("verify_layer_prefetch_consumed_count", 0.0)),
             "verify_layer_prefetch_budget_stop_count": int(self._profile.get("verify_layer_prefetch_budget_stop_count", 0.0)),
             "verify_layer_prefetch_est_transfer_ms": float(self._profile.get("verify_layer_prefetch_est_transfer_ms", 0.0)),
             "verify_layer_prefetch_available_ms": float(self._profile.get("verify_layer_prefetch_available_ms", 0.0)),
             "verify_layer_prefetch_used_budget_ms": float(self._profile.get("verify_layer_prefetch_used_budget_ms", 0.0)),
+            "draft_direct_active_prefetch_submit_count": int(self._profile.get("draft_direct_active_prefetch_submit_count", 0.0)),
+            "draft_direct_active_prefetch_ready_count": int(self._profile.get("draft_direct_active_prefetch_ready_count", 0.0)),
+            "draft_direct_active_prefetch_publish_count": int(self._profile.get("draft_direct_active_prefetch_publish_count", 0.0)),
+            "draft_direct_active_prefetch_consumed_count": int(self._profile.get("draft_direct_active_prefetch_consumed_count", 0.0)),
+            "draft_direct_active_prefetch_drain_count": int(self._profile.get("draft_direct_active_prefetch_drain_count", 0.0)),
+            "draft_direct_active_prefetch_drain_ms": float(self._profile.get("draft_direct_active_prefetch_drain_ms", 0.0)),
+            "draft_direct_active_prefetch_skipped_by_frontier_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_frontier_count", 0.0)),
+            "draft_direct_active_prefetch_skipped_by_budget_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_budget_count", 0.0)),
+            "draft_direct_active_prefetch_skipped_by_pending_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_pending_count", 0.0)),
+            "draft_direct_active_prefetch_adaptive_budget": int(
+                self._profile.get("draft_direct_active_prefetch_adaptive_budget", float(self._draft_direct_active_budget))
+            ),
+            "draft_direct_active_prefetch_budget_increase_count": int(self._profile.get("draft_direct_active_prefetch_budget_increase_count", 0.0)),
+            "draft_direct_active_prefetch_budget_decrease_count": int(self._profile.get("draft_direct_active_prefetch_budget_decrease_count", 0.0)),
+            "draft_direct_active_prefetch_visible_overhead_ms": float(self._profile.get("draft_direct_active_prefetch_visible_overhead_ms", 0.0)),
+            "draft_direct_active_prefetch_est_transfer_ms": float(self._profile.get("draft_direct_active_prefetch_est_transfer_ms", 0.0)),
+            "draft_direct_active_prefetch_used_transfer_budget_ms": float(self._profile.get("draft_direct_active_prefetch_used_transfer_budget_ms", 0.0)),
             "verify_ready_before_wait_count": int(self._profile.get("verify_ready_before_wait_count", 0.0)),
             "verify_ready_after_wait_count": int(self._profile.get("verify_ready_after_wait_count", 0.0)),
         }
         if reset:
             self._profile.clear()
+            self._draft_direct_active_budget = self._initial_draft_direct_active_budget()
         return out

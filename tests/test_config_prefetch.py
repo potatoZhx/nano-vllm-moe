@@ -19,9 +19,65 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.cache_strategy, "lru")
         self.assertEqual(cfg.prefetch_strategy, "history_window")
         self.assertEqual(cfg.prefetch_runtime_mode, "baseline_staging")
+        self.assertEqual(cfg.draft_prefetch_frontier_granularity, "segment")
+        self.assertEqual(cfg.draft_prefetch_segment_size, 12)
+        self.assertEqual(cfg.prefetch_metadata_host_buffer_pool_size, 3)
+        self.assertEqual(cfg.draft_prefetch_segment_host_buffer_pool_size, 0)
+        self.assertEqual(cfg.draft_prefetch_visible_budget_ms, 3.0)
+        self.assertEqual(cfg.draft_prefetch_min_per_boundary, 0)
+        self.assertEqual(cfg.draft_prefetch_max_per_boundary, 4)
         self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
         self.assertTrue(cfg.prefetch_verify_layer_enabled)
         self.assertGreater(cfg.prefetch_verify_layer_transfer_bandwidth_gbps, 0.0)
+
+    def test_draft_direct_active_runtime_mode_is_opt_in(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            prefetch_runtime_mode="draft_direct_active",
+        )
+        self.assertEqual(cfg.prefetch_runtime_mode, "draft_direct_active")
+
+    def test_invalid_prefetch_runtime_mode_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                prefetch_runtime_mode="direct",
+            )
+
+    def test_invalid_draft_prefetch_frontier_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_prefetch_frontier_granularity="token",
+            )
+
+    def test_invalid_draft_prefetch_budget_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_prefetch_min_per_boundary=3,
+                draft_prefetch_max_per_boundary=2,
+            )
+
+    def test_invalid_prefetch_metadata_host_buffer_pool_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                prefetch_metadata_host_buffer_pool_size=0,
+            )
+
+    def test_invalid_draft_segment_host_buffer_pool_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_prefetch_segment_host_buffer_pool_size=-1,
+            )
 
     def test_draft_cuda_graph_cpu_backend_accepts_fused(self):
         cfg = self._build_config(

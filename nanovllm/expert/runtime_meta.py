@@ -40,6 +40,8 @@ class RuntimeMetaOffloadHandle:
     logical_token_count: int
     buffer_bytes: int
     host_buffer_slot: int = 0
+    layer_start_idx: int = 0
+    layer_end_idx: int | None = None
 
 
 def _aggregate_layer_runtime_meta_cpu(
@@ -83,10 +85,32 @@ class ModelRuntimeMetaRecorder:
             1,
             int(getattr(config, "prefetch_metadata_host_buffer_pool_size", _DEFAULT_HOST_BUFFER_POOL_SIZE)),
         )
+        self.draft_segment_host_buffer_pool_size = max(
+            0,
+            int(getattr(config, "draft_prefetch_segment_host_buffer_pool_size", 0)),
+        )
         self.active_key: tuple[str, int] | None = None
         self.active_step_id: int = -1
         self.active_mode: str = "idle"
         self.active_logical_token_count: int = 0
+
+    def target_host_buffer_pool_size(self, mode: str, token_capacity: int) -> int:
+        _ = token_capacity
+        target = int(self.host_buffer_pool_size)
+        if (
+            str(mode) == "draft"
+            and str(getattr(self.config, "prefetch_runtime_mode", "baseline_staging")) == "draft_direct_active"
+            and str(getattr(self.config, "draft_prefetch_frontier_granularity", "segment")) in {"segment", "layer"}
+        ):
+            configured = int(self.draft_segment_host_buffer_pool_size)
+            if configured > 0:
+                target = max(target, configured)
+            else:
+                granularity = str(getattr(self.config, "draft_prefetch_frontier_granularity", "segment"))
+                segment_size = 1 if granularity == "layer" else max(1, int(getattr(self.config, "draft_prefetch_segment_size", 12)))
+                segment_count = max(1, (self.num_layers + segment_size - 1) // segment_size)
+                target = max(target, min(64, segment_count + 2))
+        return max(1, target)
 
     def _make_host_buffer(self, token_capacity: int, device: torch.device) -> dict[str, torch.Tensor]:
         if device.type == "cuda":
@@ -151,7 +175,7 @@ class ModelRuntimeMetaRecorder:
             device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
             self._ensure_buffer(mode, int(token_capacity), device)
         pool = self.host_buffer_pools[key]
-        if len(pool) >= self.host_buffer_pool_size:
+        if len(pool) >= self.target_host_buffer_pool_size(mode, int(token_capacity)):
             return False
         device = self.device_buffers[key]["selected_experts"].device
         pool.append(self._make_host_buffer(int(token_capacity), device))
@@ -211,6 +235,8 @@ class ModelRuntimeMetaRecorder:
         self,
         stream: torch.cuda.Stream | None,
         host_buffer_slot: int = 0,
+        layer_start_idx: int | None = None,
+        layer_end_idx: int | None = None,
     ) -> RuntimeMetaOffloadHandle | None:
         if self.active_key is None:
             return None
@@ -222,20 +248,36 @@ class ModelRuntimeMetaRecorder:
         if not (0 <= host_slot < len(host_pool)):
             raise IndexError(f"host_buffer_slot out of range: {host_slot}")
         host = host_pool[host_slot]
-        buffer_bytes = self._buffer_bytes(key)
+        layer_start = 0 if layer_start_idx is None else max(0, int(layer_start_idx))
+        layer_end = self.num_layers if layer_end_idx is None else min(self.num_layers, int(layer_end_idx))
+        layer_start = min(layer_start, self.num_layers)
+        layer_end = max(layer_start, layer_end)
+        buffer_bytes = self._buffer_bytes(key, layer_start, layer_end)
 
         if dev["selected_experts"].is_cuda:
             active_stream = stream if stream is not None else torch.cuda.current_stream()
+            current_stream = torch.cuda.current_stream()
             event = torch.cuda.Event(blocking=False)
             with torch.cuda.stream(active_stream):
-                host["token_count"].copy_(dev["token_count"], non_blocking=True)
-                host["selected_experts"].copy_(dev["selected_experts"], non_blocking=True)
-                host["routing_weights"].copy_(dev["routing_weights"], non_blocking=True)
+                if active_stream != current_stream:
+                    active_stream.wait_stream(current_stream)
+                host["token_count"][layer_start:layer_end].copy_(
+                    dev["token_count"][layer_start:layer_end],
+                    non_blocking=True,
+                )
+                host["selected_experts"][layer_start:layer_end].copy_(
+                    dev["selected_experts"][layer_start:layer_end],
+                    non_blocking=True,
+                )
+                host["routing_weights"][layer_start:layer_end].copy_(
+                    dev["routing_weights"][layer_start:layer_end],
+                    non_blocking=True,
+                )
                 event.record(active_stream)
         else:
-            host["token_count"].copy_(dev["token_count"])
-            host["selected_experts"].copy_(dev["selected_experts"])
-            host["routing_weights"].copy_(dev["routing_weights"])
+            host["token_count"][layer_start:layer_end].copy_(dev["token_count"][layer_start:layer_end])
+            host["selected_experts"][layer_start:layer_end].copy_(dev["selected_experts"][layer_start:layer_end])
+            host["routing_weights"][layer_start:layer_end].copy_(dev["routing_weights"][layer_start:layer_end])
             event = _ImmediateEvent()
 
         return RuntimeMetaOffloadHandle(
@@ -246,6 +288,8 @@ class ModelRuntimeMetaRecorder:
             logical_token_count=self.active_logical_token_count,
             buffer_bytes=buffer_bytes,
             host_buffer_slot=host_slot,
+            layer_start_idx=layer_start,
+            layer_end_idx=layer_end,
         )
 
     def collect(
@@ -265,7 +309,13 @@ class ModelRuntimeMetaRecorder:
         token_counts = host["token_count"]
         out: dict[int, LayerRuntimeMetaCPU] = {}
 
-        for layer_idx in range(self.num_layers):
+        layer_start = max(0, int(getattr(handle, "layer_start_idx", 0)))
+        layer_end_value = getattr(handle, "layer_end_idx", None)
+        layer_end = self.num_layers if layer_end_value is None else min(self.num_layers, int(layer_end_value))
+        layer_start = min(layer_start, self.num_layers)
+        layer_end = max(layer_start, layer_end)
+
+        for layer_idx in range(layer_start, layer_end):
             token_count = int(token_counts[layer_idx].item())
             token_count = min(token_count, int(handle.logical_token_count))
             if token_count <= 0:
@@ -292,9 +342,12 @@ class ModelRuntimeMetaRecorder:
         self.active_mode = "idle"
         self.active_logical_token_count = 0
 
-    def _buffer_bytes(self, key: tuple[str, int]) -> int:
+    def _buffer_bytes(self, key: tuple[str, int], layer_start: int = 0, layer_end: int | None = None) -> int:
         host = self.host_buffers[key]
+        end = self.num_layers if layer_end is None else int(layer_end)
+        layer_count = max(0, min(self.num_layers, end) - max(0, int(layer_start)))
         total = 0
-        for tensor in host.values():
-            total += int(tensor.numel() * tensor.element_size())
+        total += int(layer_count * host["token_count"].element_size())
+        total += int(layer_count * host["selected_experts"].size(1) * host["selected_experts"].size(2) * host["selected_experts"].element_size())
+        total += int(layer_count * host["routing_weights"].size(1) * host["routing_weights"].size(2) * host["routing_weights"].element_size())
         return total

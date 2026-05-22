@@ -660,9 +660,28 @@ class Qwen3MoeModel(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        return self.forward_layers(
+            hidden_states,
+            position_ids,
+            start_layer=0,
+            end_layer=len(self.layers),
+            apply_norm=True,
+        )
+
+    def forward_layers(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        apply_norm: bool,
+    ) -> torch.Tensor:
         for decoder_layer in self.layers:
-            controller = self.verify_prefetch_controller
             layer_idx = decoder_layer.layer_idx
+            if layer_idx < start_layer or layer_idx >= end_layer:
+                continue
+            controller = self.verify_prefetch_controller
             if controller is not None:
                 controller.before_verify_layer(layer_idx)
             hidden_states = decoder_layer(
@@ -671,7 +690,8 @@ class Qwen3MoeModel(nn.Module):
             )
             if controller is not None:
                 controller.after_verify_layer(layer_idx)
-        hidden_states = self.norm(hidden_states)
+        if apply_norm:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -701,6 +721,28 @@ class Qwen3MoeForCausalLM(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(input_ids, position_ids)
+
+    def forward_draft_segment(
+        self,
+        input_ids: torch.Tensor | None,
+        hidden_states: torch.Tensor | None,
+        position_ids: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        apply_norm: bool,
+    ) -> torch.Tensor:
+        if hidden_states is None:
+            if input_ids is None:
+                raise ValueError("input_ids are required for the first draft segment")
+            hidden_states = self.model.embed_tokens(input_ids)
+        return self.model.forward_layers(
+            hidden_states,
+            position_ids,
+            start_layer=int(start_layer),
+            end_layer=int(end_layer),
+            apply_norm=bool(apply_norm),
+        )
     
     def compute_logits(
         self,

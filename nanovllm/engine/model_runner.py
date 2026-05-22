@@ -98,6 +98,8 @@ class ModelRunner:
         self._verify_layer_compute_ms_ema: dict[int, float] = {}
         self._verify_layer_timing_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
         self._verify_layer_active_timing: dict[int, object] = {}
+        self._active_draft_prefetch_step_id = -1
+        self._draft_segment_metadata_enqueued_step_id = -1
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -291,6 +293,66 @@ class ModelRunner:
         self._prefetch_step_id += 1
         return self._prefetch_step_id
 
+    def _prefetch_runtime_mode(self) -> str:
+        return str(getattr(getattr(self, "config", None), "prefetch_runtime_mode", "baseline_staging"))
+
+    def _draft_prefetch_granularity(self) -> str:
+        return str(getattr(getattr(self, "config", None), "draft_prefetch_frontier_granularity", "segment"))
+
+    def _draft_segment_graph_enabled(self) -> bool:
+        return (
+            self._prefetch_runtime_mode() == "draft_direct_active"
+            and self._draft_prefetch_granularity() in {"segment", "layer"}
+            and hasattr(self.model, "forward_draft_segment")
+        )
+
+    def _draft_segment_size(self) -> int:
+        if self._draft_prefetch_granularity() == "layer":
+            return 1
+        return max(1, int(getattr(self.config, "draft_prefetch_segment_size", 12)))
+
+    def _draft_segment_boundaries(self) -> list[tuple[int, int]]:
+        num_layers = int(getattr(getattr(self.config, "hf_config", None), "num_hidden_layers", 0))
+        if num_layers <= 0:
+            layer_caches = getattr(self, "layer_caches", None)
+            if layer_caches:
+                num_layers = max(int(layer_idx) for layer_idx in layer_caches.keys()) + 1
+        if num_layers <= 0:
+            return []
+        segment_size = self._draft_segment_size()
+        return [(start, min(start + segment_size, num_layers)) for start in range(0, num_layers, segment_size)]
+
+    def _draft_prefetch_frontier_layer_idx(self) -> int | None:
+        layer_caches = getattr(self, "layer_caches", None)
+        if not layer_caches:
+            return None
+        # Full-draft metadata is only submitted after replay, so every layer is
+        # already behind the safety frontier. Segment metadata passes an
+        # explicit frontier from _enqueue_draft_segment_metadata.
+        return max(int(layer_idx) for layer_idx in layer_caches.keys())
+
+    def _submit_prefetch_after_metadata(
+        self,
+        *,
+        prefetch_runtime: PrefetchRuntime,
+        mode: str,
+        step_id: int,
+        phase: str,
+        frontier_layer_idx: int | None = None,
+    ) -> int:
+        if mode == "draft" and self._prefetch_runtime_mode() == "draft_direct_active":
+            return prefetch_runtime.submit_draft_direct_active_prefetch(
+                step_id=step_id,
+                phase=phase,
+                frontier_layer_idx=(
+                    self._draft_prefetch_frontier_layer_idx()
+                    if frontier_layer_idx is None
+                    else int(frontier_layer_idx)
+                ),
+                visible_budget_ms=float(getattr(self.config, "draft_prefetch_visible_budget_ms", 3.0)),
+            )
+        return prefetch_runtime.submit_from_global_queue(step_id=step_id, phase=phase)
+
     def _trace_prefetch_interval(
         self,
         *,
@@ -479,9 +541,24 @@ class ModelRunner:
 
             submit_after_phase = item["submit_after_phase"]
             if submit_after_phase is not None:
-                submit_after_t0 = perf_counter()
-                prefetch_runtime.submit_from_global_queue(step_id=int(item["step_id"]), phase=str(submit_after_phase))
-                submit_after_ms = (perf_counter() - submit_after_t0) * 1000.0
+                mode = str(item["mode"])
+                stale_draft_submit = (
+                    mode == "draft"
+                    and self._prefetch_runtime_mode() == "draft_direct_active"
+                    and int(item["step_id"]) != int(getattr(self, "_active_draft_prefetch_step_id", -1))
+                )
+                if stale_draft_submit:
+                    self._profile["run_draft_submit_after_stale_skip_count"] += 1
+                else:
+                    submit_after_t0 = perf_counter()
+                    self._submit_prefetch_after_metadata(
+                        prefetch_runtime=prefetch_runtime,
+                        mode=mode,
+                        step_id=int(item["step_id"]),
+                        phase=str(submit_after_phase),
+                        frontier_layer_idx=item.get("frontier_layer_idx"),
+                    )
+                    submit_after_ms = (perf_counter() - submit_after_t0) * 1000.0
 
             prefetch_runtime.record_metadata_offload(
                 mode=str(item["mode"]),
@@ -593,6 +670,7 @@ class ModelRunner:
         host_buffer_slot: int = 0,
         submit_after_phase: str | None = None,
         record_verify_consumed: bool = False,
+        frontier_layer_idx: int | None = None,
     ) -> None:
         self._ensure_prefetch_internal_state()
         if handle is None:
@@ -605,6 +683,7 @@ class ModelRunner:
             "enqueue_ts_ms": perf_counter() * 1000.0,
             "submit_after_phase": submit_after_phase,
             "record_verify_consumed": bool(record_verify_consumed),
+            "frontier_layer_idx": frontier_layer_idx,
             "buffer_key": self._prefetch_worker_key(mode=mode, handle=handle),
             "host_buffer_slot": int(host_buffer_slot),
         }
@@ -884,7 +963,7 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             replay_t0 = perf_counter()
             graph.replay()
-            if self.profile_cuda_sync:
+            if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
                 torch.cuda.synchronize()
             replay_ms = (perf_counter() - replay_t0) * 1000.0
             self._profile["graph_replay_count"] += 1
@@ -896,6 +975,9 @@ class ModelRunner:
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _replay_draft_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if self._can_use_draft_segment_graph(input_ids.size(0)):
+            return self._replay_draft_segment_graph(input_ids, positions)
+
         bs = input_ids.size(0)
         context = get_context()
         graph = self.draft_graphs[next(x for x in self.draft_graph_bs if x >= bs)]
@@ -910,7 +992,7 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             replay_t0 = perf_counter()
             graph.replay()
-            if self.profile_cuda_sync:
+            if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
                 torch.cuda.synchronize()
             replay_ms = (perf_counter() - replay_t0) * 1000.0
             self._profile["graph_replay_count"] += 1
@@ -919,6 +1001,106 @@ class ModelRunner:
             self._profile["draft_graph_replay_ms"] += replay_ms
         else:
             graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    def _can_use_draft_segment_graph(self, bs: int) -> bool:
+        if not self._draft_segment_graph_enabled():
+            return False
+        if bs > getattr(getattr(self, "config", None), "draft_cuda_graph_max_bs", 512):
+            return False
+        graphs = getattr(self, "draft_segment_graphs", None)
+        if not graphs:
+            return False
+        return any(bucket >= bs for bucket in self.draft_graph_bs)
+
+    def _enqueue_draft_segment_metadata(
+        self,
+        *,
+        step_id: int,
+        token_capacity: int,
+        layer_start_idx: int,
+        layer_end_idx: int,
+    ) -> None:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is None or runtime_meta_recorder is None:
+            return
+
+        host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+            mode="draft",
+            token_capacity=int(token_capacity),
+        )
+        enqueue_t0 = perf_counter()
+        handle = runtime_meta_recorder.offload_async(
+            prefetch_runtime.metadata_stream,
+            host_buffer_slot=host_buffer_slot,
+            layer_start_idx=int(layer_start_idx),
+            layer_end_idx=int(layer_end_idx),
+        )
+        enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+        if handle is None:
+            return
+        frontier = int(layer_end_idx) - 1
+        self._enqueue_prefetch_metadata(
+            mode="draft",
+            step_id=int(step_id),
+            handle=handle,
+            enqueue_ms=enqueue_ms,
+            host_buffer_slot=host_buffer_slot,
+            submit_after_phase="after_draft_segment",
+            frontier_layer_idx=frontier,
+        )
+        self._draft_segment_metadata_enqueued_step_id = int(step_id)
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["draft_segment_metadata_enqueue_count"] += 1
+                self._profile["draft_segment_metadata_enqueue_ms"] += enqueue_ms
+                self._profile["draft_segment_frontier_sum"] += frontier
+        if not getattr(self, "_prefetch_async_enabled", False):
+            self._flush_pending_prefetch_metadata(block=True)
+
+    def _replay_draft_segment_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        bs = input_ids.size(0)
+        context = get_context()
+        bucket = next(x for x in self.draft_graph_bs if x >= bs)
+        graphs = self.draft_segment_graphs[bucket]
+        boundaries = self.draft_segment_boundaries[bucket]
+        graph_vars = self.draft_segment_graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+
+        replay_t0 = perf_counter()
+        step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
+        for graph, (layer_start, layer_end) in zip(graphs, boundaries, strict=True):
+            segment_t0 = perf_counter()
+            graph.replay()
+            segment_enqueue_ms = (perf_counter() - segment_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["draft_segment_graph_replay_count"] += 1
+                    self._profile["draft_segment_graph_replay_enqueue_ms"] += segment_enqueue_ms
+            if step_id >= 0:
+                self._enqueue_draft_segment_metadata(
+                    step_id=step_id,
+                    token_capacity=int(bucket),
+                    layer_start_idx=int(layer_start),
+                    layer_end_idx=int(layer_end),
+                )
+
+        if self.profile_enabled and self.rank == 0:
+            if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            replay_ms = (perf_counter() - replay_t0) * 1000.0
+            self._profile["graph_replay_count"] += 1
+            self._profile["graph_hit_count"] += 1
+            self._profile["draft_graph_replay_count"] += 1
+            self._profile["draft_graph_replay_ms"] += replay_ms
+            self._profile["draft_segment_graph_replay_ms"] += replay_ms
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
@@ -930,6 +1112,8 @@ class ModelRunner:
             return False
         if bs > getattr(self.config, "draft_cuda_graph_max_bs", 512):
             return False
+        if self._can_use_draft_segment_graph(bs):
+            return True
         if not hasattr(self, "draft_graphs") or not self.draft_graphs:
             return False
         return any(bucket >= bs for bucket in self.draft_graph_bs)
@@ -1048,6 +1232,8 @@ class ModelRunner:
         if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
             self.model.set_draft_cpu_graph_mode(True)
         self._decode_graph_policy = "draft"
+        self._active_draft_prefetch_step_id = int(step_id)
+        self._draft_segment_metadata_enqueued_step_id = -1
         mode_set_ms = (perf_counter() - mode_set_t0) * 1000.0
         if self.profile_enabled and self.rank == 0:
             self._profile["run_draft_mode_set_ms"] += mode_set_ms
@@ -1060,6 +1246,8 @@ class ModelRunner:
                 if self._can_use_draft_cudagraph(len(seqs)):
                     draft_capacity = next(x for x in self.draft_graph_bs if x >= len(seqs))
 
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.drain_direct_active_ready(step_id=step_id)
                 self._wait_for_prefetch_device_reuse(mode="draft", token_capacity=draft_capacity)
                 runtime_meta_recorder.arm(
                     mode="draft",
@@ -1101,24 +1289,28 @@ class ModelRunner:
                 )
 
             if prefetch_runtime is not None and runtime_meta_recorder is not None:
-                host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
-                    mode="draft",
-                    token_capacity=draft_capacity,
+                segment_metadata_enqueued = (
+                    int(getattr(self, "_draft_segment_metadata_enqueued_step_id", -1)) == int(step_id)
                 )
-                enqueue_t0 = perf_counter()
-                handle = runtime_meta_recorder.offload_async(
-                    prefetch_runtime.metadata_stream,
-                    host_buffer_slot=host_buffer_slot,
-                )
-                enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
-                self._enqueue_prefetch_metadata(
-                    mode="draft",
-                    step_id=step_id,
-                    handle=handle,
-                    enqueue_ms=enqueue_ms,
-                    host_buffer_slot=host_buffer_slot,
-                    submit_after_phase="after_draft",
-                )
+                if not segment_metadata_enqueued:
+                    host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+                        mode="draft",
+                        token_capacity=draft_capacity,
+                    )
+                    enqueue_t0 = perf_counter()
+                    handle = runtime_meta_recorder.offload_async(
+                        prefetch_runtime.metadata_stream,
+                        host_buffer_slot=host_buffer_slot,
+                    )
+                    enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                    self._enqueue_prefetch_metadata(
+                        mode="draft",
+                        step_id=step_id,
+                        handle=handle,
+                        enqueue_ms=enqueue_ms,
+                        host_buffer_slot=host_buffer_slot,
+                        submit_after_phase="after_draft",
+                    )
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
             if return_logits and self.rank == 0:
@@ -1126,6 +1318,8 @@ class ModelRunner:
             return token_ids, {"prefetch_step_id": step_id}
         finally:
             self._decode_graph_policy = "standard"
+            self._active_draft_prefetch_step_id = -1
+            self._draft_segment_metadata_enqueued_step_id = -1
             if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
                 self.model.set_draft_cpu_graph_mode(False)
             self._set_speculative_execution_mode("normal")
@@ -1449,6 +1643,9 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_draft_cudagraph(self):
         self.draft_graphs = {}
+        self.draft_segment_graphs = {}
+        self.draft_segment_boundaries = {}
+        self.draft_segment_graph_vars = {}
         self.draft_graph_pool = None
         self.draft_graph_bs = []
 
@@ -1477,6 +1674,17 @@ class ModelRunner:
         self.draft_graph_bs = sorted(set(self.draft_graph_bs))
 
         if not self.draft_graph_bs:
+            return
+
+        if self._draft_segment_graph_enabled():
+            self._capture_draft_segment_cudagraph(
+                input_ids=input_ids,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                context_lens=context_lens,
+                block_tables=block_tables,
+                outputs=outputs,
+            )
             return
 
         self._set_speculative_execution_mode("draft")
@@ -1522,4 +1730,115 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+        )
+
+    def _capture_draft_segment_cudagraph(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        outputs: torch.Tensor,
+    ) -> None:
+        boundaries = self._draft_segment_boundaries()
+        if not boundaries:
+            return
+
+        hidden_size = int(getattr(self.config.hf_config, "hidden_size"))
+        segment_outputs = [
+            torch.zeros(input_ids.size(0), hidden_size, dtype=outputs.dtype, device=outputs.device)
+            for _ in boundaries
+        ]
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        draft_cpu_graph = self._can_use_draft_cpu_cudagraph()
+
+        self._set_speculative_execution_mode("draft")
+        if hasattr(self.model, "set_draft_cpu_graph_mode"):
+            self.model.set_draft_cpu_graph_mode(draft_cpu_graph)
+        try:
+            for bs in reversed(self.draft_graph_bs):
+                graphs = []
+                set_context(
+                    False,
+                    slot_mapping=slot_mapping[:bs],
+                    context_lens=context_lens[:bs],
+                    block_tables=block_tables[:bs],
+                )
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="draft",
+                        step_id=-1,
+                        token_capacity=bs,
+                        logical_token_count=bs,
+                    )
+                for segment_idx, (layer_start, layer_end) in enumerate(boundaries):
+                    graph = torch.cuda.CUDAGraph()
+                    apply_norm = int(layer_end) >= int(getattr(self.config.hf_config, "num_hidden_layers"))
+                    if segment_idx == 0:
+                        segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                            input_ids[:bs],
+                            None,
+                            positions[:bs],
+                            start_layer=int(layer_start),
+                            end_layer=int(layer_end),
+                            apply_norm=apply_norm,
+                        )
+                    else:
+                        segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                            None,
+                            segment_outputs[segment_idx - 1][:bs],
+                            positions[:bs],
+                            start_layer=int(layer_start),
+                            end_layer=int(layer_end),
+                            apply_norm=apply_norm,
+                        )
+                    if draft_cpu_graph:
+                        torch.cuda.synchronize()
+                        if hasattr(self.model, "check_draft_cpu_graph_errors"):
+                            self.model.check_draft_cpu_graph_errors()
+                    with torch.cuda.graph(graph, self.draft_graph_pool):
+                        if segment_idx == 0:
+                            segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                                input_ids[:bs],
+                                None,
+                                positions[:bs],
+                                start_layer=int(layer_start),
+                                end_layer=int(layer_end),
+                                apply_norm=apply_norm,
+                            )
+                        else:
+                            segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                                None,
+                                segment_outputs[segment_idx - 1][:bs],
+                                positions[:bs],
+                                start_layer=int(layer_start),
+                                end_layer=int(layer_end),
+                                apply_norm=apply_norm,
+                            )
+                    if self.draft_graph_pool is None:
+                        self.draft_graph_pool = graph.pool()
+                    graphs.append(graph)
+                self.draft_segment_graphs[bs] = graphs
+                self.draft_segment_boundaries[bs] = list(boundaries)
+                torch.cuda.synchronize()
+                if hasattr(self.model, "check_draft_cpu_graph_errors"):
+                    self.model.check_draft_cpu_graph_errors()
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.reset()
+                reset_context()
+        finally:
+            if hasattr(self.model, "set_draft_cpu_graph_mode"):
+                self.model.set_draft_cpu_graph_mode(False)
+            self._set_speculative_execution_mode("normal")
+
+        self.draft_segment_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=segment_outputs[-1],
+            segment_outputs=segment_outputs,
         )

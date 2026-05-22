@@ -50,7 +50,14 @@ class Config:
     prefetch_verify_layer_min_compute_ms: float = 0.05
     prefetch_verify_layer_transfer_bandwidth_gbps: float = 12.0
     prefetch_verify_layer_max_budget: int = 2
+    prefetch_metadata_host_buffer_pool_size: int = 3
     prefetch_runtime_mode: str = "baseline_staging"
+    draft_prefetch_frontier_granularity: str = "segment"
+    draft_prefetch_segment_size: int = 12
+    draft_prefetch_segment_host_buffer_pool_size: int = 0
+    draft_prefetch_visible_budget_ms: float = 3.0
+    draft_prefetch_min_per_boundary: int = 0
+    draft_prefetch_max_per_boundary: int = 4
     spec_profile: bool = False
     engine_profile: bool = False
     engine_profile_cuda_sync: bool = True
@@ -122,7 +129,14 @@ class Config:
         assert self.prefetch_verify_layer_min_compute_ms >= 0.0
         assert self.prefetch_verify_layer_transfer_bandwidth_gbps > 0.0
         assert self.prefetch_verify_layer_max_budget >= 0
-        assert self.prefetch_runtime_mode == "baseline_staging"
+        assert self.prefetch_metadata_host_buffer_pool_size >= 1
+        assert self.prefetch_runtime_mode in {"baseline_staging", "draft_direct_active"}
+        assert self.draft_prefetch_frontier_granularity in {"iteration", "segment", "layer"}
+        assert self.draft_prefetch_segment_size >= 1
+        assert self.draft_prefetch_segment_host_buffer_pool_size >= 0
+        assert self.draft_prefetch_visible_budget_ms >= 0.0
+        assert self.draft_prefetch_min_per_boundary >= 0
+        assert self.draft_prefetch_max_per_boundary >= self.draft_prefetch_min_per_boundary
         assert self.acceptance_strategy in {"greedy", "standard", "standard_sampling", "sampling", "spec_sampling"}
         assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}
         assert self.cpu_expert_workspace_max_routes >= 1

@@ -145,6 +145,14 @@ def run_case(args: argparse.Namespace) -> dict:
         prefetch_use_prefill_history=args.prefetch_use_prefill_history,
         prefetch_use_verify_history=args.prefetch_use_verify_history,
         prefetch_use_draft_live=args.prefetch_use_draft_live,
+        prefetch_metadata_host_buffer_pool_size=args.prefetch_metadata_host_buffer_pool_size,
+        prefetch_runtime_mode=args.prefetch_runtime_mode,
+        draft_prefetch_frontier_granularity=args.draft_prefetch_frontier_granularity,
+        draft_prefetch_segment_size=args.draft_prefetch_segment_size,
+        draft_prefetch_segment_host_buffer_pool_size=args.draft_prefetch_segment_host_buffer_pool_size,
+        draft_prefetch_visible_budget_ms=args.draft_prefetch_visible_budget_ms,
+        draft_prefetch_min_per_boundary=args.draft_prefetch_min_per_boundary,
+        draft_prefetch_max_per_boundary=args.draft_prefetch_max_per_boundary,
     )
 
     prompts = _build_meaningful_prompts(args, rng)
@@ -198,6 +206,14 @@ def run_case(args: argparse.Namespace) -> dict:
         "output_len": args.output_len,
         "seed": args.seed,
         "spec_enable_prefetch": bool(mode == "spec" and args.spec_enable_prefetch),
+        "prefetch_runtime_mode": args.prefetch_runtime_mode,
+        "prefetch_metadata_host_buffer_pool_size": int(args.prefetch_metadata_host_buffer_pool_size),
+        "draft_prefetch_frontier_granularity": args.draft_prefetch_frontier_granularity,
+        "draft_prefetch_segment_size": int(args.draft_prefetch_segment_size),
+        "draft_prefetch_segment_host_buffer_pool_size": int(args.draft_prefetch_segment_host_buffer_pool_size),
+        "draft_prefetch_visible_budget_ms": float(args.draft_prefetch_visible_budget_ms),
+        "draft_prefetch_min_per_boundary": int(args.draft_prefetch_min_per_boundary),
+        "draft_prefetch_max_per_boundary": int(args.draft_prefetch_max_per_boundary),
         "prefetch_verify_wait_ms": float(args.prefetch_verify_wait_ms),
         "input_tokens": input_tokens,
         "target_output_tokens": target_output_tokens,
@@ -277,6 +293,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-use-prefill-history", type=str2bool, default=True)
     parser.add_argument("--prefetch-use-verify-history", type=str2bool, default=True)
     parser.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
+    parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
+    parser.add_argument("--prefetch-runtime-mode", type=str, default="baseline_staging",
+                        choices=["baseline_staging", "draft_direct_active"])
+    parser.add_argument("--draft-prefetch-frontier-granularity", type=str, default="segment",
+                        choices=["iteration", "segment", "layer"])
+    parser.add_argument("--draft-prefetch-segment-size", type=int, default=12)
+    parser.add_argument("--draft-prefetch-segment-host-buffer-pool-size", type=int, default=0)
+    parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
+    parser.add_argument("--draft-prefetch-min-per-boundary", type=int, default=0)
+    parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=4)
     parser.add_argument("--return-token-ids", type=str2bool, default=False)
     parser.add_argument("--return-text", type=str2bool, default=True)
     parser.add_argument("--return-prompts", type=str2bool, default=True)

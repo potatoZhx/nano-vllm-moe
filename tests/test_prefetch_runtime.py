@@ -31,6 +31,12 @@ class TestPrefetchRuntime(unittest.TestCase):
             prefetch_verify_layer_enabled=True,
             prefetch_verify_layer_transfer_bandwidth_gbps=12.0,
             prefetch_verify_layer_max_budget=2,
+            prefetch_runtime_mode="baseline_staging",
+            draft_prefetch_frontier_granularity="segment",
+            draft_prefetch_segment_size=4,
+            draft_prefetch_visible_budget_ms=3.0,
+            draft_prefetch_min_per_boundary=0,
+            draft_prefetch_max_per_boundary=4,
         )
 
     def _build_runtime(self):
@@ -146,6 +152,120 @@ class TestPrefetchRuntime(unittest.TestCase):
         prof = runtime.get_profile(reset=False)
         self.assertEqual(prof["verify_layer_prefetch_submit_count"], 1)
         self.assertEqual(prof["verify_layer_prefetch_publish_count"], 1)
+
+    def test_draft_direct_active_prefetch_respects_frontier(self):
+        cfg = self._config()
+        cfg.prefetch_runtime_mode = "draft_direct_active"
+        cfg.prefetch_staging_slots_per_layer = 0
+        cpu_pool = {
+            0: {
+                0: {"gate_up": torch.zeros(2, 2), "down": torch.zeros(2, 2)},
+                2: {"gate_up": torch.ones(2, 2), "down": torch.ones(2, 2)},
+            },
+            1: {
+                0: {"gate_up": torch.zeros(2, 2), "down": torch.zeros(2, 2)},
+                2: {"gate_up": torch.ones(2, 2), "down": torch.ones(2, 2)},
+            },
+        }
+        caches = {}
+        for layer_idx in (0, 1):
+            cache = LayerExpertCache(
+                num_experts=3,
+                slots_per_layer=1,
+                gate_up_shape=(2, 2),
+                down_shape=(2, 2),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                cpu_expert_pool=cpu_pool[layer_idx],
+                staging_slots_per_layer=0,
+                enable_prefetch=False,
+            )
+            cache.put_to_slot(0, 0, cpu_pool[layer_idx][0]["gate_up"], cpu_pool[layer_idx][0]["down"])
+            caches[layer_idx] = cache
+
+        runtime = PrefetchRuntime(
+            config=cfg,
+            layer_caches=caches,
+            cpu_expert_pool=cpu_pool,
+            cache_strategy=create_cache_strategy("lru"),
+            prefetch_strategy=create_prefetch_strategy("noop", cfg),
+            runtime_meta_recorder=SimpleNamespace(),
+        )
+        runtime.observe_draft(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=3,
+                    mode="draft",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                ),
+                1: LayerRuntimeMetaCPU(
+                    step_id=3,
+                    mode="draft",
+                    layer_idx=1,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                ),
+            },
+            step_id=3,
+        )
+
+        submitted = runtime.submit_draft_direct_active_prefetch(
+            step_id=3,
+            phase="after_draft",
+            frontier_layer_idx=0,
+            visible_budget_ms=10.0,
+        )
+        self.assertEqual(submitted, 1)
+        self.assertFalse(caches[0].is_cached_cpu(2))
+        self.assertFalse(caches[1].is_cached_cpu(2))
+
+        published = runtime.publish_direct_active_ready(step_id=3)
+        self.assertEqual(published, 1)
+        self.assertTrue(caches[0].is_cached_cpu(2))
+        self.assertFalse(caches[1].is_cached_cpu(2))
+
+        prof = runtime.get_profile(reset=False)
+        self.assertEqual(prof["draft_direct_active_prefetch_submit_count"], 1)
+        self.assertEqual(prof["draft_direct_active_prefetch_publish_count"], 1)
+        self.assertEqual(prof["draft_direct_active_prefetch_skipped_by_frontier_count"], 0)
+        self.assertEqual(prof["staging_prefetch_submit_count"], 0)
+
+    def test_draft_direct_active_budget_can_adapt_down(self):
+        runtime, _cache = self._build_runtime()
+        runtime.config.draft_prefetch_min_per_boundary = 0
+        runtime.config.draft_prefetch_max_per_boundary = 2
+        runtime.config.draft_prefetch_visible_budget_ms = 0.1
+        runtime._draft_direct_active_budget = 2
+
+        runtime._adjust_draft_direct_active_budget(visible_ms=1.0)
+
+        prof = runtime.get_profile(reset=False)
+        self.assertEqual(prof["draft_direct_active_prefetch_adaptive_budget"], 1)
+        self.assertEqual(prof["draft_direct_active_prefetch_budget_decrease_count"], 1)
+
+    def test_draft_direct_active_budget_recovers_from_zero(self):
+        runtime, _cache = self._build_runtime()
+        runtime.config.draft_prefetch_min_per_boundary = 0
+        runtime.config.draft_prefetch_max_per_boundary = 2
+        runtime.config.draft_prefetch_visible_budget_ms = 3.0
+        runtime._draft_direct_active_budget = 0
+
+        submitted = runtime.submit_draft_direct_active_prefetch(
+            step_id=4,
+            phase="after_draft",
+            frontier_layer_idx=0,
+            visible_budget_ms=3.0,
+        )
+
+        self.assertEqual(submitted, 0)
+        prof = runtime.get_profile(reset=False)
+        self.assertEqual(prof["draft_direct_active_prefetch_adaptive_budget"], 1)
+        self.assertEqual(prof["draft_direct_active_prefetch_budget_increase_count"], 1)
+        self.assertEqual(prof["draft_direct_active_prefetch_skipped_by_budget_count"], 1)
 
 
 if __name__ == "__main__":
