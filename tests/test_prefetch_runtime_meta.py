@@ -48,6 +48,27 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
         self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
         self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
 
+    def test_histogram_metadata_respects_logical_token_count(self):
+        recorder = ModelRuntimeMetaRecorder(
+            config=SimpleNamespace(prefetch_runtime_mode="draft_segment_indexed"),
+            hf_config=SimpleNamespace(num_hidden_layers=1, num_experts_per_tok=2, num_experts=4),
+        )
+        recorder.arm(mode="draft", step_id=1, token_capacity=4, logical_token_count=2)
+
+        selected = torch.tensor([[1, 2], [2, 3], [1, 0], [0, 3]], dtype=torch.int64)
+        weights = torch.ones(4, 2, dtype=torch.float32)
+        recorder.record_layer(layer_idx=0, selected_experts=selected, routing_weights=weights)
+
+        handle = recorder.offload_async(stream=None)
+        out = recorder.collect(handle, wait=True)
+
+        self.assertEqual(handle.metadata_format, "histogram")
+        self.assertEqual(out[0].token_count, 2)
+        self.assertIsNone(out[0].selected_experts)
+        self.assertIsNone(out[0].routing_weights)
+        self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
+
     def test_collect_supports_host_buffer_pool_slot(self):
         recorder = ModelRuntimeMetaRecorder(
             config=SimpleNamespace(prefetch_metadata_host_buffer_pool_size=2),
@@ -166,6 +187,30 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
 
             graph.replay()
             torch.cuda.synchronize()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for histogram graph-capture regression test")
+    def test_histogram_record_layer_is_capture_safe(self):
+        recorder = ModelRuntimeMetaRecorder(
+            config=SimpleNamespace(prefetch_runtime_mode="draft_segment_indexed"),
+            hf_config=SimpleNamespace(num_hidden_layers=1, num_experts_per_tok=2, num_experts=4),
+        )
+
+        with torch.device("cuda"):
+            recorder.arm(mode="draft", step_id=1, token_capacity=2, logical_token_count=2)
+            selected = torch.tensor([[1, 2], [2, 3]], dtype=torch.int64, device="cuda")
+            weights = torch.tensor([[0.7, 0.3], [0.4, 0.6]], dtype=torch.float16, device="cuda")
+
+            graph = torch.cuda.CUDAGraph()
+            recorder.record_layer(layer_idx=0, selected_experts=selected, routing_weights=weights)
+            with torch.cuda.graph(graph):
+                recorder.record_layer(layer_idx=0, selected_experts=selected, routing_weights=weights)
+
+            graph.replay()
+            torch.cuda.synchronize()
+            out = recorder.collect(recorder.offload_async(stream=None), wait=True)
+
+        self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
+        self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
 
 
 if __name__ == "__main__":

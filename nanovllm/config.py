@@ -130,7 +130,7 @@ class Config:
         assert self.prefetch_verify_layer_transfer_bandwidth_gbps > 0.0
         assert self.prefetch_verify_layer_max_budget >= 0
         assert self.prefetch_metadata_host_buffer_pool_size >= 1
-        assert self.prefetch_runtime_mode in {"baseline_staging", "draft_direct_active"}
+        assert self.prefetch_runtime_mode in {"baseline_staging", "draft_direct_active", "draft_segment_indexed"}
         assert self.draft_prefetch_frontier_granularity in {"iteration", "segment", "layer"}
         assert self.draft_prefetch_segment_size >= 1
         assert self.draft_prefetch_segment_host_buffer_pool_size >= 0

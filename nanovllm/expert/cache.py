@@ -368,6 +368,28 @@ class LayerExpertCache:
             prev_expert=int(prev_expert) if prev_expert is not None else -1,
         )
 
+    def reserve_active_slot_for_prefetch_deferred(
+        self,
+        layer_idx: int,
+        active_slot_idx: int,
+        expert_idx: int,
+    ) -> ActiveReservation | None:
+        if not (0 <= active_slot_idx < self.num_slots):
+            return None
+        if self.active_slot_pending_expert[active_slot_idx] >= 0:
+            return None
+
+        prev_expert = self.slot_to_expert[active_slot_idx]
+        self.active_slot_pending_expert[active_slot_idx] = int(expert_idx)
+        self.slot_generation[active_slot_idx] += 1
+        return ActiveReservation(
+            layer_idx=int(layer_idx),
+            active_slot_idx=int(active_slot_idx),
+            expert_idx=int(expert_idx),
+            generation=int(self.slot_generation[active_slot_idx]),
+            prev_expert=int(prev_expert) if prev_expert is not None else -1,
+        )
+
     def begin_async_put_to_active(
         self,
         reservation: ActiveReservation,
@@ -422,11 +444,57 @@ class LayerExpertCache:
             generation=reservation.generation,
         )
 
+    def commit_deferred_active_prefetch(self, reservation: ActiveReservation) -> PublishedExpert | None:
+        slot_idx = reservation.active_slot_idx
+        expert_idx = reservation.expert_idx
+        if not (0 <= slot_idx < self.num_slots):
+            return None
+        if self.slot_generation[slot_idx] != reservation.generation:
+            return None
+        if self.active_slot_pending_expert[slot_idx] != expert_idx:
+            return None
+        prev_expert = int(getattr(reservation, "prev_expert", -1))
+        if prev_expert >= 0 and self.slot_to_expert[slot_idx] != prev_expert:
+            self.active_slot_pending_expert[slot_idx] = -1
+            return None
+
+        if prev_expert >= 0 and prev_expert in self.expert_to_slot:
+            del self.expert_to_slot[prev_expert]
+            self.expert_to_slot_lut[prev_expert] = -1
+            self.cached_expert_mask[prev_expert] = False
+
+        self.slot_to_expert[slot_idx] = expert_idx
+        self.slot_to_expert_lut[slot_idx] = expert_idx
+        self.expert_to_slot[expert_idx] = slot_idx
+        self.expert_to_slot_lut[expert_idx] = slot_idx
+        self.cached_expert_mask[expert_idx] = True
+        self.active_slot_pending_expert[slot_idx] = -1
+        return PublishedExpert(
+            layer_idx=reservation.layer_idx,
+            expert_idx=expert_idx,
+            active_slot_idx=slot_idx,
+            staging_slot_idx=-1,
+            generation=reservation.generation,
+        )
+
+    def cancel_deferred_active_prefetch(self, reservation: ActiveReservation) -> None:
+        slot_idx = reservation.active_slot_idx
+        if not (0 <= slot_idx < self.num_slots):
+            return
+        if self.slot_generation[slot_idx] != reservation.generation:
+            return
+        if self.active_slot_pending_expert[slot_idx] != reservation.expert_idx:
+            return
+        self.active_slot_pending_expert[slot_idx] = -1
+
     def get_slot_idx(self, expert_idx: int) -> int:
         return self.expert_to_slot.get(expert_idx, -1)
 
     def is_cached_cpu(self, expert_idx: int) -> bool:
         return int(expert_idx) in self.expert_to_slot
+
+    def is_pending_cpu(self, expert_idx: int) -> bool:
+        return int(expert_idx) in self.active_slot_pending_expert
 
     def remap_experts_to_slots(self, selected_experts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Map original expert ids to slot ids; uncached experts are marked as -1."""

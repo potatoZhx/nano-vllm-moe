@@ -38,6 +38,14 @@ class TestConfigPrefetch(unittest.TestCase):
         )
         self.assertEqual(cfg.prefetch_runtime_mode, "draft_direct_active")
 
+    def test_draft_segment_indexed_runtime_mode_is_opt_in(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            prefetch_runtime_mode="draft_segment_indexed",
+        )
+        self.assertEqual(cfg.prefetch_runtime_mode, "draft_segment_indexed")
+
     def test_invalid_prefetch_runtime_mode_fails(self):
         with self.assertRaises(AssertionError):
             self._build_config(

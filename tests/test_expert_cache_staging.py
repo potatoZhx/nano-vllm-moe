@@ -57,6 +57,34 @@ class TestExpertCacheStaging(unittest.TestCase):
         self.assertEqual(cache.access_count[1], 1)
         self.assertGreater(cache.access_score_sum[1], 0.0)
 
+    def test_deferred_active_prefetch_does_not_publish_mapping_until_commit(self):
+        cache = self._build_cache()
+        cache.put_to_slot(0, 0, torch.ones(4, 4), torch.ones(4, 2))
+
+        reservation = cache.reserve_active_slot_for_prefetch_deferred(
+            layer_idx=0,
+            active_slot_idx=0,
+            expert_idx=3,
+        )
+        self.assertIsNotNone(reservation)
+        self.assertTrue(cache.is_active_slot_pending(0))
+        self.assertTrue(cache.is_cached_cpu(0))
+        self.assertFalse(cache.is_cached_cpu(3))
+
+        evt = cache.begin_async_put_to_active(
+            reservation=reservation,
+            gate_up_cpu=torch.full((4, 4), 7.0),
+            down_cpu=torch.full((4, 2), 9.0),
+            stream=None,
+        )
+        self.assertTrue(evt.query())
+        published = cache.commit_deferred_active_prefetch(reservation)
+
+        self.assertIsNotNone(published)
+        self.assertFalse(cache.is_active_slot_pending(0))
+        self.assertFalse(cache.is_cached_cpu(0))
+        self.assertTrue(cache.is_cached_cpu(3))
+
 
 if __name__ == "__main__":
     unittest.main()

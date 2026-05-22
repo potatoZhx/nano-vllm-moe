@@ -301,7 +301,7 @@ class ModelRunner:
 
     def _draft_segment_graph_enabled(self) -> bool:
         return (
-            self._prefetch_runtime_mode() == "draft_direct_active"
+            self._prefetch_runtime_mode() in {"draft_direct_active", "draft_segment_indexed"}
             and self._draft_prefetch_granularity() in {"segment", "layer"}
             and hasattr(self.model, "forward_draft_segment")
         )
@@ -342,6 +342,17 @@ class ModelRunner:
     ) -> int:
         if mode == "draft" and self._prefetch_runtime_mode() == "draft_direct_active":
             return prefetch_runtime.submit_draft_direct_active_prefetch(
+                step_id=step_id,
+                phase=phase,
+                frontier_layer_idx=(
+                    self._draft_prefetch_frontier_layer_idx()
+                    if frontier_layer_idx is None
+                    else int(frontier_layer_idx)
+                ),
+                visible_budget_ms=float(getattr(self.config, "draft_prefetch_visible_budget_ms", 3.0)),
+            )
+        if mode == "draft" and self._prefetch_runtime_mode() == "draft_segment_indexed":
+            return prefetch_runtime.submit_draft_segment_indexed_prefetch(
                 step_id=step_id,
                 phase=phase,
                 frontier_layer_idx=(
@@ -544,11 +555,23 @@ class ModelRunner:
                 mode = str(item["mode"])
                 stale_draft_submit = (
                     mode == "draft"
-                    and self._prefetch_runtime_mode() == "draft_direct_active"
-                    and int(item["step_id"]) != int(getattr(self, "_active_draft_prefetch_step_id", -1))
+                    and (
+                        (
+                            self._prefetch_runtime_mode() == "draft_direct_active"
+                            and int(item["step_id"]) != int(getattr(self, "_active_draft_prefetch_step_id", -1))
+                        )
+                        or (
+                            self._prefetch_runtime_mode() == "draft_segment_indexed"
+                            and bool(getattr(prefetch_runtime, "_active_draft_iteration_steps", set()))
+                            and int(item["step_id"]) not in getattr(prefetch_runtime, "_active_draft_iteration_steps", set())
+                        )
+                    )
                 )
                 if stale_draft_submit:
                     self._profile["run_draft_submit_after_stale_skip_count"] += 1
+                    if self._prefetch_runtime_mode() == "draft_segment_indexed":
+                        self._profile["run_draft_missed_prefetch_window_count"] += 1
+                        prefetch_runtime._profile["draft_segment_indexed_missed_prefetch_window_count"] += 1
                 else:
                     submit_after_t0 = perf_counter()
                     self._submit_prefetch_after_metadata(
@@ -582,6 +605,9 @@ class ModelRunner:
                 self._profile[f"{prefix}_queue_aggregate_ms"] += float(observe_stats.get("queue_aggregate_ms", 0.0))
                 self._profile[f"{prefix}_queue_filter_ms"] += float(observe_stats.get("queue_filter_ms", 0.0))
                 self._profile[f"{prefix}_queue_entry_update_ms"] += float(observe_stats.get("queue_entry_update_ms", 0.0))
+                self._profile[f"{prefix}_segment_index_aggregate_ms"] += float(observe_stats.get("segment_index_aggregate_ms", 0.0))
+                self._profile[f"{prefix}_segment_index_filter_ms"] += float(observe_stats.get("segment_index_filter_ms", 0.0))
+                self._profile[f"{prefix}_segment_index_entry_update_ms"] += float(observe_stats.get("segment_index_entry_update_ms", 0.0))
                 self._profile[f"{prefix}_async_turnaround_ms"] += turnaround_ms
                 if item["mode"] in {"draft", "verify"}:
                     self._profile[f"run_{item['mode']}_submit_after_ms"] += submit_after_ms
@@ -1234,6 +1260,9 @@ class ModelRunner:
         self._decode_graph_policy = "draft"
         self._active_draft_prefetch_step_id = int(step_id)
         self._draft_segment_metadata_enqueued_step_id = -1
+        if prefetch_runtime is not None and self._prefetch_runtime_mode() == "draft_segment_indexed":
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.begin_draft_iteration(step_id=step_id)
         mode_set_ms = (perf_counter() - mode_set_t0) * 1000.0
         if self.profile_enabled and self.rank == 0:
             self._profile["run_draft_mode_set_ms"] += mode_set_ms
@@ -1345,6 +1374,8 @@ class ModelRunner:
                 step_id=step_id,
                 timeout_ms=float(self.config.prefetch_verify_wait_ms),
             )
+            if self._prefetch_runtime_mode() == "draft_segment_indexed":
+                prefetch_runtime.end_draft_iteration()
         verify_wait_ms = (perf_counter() - t0) * 1000.0
         self._trace_prefetch_interval(
             name="verify_prefetch_wait",
@@ -1601,6 +1632,9 @@ class ModelRunner:
             )
             runtime_meta_recorder.reset()
             self._flush_pending_prefetch_metadata(block=False)
+            if self._prefetch_runtime_mode() == "draft_segment_indexed":
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.end_draft_iteration()
         return verify_outputs
 
     @torch.inference_mode()

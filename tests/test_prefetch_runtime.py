@@ -234,6 +234,90 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertEqual(prof["draft_direct_active_prefetch_skipped_by_frontier_count"], 0)
         self.assertEqual(prof["staging_prefetch_submit_count"], 0)
 
+    def test_draft_segment_indexed_prefetch_uses_segment_index_and_deferred_mapping(self):
+        cfg = self._config()
+        cfg.prefetch_runtime_mode = "draft_segment_indexed"
+        cfg.prefetch_staging_slots_per_layer = 0
+        cfg.draft_prefetch_segment_size = 1
+        cpu_pool = {
+            0: {
+                0: {"gate_up": torch.zeros(2, 2), "down": torch.zeros(2, 2)},
+                2: {"gate_up": torch.ones(2, 2), "down": torch.ones(2, 2)},
+            },
+            1: {
+                0: {"gate_up": torch.zeros(2, 2), "down": torch.zeros(2, 2)},
+                2: {"gate_up": torch.ones(2, 2), "down": torch.ones(2, 2)},
+            },
+        }
+        caches = {}
+        for layer_idx in (0, 1):
+            cache = LayerExpertCache(
+                num_experts=3,
+                slots_per_layer=1,
+                gate_up_shape=(2, 2),
+                down_shape=(2, 2),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                cpu_expert_pool=cpu_pool[layer_idx],
+                staging_slots_per_layer=0,
+                enable_prefetch=False,
+            )
+            cache.put_to_slot(0, 0, cpu_pool[layer_idx][0]["gate_up"], cpu_pool[layer_idx][0]["down"])
+            caches[layer_idx] = cache
+
+        runtime = PrefetchRuntime(
+            config=cfg,
+            layer_caches=caches,
+            cpu_expert_pool=cpu_pool,
+            cache_strategy=create_cache_strategy("lru"),
+            prefetch_strategy=create_prefetch_strategy("noop", cfg),
+            runtime_meta_recorder=SimpleNamespace(),
+        )
+        runtime.begin_draft_iteration(step_id=3)
+        runtime.observe_draft(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=3,
+                    mode="draft",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                ),
+                1: LayerRuntimeMetaCPU(
+                    step_id=3,
+                    mode="draft",
+                    layer_idx=1,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                ),
+            },
+            step_id=3,
+        )
+
+        submitted = runtime.submit_draft_segment_indexed_prefetch(
+            step_id=3,
+            phase="after_draft_segment",
+            frontier_layer_idx=0,
+            visible_budget_ms=10.0,
+        )
+        self.assertEqual(submitted, 1)
+        self.assertTrue(caches[0].is_cached_cpu(0))
+        self.assertFalse(caches[0].is_cached_cpu(2))
+        self.assertFalse(caches[1].is_pending_cpu(2))
+
+        published = runtime.publish_direct_active_ready(step_id=3)
+        self.assertEqual(published, 1)
+        self.assertFalse(caches[0].is_cached_cpu(0))
+        self.assertTrue(caches[0].is_cached_cpu(2))
+        self.assertFalse(caches[1].is_cached_cpu(2))
+
+        prof = runtime.get_profile(reset=False)
+        self.assertEqual(prof["draft_segment_indexed_prefetch_submit_count"], 1)
+        self.assertEqual(prof["draft_segment_indexed_prefetch_publish_count"], 1)
+        self.assertEqual(prof["draft_segment_indexed_prefetch_skipped_by_pending_count"], 0)
+
     def test_draft_direct_active_budget_can_adapt_down(self):
         runtime, _cache = self._build_runtime()
         runtime.config.draft_prefetch_min_per_boundary = 0

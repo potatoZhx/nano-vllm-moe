@@ -295,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
     parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     parser.add_argument("--prefetch-runtime-mode", type=str, default="baseline_staging",
-                        choices=["baseline_staging", "draft_direct_active"])
+                        choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"])
     parser.add_argument("--draft-prefetch-frontier-granularity", type=str, default="segment",
                         choices=["iteration", "segment", "layer"])
     parser.add_argument("--draft-prefetch-segment-size", type=int, default=12)
