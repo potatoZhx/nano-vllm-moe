@@ -91,6 +91,10 @@ T5: 下一次可能消费该 layer 的 graph/verify 才能看到新 expert
 - `draft_segment_indexed_victim_select_ms`
 - `draft_segment_indexed_prefetch_est_transfer_ms`
 - `draft_segment_indexed_missed_prefetch_window_count`
+- `draft_segment_indexed_prefetch_submit_count_by_segment`
+- `draft_segment_indexed_prefetch_ready_count_by_segment`
+- `draft_segment_indexed_prefetch_success_count_by_segment`
+- `draft_segment_indexed_prefetch_consumed_count_by_segment`
 - `segment_index_aggregate_ms`
 - `segment_index_filter_ms`
 - `segment_index_entry_update_ms`
@@ -164,11 +168,66 @@ python -m pytest -q \
 - indexed 路径没有丢 metadata：`stale_metadata_observe_count=0`，`missed_prefetch_window_count=0`。这说明当前 segment 边界消费流程没有窗口错过，但代价是 worker/submit 仍占用了过多 CPU 时间。
 - graph replay 本身也需要继续压缩。indexed 路径 graph replay 为 18.77 ms/call，比 standard 的 12.21 ms/call 高 6.56 ms/call，也比旧 direct-active 高 1.08 ms/call。这部分可能来自 draft segment graph 被拆成 4 段 replay、segment metadata enqueue、以及 histogram scatter_add 进入 graph 后的额外 kernel。
 
+## 2026-05-23 Safe-Rank 优化
+
+本轮继续压缩 `draft_segment_indexed` 的 candidate ranking。原实现中，每次 segment metadata 到达后：
+
+1. long-term segment index 完整扫描并排序一次；
+2. draft segment index 完整扫描并排序一次；
+3. 两个排序结果合并去重后再排序一次。
+
+保留的优化是行为等价的：两个 index 只生成完整候选集合，不做各自内部排序；合并去重后只做一次最终排序。这不截断候选，不丢 metadata，也不改变最终 candidate 排序语义。
+
+曾尝试 bounded top-k：每个 index 只取固定数量最高分候选再合并。该尝试已回滚，因为 A100 bs=1 下 draft forward 没有改善，且输出 digest 从 standard 的 `7d829b...bb14` 变成 `ebe069...beea`。后续如果要做 top-k，需要先证明候选截断不会改变确定性输出。
+
+A100 bs=1 safe-rank 结果：
+
+| 指标 | 2026-05-22 indexed | 2026-05-23 safe-rank indexed |
+| --- | ---: | ---: |
+| 输出 digest | `7d829b...bb14` | `7d829b...bb14` |
+| draft forward summary | 24.35 ms | 23.83 ms |
+| run draft total | 24.33 ms/call | 23.81 ms/call |
+| draft graph replay | 18.77 ms/call | 18.71 ms/call |
+| sampler | 0.53 ms/call | 0.54 ms/call |
+| draft submit after | 10.20 ms/call | 8.37 ms/call |
+| visible draft prefetch overhead | 10.14 ms/call | 8.31 ms/call |
+| candidate ranking | 4.89 ms/call | 3.71 ms/call |
+| victim selection | 0.05 ms/call | 0.05 ms/call |
+
+新增 per-segment 统计的 A100 实测结果，来自 `benchmarks/results/draft_segment_indexed_safe_rank_bs1_20260523_010141/spec_draft_segment_indexed_segment12.json`：
+
+这里的 segment id 是按 `draft_prefetch_segment_size=12` 切分后的 layer 段编号。48 层模型会有 4 个 segment：`0` 表示 layer 0-11，`1` 表示 layer 12-23，`2` 表示 layer 24-35，`3` 表示 layer 36-47。`success_count_by_segment` 表示该 segment 中 H2D copy ready 后成功 publish 到 GPU expert cache 的 expert 数；`consumed_count_by_segment` 表示后续 verify metadata 中命中过这些已发布 expert 的次数，因此它可能大于 success 数，因为同一个已发布 expert 可以在多个 verify 观察窗口内被重复消费统计。
+
+```json
+{
+  "model_draft_segment_indexed_prefetch_submit_count_by_segment": {
+    "0": 13,
+    "1": 9,
+    "2": 12,
+    "3": 12
+  },
+  "model_draft_segment_indexed_prefetch_success_count_by_segment": {
+    "0": 13,
+    "1": 9,
+    "2": 12,
+    "3": 12
+  },
+  "model_draft_segment_indexed_prefetch_consumed_count_by_segment": {
+    "0": 33,
+    "1": 19,
+    "2": 40,
+    "3": 22
+  }
+}
+```
+
+本轮仍未达到 `<5ms` overhead 目标。以同轮 standard CUDA graph decode forward `14.81 ms` 计算，safe-rank indexed draft forward `23.83 ms`，差距仍为 `9.02 ms`。剩余主要开销仍是完整 segment candidate scan 和最终 Python sort：本次 `candidate_ranked_count=27792`，`candidate_merge_count=24577`。
+
 ## 后续优化方向
 
 按本次 profile，后续优化优先级如下：
 
-- candidate ranking 从每次 Python 排序改为固定大小 top-k heap 或预排序 bucket，只在分数变化的 segment 增量更新。
+- candidate ranking 不能直接截断候选。下一步应维护 per-segment 预排序缓存或增量 dirty segment 缓存，把完整排序从 submit critical path 移到 metadata worker 的 observe 阶段，同时保持最终候选集合不变。
 - submit path 合并 candidate scan、pending check、budget check 和 reservation，减少 Python 函数调用和锁/状态表访问次数。
 - draft histogram metadata 继续保留，但要减少每个 segment replay 后的 enqueue 数量和 host buffer 轮转开销。
 - 评估 segment size 24 或 layer group 合并，减少一次 draft forward 中的 graph replay 边界数量。

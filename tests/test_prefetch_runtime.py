@@ -312,10 +312,27 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertFalse(caches[0].is_cached_cpu(0))
         self.assertTrue(caches[0].is_cached_cpu(2))
         self.assertFalse(caches[1].is_cached_cpu(2))
+        runtime.record_verify_consumed(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=4,
+                    mode="verify",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                )
+            },
+            step_id=4,
+        )
 
         prof = runtime.get_profile(reset=False)
         self.assertEqual(prof["draft_segment_indexed_prefetch_submit_count"], 1)
         self.assertEqual(prof["draft_segment_indexed_prefetch_publish_count"], 1)
+        self.assertEqual(prof["draft_segment_indexed_prefetch_submit_count_by_segment"], {"0": 1})
+        self.assertEqual(prof["draft_segment_indexed_prefetch_ready_count_by_segment"], {"0": 1})
+        self.assertEqual(prof["draft_segment_indexed_prefetch_success_count_by_segment"], {"0": 1})
+        self.assertEqual(prof["draft_segment_indexed_prefetch_consumed_count_by_segment"], {"0": 1})
         self.assertEqual(prof["draft_segment_indexed_prefetch_skipped_by_pending_count"], 0)
 
     def test_draft_direct_active_budget_can_adapt_down(self):

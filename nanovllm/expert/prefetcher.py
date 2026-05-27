@@ -41,6 +41,7 @@ class PrefetchTicket:
     active_slot_idx: int = -1
     active_generation: int = -1
     active_slot_prev_expert: int = -1  # expert evicted by this prefetch (-1 if slot was empty)
+    segment_id: int = -1
 
 
 def compute_priority(
@@ -362,6 +363,45 @@ class SegmentCandidateIndex:
         ranked.sort(key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
         return ranked
 
+    def candidates(
+        self,
+        *,
+        segment_id: int,
+        step_id: int,
+        layer_caches: dict[int, LayerExpertCache],
+        inflight_keys: set[tuple[int, int]],
+    ) -> list[PrefetchCandidate]:
+        segment_entries = self.entries_by_segment.get(int(segment_id))
+        if not segment_entries:
+            return []
+
+        ttl = int(self.config.prefetch_history_ttl_steps)
+        stale_keys = []
+        out: list[PrefetchCandidate] = []
+        for key, entry in segment_entries.items():
+            layer_idx, expert_idx = key
+            cache = layer_caches.get(layer_idx)
+            if cache is None:
+                stale_keys.append(key)
+                continue
+            if int(step_id) - int(entry.last_seen_step) > ttl:
+                stale_keys.append(key)
+                continue
+            if key in inflight_keys or cache.is_cached_cpu(expert_idx) or cache.is_pending_cpu(expert_idx):
+                continue
+            age = max(0, int(step_id) - int(entry.last_seen_step))
+            entry.priority = compute_priority(
+                source=entry.source,
+                score_sum=entry.score_sum,
+                activation_count=entry.activation_count,
+                age=age,
+                config=self.config,
+            )
+            out.append(entry)
+        for key in stale_keys:
+            segment_entries.pop(key, None)
+        return out
+
 
 class PrefetchRuntime:
     def __init__(
@@ -395,6 +435,10 @@ class PrefetchRuntime:
         self._draft_segment_indexed_budget = self._initial_draft_direct_active_budget()
         self._draft_iteration_open = False
         self._active_draft_iteration_steps: set[int] = set()
+        self._draft_segment_indexed_submit_by_segment = defaultdict(int)
+        self._draft_segment_indexed_ready_by_segment = defaultdict(int)
+        self._draft_segment_indexed_success_by_segment = defaultdict(int)
+        self._draft_segment_indexed_consumed_by_segment = defaultdict(int)
 
     def _initial_draft_direct_active_budget(self) -> int:
         return max(
@@ -404,6 +448,13 @@ class PrefetchRuntime:
 
     def _segment_indexed_enabled(self) -> bool:
         return str(getattr(self.config, "prefetch_runtime_mode", "baseline_staging")) == "draft_segment_indexed"
+
+    def _segment_id_for_layer(self, layer_idx: int) -> int:
+        return int(layer_idx) // int(self.draft_segment_index.segment_size)
+
+    @staticmethod
+    def _format_segment_counts(counts: defaultdict[int, int] | dict[int, int]) -> dict[str, int]:
+        return {str(int(segment_id)): int(value) for segment_id, value in sorted(counts.items())}
 
     def begin_draft_iteration(self, step_id: int) -> None:
         if not self._segment_indexed_enabled():
@@ -801,7 +852,7 @@ class PrefetchRuntime:
             if not self.layer_caches:
                 return 0
             frontier = max(int(layer_idx) for layer_idx in self.layer_caches.keys())
-        segment_id = int(frontier) // int(self.draft_segment_index.segment_size)
+        segment_id = self._segment_id_for_layer(int(frontier))
         transfer_budget_ms = (
             float(visible_budget_ms)
             if visible_budget_ms is not None
@@ -811,17 +862,21 @@ class PrefetchRuntime:
         rank_t0 = time.perf_counter()
         ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
         for index in (self.long_term_segment_index, self.draft_segment_index):
-            for candidate in index.ranked_candidates(
+            candidates = index.candidates(
                 segment_id=segment_id,
                 step_id=step_id,
                 layer_caches=self.layer_caches,
                 inflight_keys=inflight_keys,
-            ):
+            )
+            self._profile["draft_segment_indexed_candidate_scan_count"] += 1
+            self._profile["draft_segment_indexed_candidate_ranked_count"] += len(candidates)
+            for candidate in candidates:
                 key = (int(candidate.layer_idx), int(candidate.expert_idx))
                 prev = ranked_by_key.get(key)
                 if prev is None or candidate.priority > prev.priority:
                     ranked_by_key[key] = candidate
         ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+        self._profile["draft_segment_indexed_candidate_merge_count"] += len(ranked)
         self._profile["draft_segment_indexed_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0
 
         submitted = 0
@@ -898,13 +953,16 @@ class PrefetchRuntime:
                 active_slot_idx=reservation.active_slot_idx,
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                segment_id=segment_id,
             )
             submitted += 1
             used_transfer_ms += transfer_ms
+            inflight_keys.add(key)
             self._profile["prefetch_submit_count"] += 1
             self._profile["direct_active_prefetch_submit_count"] += 1
             self._profile["draft_segment_indexed_prefetch_submit_count"] += 1
             self._profile["draft_segment_indexed_prefetch_est_transfer_ms"] += transfer_ms
+            self._draft_segment_indexed_submit_by_segment[int(segment_id)] += 1
             self._record_source_submit(candidate.source)
 
         visible_ms = (time.perf_counter() - submit_t0) * 1000.0
@@ -1238,6 +1296,8 @@ class PrefetchRuntime:
                 self._profile["draft_direct_active_prefetch_ready_count"] += 1
             elif ticket.source == "draft_segment_indexed":
                 self._profile["draft_segment_indexed_prefetch_ready_count"] += 1
+                if int(ticket.segment_id) >= 0:
+                    self._draft_segment_indexed_ready_by_segment[int(ticket.segment_id)] += 1
             elif ticket.source == "verify_layer_predict":
                 self._profile["verify_layer_prefetch_ready_count"] += 1
             cache = self.layer_caches.get(ticket.layer_idx)
@@ -1271,6 +1331,8 @@ class PrefetchRuntime:
                 self._profile["draft_direct_active_prefetch_publish_count"] += 1
             elif ticket.source == "draft_segment_indexed":
                 self._profile["draft_segment_indexed_prefetch_publish_count"] += 1
+                if int(ticket.segment_id) >= 0:
+                    self._draft_segment_indexed_success_by_segment[int(ticket.segment_id)] += 1
             elif ticket.source == "verify_layer_predict":
                 self._profile["verify_layer_prefetch_publish_count"] += 1
         publish_ms = (time.perf_counter() - t0) * 1000.0
@@ -1375,6 +1437,9 @@ class PrefetchRuntime:
                         self._profile["draft_direct_active_prefetch_consumed_count"] += 1
                     elif source == "draft_segment_indexed":
                         self._profile["draft_segment_indexed_prefetch_consumed_count"] += 1
+                        self._draft_segment_indexed_consumed_by_segment[
+                            self._segment_id_for_layer(int(layer_idx))
+                        ] += 1
                     elif source == "verify_layer_predict":
                         self._profile["verify_layer_prefetch_consumed_count"] += 1
         self._profile["prefetch_consumed_count"] += consumed
@@ -1508,6 +1573,21 @@ class PrefetchRuntime:
             "draft_segment_indexed_prefetch_used_transfer_budget_ms": float(self._profile.get("draft_segment_indexed_prefetch_used_transfer_budget_ms", 0.0)),
             "draft_segment_indexed_rank_ms": float(self._profile.get("draft_segment_indexed_rank_ms", 0.0)),
             "draft_segment_indexed_victim_select_ms": float(self._profile.get("draft_segment_indexed_victim_select_ms", 0.0)),
+            "draft_segment_indexed_candidate_scan_count": int(self._profile.get("draft_segment_indexed_candidate_scan_count", 0.0)),
+            "draft_segment_indexed_candidate_ranked_count": int(self._profile.get("draft_segment_indexed_candidate_ranked_count", 0.0)),
+            "draft_segment_indexed_candidate_merge_count": int(self._profile.get("draft_segment_indexed_candidate_merge_count", 0.0)),
+            "draft_segment_indexed_prefetch_submit_count_by_segment": self._format_segment_counts(
+                self._draft_segment_indexed_submit_by_segment
+            ),
+            "draft_segment_indexed_prefetch_ready_count_by_segment": self._format_segment_counts(
+                self._draft_segment_indexed_ready_by_segment
+            ),
+            "draft_segment_indexed_prefetch_success_count_by_segment": self._format_segment_counts(
+                self._draft_segment_indexed_success_by_segment
+            ),
+            "draft_segment_indexed_prefetch_consumed_count_by_segment": self._format_segment_counts(
+                self._draft_segment_indexed_consumed_by_segment
+            ),
             "draft_segment_indexed_stale_metadata_observe_count": int(self._profile.get("draft_segment_indexed_stale_metadata_observe_count", 0.0)),
             "draft_segment_indexed_missed_prefetch_window_count": int(self._profile.get("draft_segment_indexed_missed_prefetch_window_count", 0.0)),
             "verify_ready_before_wait_count": int(self._profile.get("verify_ready_before_wait_count", 0.0)),
@@ -1517,4 +1597,8 @@ class PrefetchRuntime:
             self._profile.clear()
             self._draft_direct_active_budget = self._initial_draft_direct_active_budget()
             self._draft_segment_indexed_budget = self._initial_draft_direct_active_budget()
+            self._draft_segment_indexed_submit_by_segment.clear()
+            self._draft_segment_indexed_ready_by_segment.clear()
+            self._draft_segment_indexed_success_by_segment.clear()
+            self._draft_segment_indexed_consumed_by_segment.clear()
         return out
