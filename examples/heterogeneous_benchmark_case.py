@@ -111,6 +111,8 @@ def run_case(args: argparse.Namespace) -> dict:
         enable_heterogeneous=enable_heterogeneous,
         enable_speculative=(mode == "spec"),
         draft_top_c=args.draft_top_c,
+        draft_reroute_policy=args.draft_reroute_policy,
+        draft_reroute_artifact=args.draft_reroute_artifact,
         draft_cuda_graph_bucket_steps=draft_cuda_graph_bucket_steps,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_backend=args.cpu_expert_backend,
@@ -198,6 +200,8 @@ def run_case(args: argparse.Namespace) -> dict:
         "slots_per_layer": args.slots_per_layer,
         "max_draft_tokens": args.max_draft_tokens,
         "draft_top_c": args.draft_top_c,
+        "draft_reroute_policy": args.draft_reroute_policy,
+        "draft_reroute_artifact": args.draft_reroute_artifact,
         "draft_cuda_graph_bucket_steps": draft_cuda_graph_bucket_steps,
         "cpu_expert_backend": args.cpu_expert_backend,
         "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
@@ -255,6 +259,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--draft-top-c", type=int, default=2)
+    parser.add_argument("--draft-reroute-policy", type=str, default="round_robin",
+                        choices=["round_robin", "drop_miss", "entropy_cache_bias",
+                                 "bounded_cache_bias", "similarity_replace"])
+    parser.add_argument("--draft-reroute-artifact", type=str, default="")
     parser.add_argument("--draft-cuda-graph-bucket-steps", type=parse_int_list, default=None)
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-backend", type=str, default="torch")

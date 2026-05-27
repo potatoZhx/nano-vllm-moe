@@ -103,6 +103,10 @@ def run_case(
             str(args.max_draft_tokens),
             "--draft-top-c",
             str(args.draft_top_c),
+            "--draft-reroute-policy",
+            args.draft_reroute_policy,
+            "--draft-reroute-artifact",
+            args.draft_reroute_artifact,
             "--draft-cuda-graph-bucket-steps",
             args.draft_cuda_graph_bucket_steps,
             "--cpu-expert-execution-enabled",
@@ -433,6 +437,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     parser.add_argument("--max-draft-tokens", type=int, default=4)
     parser.add_argument("--draft-top-c", type=int, default=0)
+    parser.add_argument("--draft-reroute-policy", type=str, default="round_robin",
+                        choices=["round_robin", "drop_miss", "entropy_cache_bias",
+                                 "bounded_cache_bias", "similarity_replace"])
+    parser.add_argument("--draft-reroute-artifact", type=str, default="")
     parser.add_argument("--draft-cuda-graph-bucket-steps", type=str, default="")
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-backend", type=str, default="torch")
@@ -534,6 +542,8 @@ def main() -> None:
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "max_draft_tokens": args.max_draft_tokens,
             "draft_top_c": args.draft_top_c,
+            "draft_reroute_policy": args.draft_reroute_policy,
+            "draft_reroute_artifact": args.draft_reroute_artifact,
             "draft_cuda_graph_bucket_steps": args.draft_cuda_graph_bucket_steps,
             "seed": args.seed,
             "temperature": args.temperature,

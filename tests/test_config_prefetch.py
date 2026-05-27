@@ -27,6 +27,8 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.draft_prefetch_min_per_boundary, 0)
         self.assertEqual(cfg.draft_prefetch_max_per_boundary, 4)
         self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
+        self.assertEqual(cfg.draft_reroute_policy, "round_robin")
+        self.assertEqual(cfg.draft_reroute_artifact, "")
         self.assertTrue(cfg.prefetch_verify_layer_enabled)
         self.assertGreater(cfg.prefetch_verify_layer_transfer_bandwidth_gbps, 0.0)
 
@@ -111,6 +113,33 @@ class TestConfigPrefetch(unittest.TestCase):
                 enable_heterogeneous=True,
                 inference_mode="spec",
                 draft_cuda_graph_cpu_backend="torch",
+            )
+
+    def test_topc_zero_accepts_public_draft_reroute_policy(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            draft_top_c=0,
+            draft_reroute_policy="entropy_cache_bias",
+        )
+        self.assertEqual(cfg.draft_reroute_policy, "entropy_cache_bias")
+
+    def test_reroute_policy_requires_topc_zero(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_top_c=1,
+                draft_reroute_policy="drop_miss",
+            )
+
+    def test_similarity_replace_requires_offline_artifact(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                draft_top_c=0,
+                draft_reroute_policy="similarity_replace",
             )
 
     def test_invalid_cache_strategy_fails(self):

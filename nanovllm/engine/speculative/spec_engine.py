@@ -168,6 +168,10 @@ class SpeculativeEngine:
                 if i > 0:
                     self.scheduler.append_draft_kv(seq)
                 seq.append_token(token_id)
+            if draft_tokens:
+                # Verify consumes the final proposed token as an input too. The
+                # draft loop only reserved storage through the previous input.
+                self.scheduler.append_draft_kv(seq)
             # Recompute from last accepted token (num_tokens before draft) and drafts.
             seq.num_cached_tokens = seq._draft_start_num_tokens - 1
             verify_lengths.append(len(draft_tokens) + 1)

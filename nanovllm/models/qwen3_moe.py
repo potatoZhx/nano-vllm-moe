@@ -23,7 +23,13 @@ from nanovllm.layers.fuse_moe.kt_backend import KtKernelCpuMoeBackend
 from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
-from nanovllm.expert.placement import build_draft_plan_gpu, build_prefill_plan_gpu, build_verify_plan_gpu
+from nanovllm.expert.placement import (
+    build_cached_draft_plan_gpu,
+    build_draft_plan_gpu,
+    build_prefill_plan_gpu,
+    build_verify_plan_gpu,
+)
+from nanovllm.scheduling.draft_reroute import ROUND_ROBIN, DraftReroutePolicy
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
 from nanovllm.utils.context import get_context
 
@@ -316,6 +322,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
         self.gpu_fallback_workspace: GpuFallbackWorkspace | None = None
+        self.draft_reroute_policy: DraftReroutePolicy | None = None
 
     def enable_heterogeneous(
         self,
@@ -337,6 +344,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         kt_num_threads: int = 0,
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
+        draft_reroute_policy: str = ROUND_ROBIN,
+        draft_reroute_cond_sim: torch.Tensor | None = None,
+        draft_reroute_skip_err: torch.Tensor | None = None,
     ) -> None:
         self.expert_cache = expert_cache
         self.cpu_expert_pool = cpu_expert_pool
@@ -390,6 +400,18 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_gpu_parallel_execution_enabled = str(cpu_gpu_parallel_execution_enabled)
         self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
         self._parallel_stream = None
+        if draft_reroute_policy == ROUND_ROBIN:
+            self.draft_reroute_policy = None
+        else:
+            self.draft_reroute_policy = DraftReroutePolicy(
+                policy=draft_reroute_policy,
+                num_experts=self.num_experts,
+                top_k=self.num_selected,
+                cached_expert_mask=expert_cache.get_cached_expert_mask(),
+                slot_to_expert_lut=expert_cache.get_slot_to_expert_lut(),
+                cond_sim=draft_reroute_cond_sim,
+                skip_err=draft_reroute_skip_err,
+            )
 
     def set_speculative_execution(
         self,
@@ -424,10 +446,15 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         profile: dict[str, float] = {}
         t_route0 = perf_counter()
         router_logits = self.gate(hidden_states)
-        routing_weights = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.num_selected, dim=-1)
+        router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(router_probs, self.num_selected, dim=-1)
+        reroute_active = self.execution_mode == "draft" and self.draft_reroute_policy is not None
+        selected_weights = routing_weights if reroute_active else None
         if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            if reroute_active:
+                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            else:
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
         profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
 
@@ -439,9 +466,20 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             )
 
         t_plan0 = perf_counter()
+        execution_experts = selected_experts
+        execution_weights = routing_weights
         if self.execution_mode == "draft":
             if self.draft_scheduler is None:
                 raise RuntimeError("Draft execution requires a draft scheduler.")
+            if self.draft_reroute_policy is not None:
+                assert selected_weights is not None
+                execution_experts, execution_weights = self.draft_reroute_policy(
+                    router_logits,
+                    router_probs,
+                    selected_experts,
+                    selected_weights,
+                    hidden_states.dtype,
+                )
             graph_safe_cpu = (
                 self.draft_cpu_graph_mode
                 and self.draft_top_c > 0
@@ -462,18 +500,26 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             use_graph_cpu_plan = graph_safe_cpu and (
                 self.draft_cuda_graph_cpu_backend == "fused_sync" or async_sidecar_enabled
             )
-            plan = build_draft_plan_gpu(
-                layer_idx=self.layer_idx,
-                selected_experts=selected_experts,
-                routing_weights=routing_weights,
-                expert_cache=self.expert_cache,
-                draft_scheduler=self.draft_scheduler,
-                num_experts=self.num_experts,
-                top_c=self.draft_top_c if use_graph_cpu_plan else 0,
-                graph_safe_cpu=use_graph_cpu_plan,
-                graph_async_cpu=(self.draft_cuda_graph_cpu_backend == "fused" and async_sidecar_enabled),
-                active_token_mask=active_token_mask if use_graph_cpu_plan else None,
-            )
+            if self.draft_reroute_policy is not None:
+                plan = build_cached_draft_plan_gpu(
+                    layer_idx=self.layer_idx,
+                    selected_experts=execution_experts,
+                    routing_weights=execution_weights,
+                    expert_cache=self.expert_cache,
+                )
+            else:
+                plan = build_draft_plan_gpu(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    expert_cache=self.expert_cache,
+                    draft_scheduler=self.draft_scheduler,
+                    num_experts=self.num_experts,
+                    top_c=self.draft_top_c if use_graph_cpu_plan else 0,
+                    graph_safe_cpu=use_graph_cpu_plan,
+                    graph_async_cpu=(self.draft_cuda_graph_cpu_backend == "fused" and async_sidecar_enabled),
+                    active_token_mask=active_token_mask if use_graph_cpu_plan else None,
+                )
         elif self.execution_mode == "verify":
             plan = build_verify_plan_gpu(
                 layer_idx=self.layer_idx,
@@ -497,8 +543,8 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
 
         out = heterogeneous_moe_forward(
             hidden_states=hidden_states,
-            selected_experts=selected_experts,
-            routing_weights=routing_weights,
+            selected_experts=execution_experts,
+            routing_weights=execution_weights,
             expert_cache=self.expert_cache,
             cpu_expert_pool=self.cpu_expert_pool,
             act_fn=self.act_fn,
@@ -770,11 +816,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         kt_num_threads: int = 0,
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
+        draft_reroute_policy: str = ROUND_ROBIN,
+        draft_reroute_artifact: dict[str, torch.Tensor] | None = None,
     ):
+        reroute_layer_idx = 0
         for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 assert layer_idx in layer_caches, f"No cache for layer {layer_idx}"
                 assert layer_idx in cpu_expert_pool, f"No cpu expert pool for layer {layer_idx}"
+                cond_sim = None
+                skip_err = None
+                if draft_reroute_artifact is not None:
+                    if reroute_layer_idx >= int(draft_reroute_artifact["cond_sim"].shape[0]):
+                        raise ValueError("draft reroute artifact has fewer layers than the model MoE blocks")
+                    cond_sim = draft_reroute_artifact["cond_sim"][reroute_layer_idx]
+                    skip_err = draft_reroute_artifact["skip_err"][reroute_layer_idx]
                 layer.mlp.enable_heterogeneous(
                     layer_caches[layer_idx],
                     cpu_expert_pool[layer_idx],
@@ -794,7 +850,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                     kt_num_threads=kt_num_threads,
                     kt_threadpool_count=kt_threadpool_count,
                     kt_chunked_prefill_size=kt_chunked_prefill_size,
+                    draft_reroute_policy=draft_reroute_policy,
+                    draft_reroute_cond_sim=cond_sim,
+                    draft_reroute_skip_err=skip_err,
                 )
+                reroute_layer_idx += 1
+        if draft_reroute_artifact is not None and reroute_layer_idx != int(draft_reroute_artifact["cond_sim"].shape[0]):
+            raise ValueError("draft reroute artifact layer count does not match the model MoE block count")
 
     def set_speculative_execution_mode(
         self,

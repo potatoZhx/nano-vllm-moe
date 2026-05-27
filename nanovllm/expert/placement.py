@@ -549,6 +549,42 @@ def build_draft_plan_gpu(
     )
 
 
+def build_cached_draft_plan_gpu(
+    layer_idx: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_cache: LayerExpertCache,
+) -> MoEExecutionPlan:
+    """Build a fixed-route GPU plan once rerouting has produced cache-valid ids."""
+    flat_selected = _flatten_experts(selected_experts)
+    _ = routing_weights
+    gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
+    gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=flat_selected.device)
+    m_sizes, gpu_route_indices = _build_grouped_layout(
+        gpu_slots,
+        gpu_route_indices,
+        expert_cache.num_slots,
+    )
+    return MoEExecutionPlan(
+        layer_idx=layer_idx,
+        gpu_route_indices=gpu_route_indices,
+        gpu_m_sizes=m_sizes,
+        cpu_route_indices=None,
+        cpu_task_expert_ids=None,
+        cpu_task_offsets=None,
+        cpu_task_expert_ids_host=None,
+        cpu_task_offsets_host=None,
+        flat_selected_original=flat_selected,
+        flat_selected_effective=flat_selected,
+        gpu_route_weights=None,
+        cpu_graph_enabled=False,
+        cpu_graph_async=False,
+        substitution_lut=None,
+        gpu_route_mask=torch.ones_like(flat_selected, dtype=torch.bool),
+        cpu_route_mask=torch.zeros_like(flat_selected, dtype=torch.bool),
+    )
+
+
 def build_verify_plan_gpu(
     layer_idx: int,
     selected_experts: torch.Tensor,

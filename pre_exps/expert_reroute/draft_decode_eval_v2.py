@@ -252,6 +252,12 @@ def calibrate(model, moe_attr: str, chunks: List[torch.Tensor],
 
     # ── Hooks ─────────────────────────────────────────────────────────────────
     bufs: List[Dict] = [{} for _ in range(L)]
+    hidden_bufs: List[Optional[torch.Tensor]] = [None for _ in range(L)]
+    selected_bufs: List[Optional[torch.Tensor]] = [None for _ in range(L)]
+    fused_experts = [
+        hasattr(mm.experts, "gate_up_proj") and getattr(mm.experts.gate_up_proj, "ndim", 0) == 3
+        for _, mm in layers
+    ]
     hs   = []
 
     def _ehook(li, ei):
@@ -262,13 +268,15 @@ def calibrate(model, moe_attr: str, chunks: List[torch.Tensor],
 
     def _ghook(li):
         def h(m, inp, out):
-            g = out.float().cpu().numpy()
+            router_logits = out[0] if isinstance(out, tuple) else out
+            g = router_logits.float().cpu().numpy()
             T = g.shape[0]
             g_sum[li]  += g.sum(0); g_sum2[li] += (g**2).sum(0)
             g_cross[li]+= g.T @ g;  g_n[li]    += T
             w = np.exp(g - g.max(-1, keepdims=True))
             w /= w.sum(-1, keepdims=True)
             ti = np.argsort(w, -1)[:, -top_k:]
+            selected_bufs[li] = torch.tensor(ti, dtype=torch.int64)
             tw = np.take_along_axis(w, ti, -1)
             for t in range(T):
                 for ei, we in zip(ti[t], tw[t]):
@@ -281,6 +289,7 @@ def calibrate(model, moe_attr: str, chunks: List[torch.Tensor],
     def _mhook(li):
         def h(m, inp, out):
             hid = inp[0].detach().float()
+            hidden_bufs[li] = hid.reshape(-1, hid.size(-1))
             ns = hid.reshape(-1, hid.size(-1)).norm(dim=-1)
             h_norm_s[li] += float(ns.sum()); h_norm_n[li] += int(ns.numel())
         return h
@@ -288,8 +297,9 @@ def calibrate(model, moe_attr: str, chunks: List[torch.Tensor],
     for li, (_, mm) in enumerate(layers):
         hs.append(mm.gate.register_forward_hook(_ghook(li)))
         hs.append(mm.register_forward_hook(_mhook(li)))
-        for ei, exp in enumerate(mm.experts):
-            hs.append(exp.register_forward_hook(_ehook(li, ei)))
+        if not fused_experts[li]:
+            for ei, exp in enumerate(mm.experts):
+                hs.append(exp.register_forward_hook(_ehook(li, ei)))
 
     for chunk in tqdm(chunks, desc="  Calib forward"):
         for b in bufs: b.clear()
@@ -297,6 +307,21 @@ def calibrate(model, moe_attr: str, chunks: List[torch.Tensor],
             model(chunk.to(device))
         except Exception as ex:
             print(f"  ⚠ {ex}"); continue
+        for li, (_, mm) in enumerate(layers):
+            if not fused_experts[li]:
+                continue
+            hid = hidden_bufs[li]
+            selected = selected_bufs[li]
+            if hid is None or selected is None:
+                continue
+            selected = selected.to(hid.device)
+            for expert_id in torch.unique(selected).tolist():
+                token_mask = selected.eq(int(expert_id)).any(dim=-1)
+                current = hid[token_mask].to(mm.experts.gate_up_proj.dtype)
+                gate, up = F.linear(current, mm.experts.gate_up_proj[int(expert_id)]).chunk(2, dim=-1)
+                activated = mm.experts.act_fn(gate) * up
+                expert_out = F.linear(activated, mm.experts.down_proj[int(expert_id)])
+                bufs[li][int(expert_id)] = expert_out.detach().float().cpu()
         for li in range(L):
             for ei, oe in bufs[li].items():
                 if oe.dim() != 2 or oe.size(0) == 0: continue
@@ -1133,6 +1158,10 @@ def main():
                    help="Miss-rate gate threshold (default 0.25).")
     p.add_argument("--sim_floor",   type=float, default=SIM_FLOOR,
                    help="Min substitute similarity floor (default 0.40).")
+    p.add_argument("--calibration_artifact", default="",
+                   help="Optional .pt path for exporting cond_sim and skip_err for nano-vllm-moe.")
+    p.add_argument("--calibration_only", action="store_true",
+                   help="Exit after offline calibration and optional artifact export.")
     args = p.parse_args()
 
     assert args.prompt_len + args.draft_len + 1 <= args.seq_len
@@ -1166,6 +1195,20 @@ def main():
     print(f"\n── Phase 1: Offline Calibration {'─'*30}")
     calib = calibrate(model, moe_cfg["moe_attr"], calib_chunks,
                       args.device, moe_cfg["num_experts"])
+    if args.calibration_artifact:
+        artifact_path = os.path.abspath(args.calibration_artifact)
+        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+        torch.save(
+            {
+                "cond_sim": calib.cond_sim.float().cpu().contiguous(),
+                "skip_err": calib.skip_err.float().cpu().contiguous(),
+            },
+            artifact_path,
+        )
+        print(f"  Saved runtime calibration artifact: {artifact_path}")
+    if args.calibration_only:
+        print("  Calibration-only run complete.")
+        return
 
     # ── Evaluation ───────────────────────────────────────────────────────────
     print(f"\n── Phase 2: Draft-Decode Simulation {'─'*25}")

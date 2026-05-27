@@ -22,6 +22,8 @@ class Config:
     enable_speculative: bool = False
     max_draft_tokens: int = 8
     draft_top_c: int = 2
+    draft_reroute_policy: str = "round_robin"
+    draft_reroute_artifact: str = ""
     acceptance_strategy: str = "standard_sampling"
     acceptance_threshold: float = 0.7
     draft_scheduler: str = "simple"
@@ -115,6 +117,17 @@ class Config:
 
         assert self.max_draft_tokens >= 1
         assert self.draft_top_c >= 0
+        assert self.draft_reroute_policy in {
+            "round_robin",
+            "drop_miss",
+            "entropy_cache_bias",
+            "bounded_cache_bias",
+            "similarity_replace",
+        }
+        if self.draft_reroute_policy != "round_robin":
+            assert self.draft_top_c == 0, "draft reroute policies are implemented only for draft_top_c=0"
+        if self.draft_reroute_policy == "similarity_replace":
+            assert self.draft_reroute_artifact, "similarity_replace requires draft_reroute_artifact"
         assert self.cache_strategy in {"lru", "lfu", "adaptive"}
         assert self.prefetch_strategy in {"noop", "history_window"}
         assert self.prefetch_staging_slots_per_layer >= 0

@@ -58,6 +58,16 @@ def _make_prompts(num_seqs: int, input_len: int, seed: int) -> list[str]:
     return prompts
 
 
+def _tokenize_prompts_to_length(tokenizer: Any, prompts: list[str], input_len: int) -> list[list[int]]:
+    token_prompts: list[list[int]] = []
+    for prompt in prompts:
+        token_ids = tokenizer.encode(prompt)
+        if len(token_ids) < input_len:
+            raise ValueError(f"generated prompt has {len(token_ids)} tokens, shorter than requested {input_len}")
+        token_prompts.append(token_ids[:input_len])
+    return token_prompts
+
+
 def _install_verify_layer_probe(sync_layer_timing: bool) -> None:
     global SYNC_LAYER_TIMING
     SYNC_LAYER_TIMING = bool(sync_layer_timing)
@@ -234,9 +244,10 @@ def run_single_case(args: argparse.Namespace) -> None:
     slots = int(args.slots_per_layer)
     if slots <= 0:
         slots = int(round(num_experts * args.cache_ratio))
+    effective_cache_ratio = float(slots / num_experts)
 
     case_info = {
-        "cache_ratio": float(args.cache_ratio),
+        "cache_ratio": effective_cache_ratio,
         "slots_per_layer": slots,
         "prefetch_enabled": bool(args.prefetch_enabled),
         "acceptance_strategy": args.acceptance_strategy,
@@ -246,6 +257,8 @@ def run_single_case(args: argparse.Namespace) -> None:
         "output_len": int(args.output_len),
         "max_draft_tokens": int(args.max_draft_tokens),
         "draft_top_c": int(args.draft_top_c),
+        "draft_reroute_policy": args.draft_reroute_policy,
+        "draft_reroute_artifact": args.draft_reroute_artifact,
         "cpu_expert_backend": args.cpu_expert_backend,
         "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
     }
@@ -264,6 +277,8 @@ def run_single_case(args: argparse.Namespace) -> None:
         heterogeneous_slots_per_layer=slots,
         max_draft_tokens=args.max_draft_tokens,
         draft_top_c=args.draft_top_c,
+        draft_reroute_policy=args.draft_reroute_policy,
+        draft_reroute_artifact=args.draft_reroute_artifact,
         acceptance_strategy=args.acceptance_strategy,
         acceptance_threshold=args.acceptance_threshold,
         cpu_expert_execution_enabled=True,
@@ -299,7 +314,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_use_draft_live=args.prefetch_use_draft_live,
     )
 
-    prompts = _make_prompts(args.num_seqs, args.input_len, args.seed)
+    prompt_texts = _make_prompts(args.num_seqs, args.input_len, args.seed)
+    prompts = _tokenize_prompts_to_length(llm.tokenizer, prompt_texts, args.input_len)
+    case_info["actual_input_tokens"] = [len(prompt) for prompt in prompts]
     sampling = [
         SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=args.output_len)
         for _ in range(args.num_seqs)
@@ -341,10 +358,11 @@ def run_single_case(args: argparse.Namespace) -> None:
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 
 
-def _case_name(ratio: float, prefetch: bool, backend: str) -> str:
+def _case_name(ratio: float, prefetch: bool, backend: str, policy: str) -> str:
     ratio_pct = int(round(ratio * 100))
     safe_backend = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in backend)
-    return f"{safe_backend}_ratio{ratio_pct}_prefetch_{'on' if prefetch else 'off'}"
+    safe_policy = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in policy)
+    return f"{safe_policy}_{safe_backend}_ratio{ratio_pct}_prefetch_{'on' if prefetch else 'off'}"
 
 
 def _write_markdown(summary: dict[str, Any], path: Path) -> None:
@@ -356,6 +374,7 @@ def _write_markdown(summary: dict[str, Any], path: Path) -> None:
         f"- output_dir: `{summary['metadata']['output_dir']}`",
         f"- layer timing: synchronized per verify MoE layer = `{summary['metadata']['sync_layer_timing']}`",
         f"- draft_top_c: `{summary['metadata']['draft_top_c']}`",
+        f"- draft_reroute_policy: `{summary['metadata']['draft_reroute_policy']}`",
         f"- acceptance_strategy: `{summary['metadata']['acceptance_strategy']}`",
         f"- temperature: `{summary['metadata']['temperature']}`",
         f"- cpu expert backends: `{', '.join(summary['metadata']['cpu_expert_backends'])}`",
@@ -499,7 +518,7 @@ def run_suite(args: argparse.Namespace) -> None:
     for backend in backend_values:
         for ratio in ratios:
             for prefetch in prefetch_values:
-                name = _case_name(ratio, prefetch, backend)
+                name = _case_name(ratio, prefetch, backend, args.draft_reroute_policy)
                 case_json = outdir / f"{name}.json"
                 case_log = outdir / f"{name}.log"
                 cmd = [
@@ -528,6 +547,10 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(args.max_draft_tokens),
                     "--draft-top-c",
                     str(args.draft_top_c),
+                    "--draft-reroute-policy",
+                    args.draft_reroute_policy,
+                    "--draft-reroute-artifact",
+                    args.draft_reroute_artifact,
                     "--temperature",
                     str(args.temperature),
                     "--acceptance-strategy",
@@ -626,6 +649,8 @@ def run_suite(args: argparse.Namespace) -> None:
             "cache_ratios": ratios,
             "cpu_expert_backends": backend_values,
             "draft_top_c": int(args.draft_top_c),
+            "draft_reroute_policy": args.draft_reroute_policy,
+            "draft_reroute_artifact": args.draft_reroute_artifact,
             "acceptance_strategy": args.acceptance_strategy,
             "temperature": float(args.temperature),
             "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
@@ -659,6 +684,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-len", type=int, default=24)
     p.add_argument("--max-draft-tokens", type=int, default=4)
     p.add_argument("--draft-top-c", type=int, default=0)
+    p.add_argument("--draft-reroute-policy", default="round_robin",
+                   choices=["round_robin", "drop_miss", "entropy_cache_bias",
+                            "bounded_cache_bias", "similarity_replace"])
+    p.add_argument("--draft-reroute-artifact", default="")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)

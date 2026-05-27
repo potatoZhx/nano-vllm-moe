@@ -18,6 +18,7 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.scheduling.draft_scheduler import create_draft_scheduler
 from nanovllm.scheduling.cache_strategy import create_cache_strategy
 from nanovllm.scheduling.prefetch_strategy import create_prefetch_strategy
+from nanovllm.scheduling.draft_reroute import SIMILARITY_REPLACE, load_draft_reroute_artifact
 from nanovllm.expert.prefetcher import PrefetchRuntime
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -120,6 +121,12 @@ class ModelRunner:
             gpu_fallback_workspace = _create_gpu_fallback_workspace(
                 cpu_expert_pool, hf_config
             )
+            draft_reroute_artifact = None
+            if getattr(config, "draft_reroute_policy", "round_robin") == SIMILARITY_REPLACE:
+                draft_reroute_artifact = load_draft_reroute_artifact(
+                    getattr(config, "draft_reroute_artifact", ""),
+                    num_experts=int(getattr(hf_config, "num_experts")),
+                )
             self.model.enable_heterogeneous_mode(
                 layer_caches,
                 cpu_expert_pool,
@@ -139,6 +146,8 @@ class ModelRunner:
                 kt_num_threads=getattr(config, "kt_num_threads", 0),
                 kt_threadpool_count=getattr(config, "kt_threadpool_count", 1),
                 kt_chunked_prefill_size=getattr(config, "kt_chunked_prefill_size", 4096),
+                draft_reroute_policy=getattr(config, "draft_reroute_policy", "round_robin"),
+                draft_reroute_artifact=draft_reroute_artifact,
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
             self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"

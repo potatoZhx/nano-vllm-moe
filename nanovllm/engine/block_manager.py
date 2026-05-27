@@ -118,6 +118,16 @@ class BlockManager:
     def append_draft_token(self, seq: Sequence):
         self.may_append(seq)
 
+    def _invalidate_partial_tail_block(self, seq: Sequence, target_tokens: int):
+        if target_tokens == 0 or target_tokens % self.block_size == 0:
+            return
+        tail = self.blocks[seq.block_table[-1]]
+        if tail.hash == -1:
+            return
+        if self.hash_to_block_id.get(tail.hash) == tail.block_id:
+            del self.hash_to_block_id[tail.hash]
+        tail.update(-1, [])
+
     def rollback_draft(self, seq: Sequence):
         target_tokens = seq._draft_start_num_tokens
         target_num_blocks = (target_tokens + self.block_size - 1) // self.block_size
@@ -127,6 +137,7 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(freed_block)
+        self._invalidate_partial_tail_block(seq, target_tokens)
         seq.num_tokens = target_tokens
 
     def accept_draft(self, seq: Sequence, num_accepted: int):
@@ -138,4 +149,5 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(freed_block)
+        self._invalidate_partial_tail_block(seq, target_tokens)
         seq.num_tokens = target_tokens

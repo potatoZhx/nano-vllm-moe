@@ -9,6 +9,8 @@ __pycache__/
 # macOS
 .DS_Store
 
+/results/
+
 /.tmp/
 /.triton_cache/
 /torchinductor_mumura/
