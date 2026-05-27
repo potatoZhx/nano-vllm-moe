@@ -38,17 +38,26 @@ Algorithms
 
 Usage
 -----
-  python draft_decode_eval_v2.py \
+  CUDA_VISIBLE_DEVICES=1 python draft_decode_eval_v2.py \
       --model /zx_data1/models/Qwen--Qwen3-30B-A3B-Base/ \
       --data_file /zx_data1/models/datasets/wikitext2_test.txt \
       --cache_ratios 0.75 0.5 0.25 \
       --draft_len 8 --prompt_len 128 \
       --n_prompts 32 --outdir ./results_v2
+
+CUDA_VISIBLE_DEVICES=1 python draft_decode_eval_v2.py \
+      --model /zx_data1/models/Qwen--Qwen3-30B-A3B-Base/ \
+      --data_file /zx_data1/models/datasets/wikitext2_test.txt \
+      --cache_ratios 0.75 0.5 0.25 \
+      --draft_len 8 --prompt_len 128 \
+      --n_calib 2 \
+      --n_prompts 2 --outdir ./results_v2
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -801,12 +810,12 @@ def restore(model, moe_attr, originals, indices):
 
 def copy_kv(kv):
     if kv is None: return None
-    return tuple(tuple(t.clone() for t in lkv) for lkv in kv)
+    if isinstance(kv, tuple):
+        return tuple(tuple(t.clone() for t in lkv) for lkv in kv)
+    return copy.deepcopy(kv)
 
 def free_kv(kv):
     if kv is None: return
-    for lkv in kv:
-        for t in lkv: del t
     del kv
 
 
@@ -1147,7 +1156,7 @@ def main():
 
     # ── Data ─────────────────────────────────────────────────────────────────
     print(f"\nPreparing {args.n_prompts} prompts (length {args.prompt_len}) ...")
-    prompts = prepare_chunks(tok, args.n_prompts, args.prompt_len,
+    prompts = prepare_chunks(tok, args.n_prompts, args.prompt_len + args.draft_len + 1,
                              args.data_file)
     print(f"Preparing {args.n_calib} calibration chunks (length {args.seq_len}) ...")
     calib_chunks = prepare_chunks(tok, args.n_calib, args.seq_len,
