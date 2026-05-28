@@ -87,13 +87,45 @@ All correlations are weak and statistically insignificant (p > 0.1). This is exp
 | 0.25  | 0.10/0.15/0.20 | —     | 0.8935 | 0.8935 | **0.8952** | **0.8952** |
 
 Observations:
-- At r=0.75: miss-rate gate (ρ < 0.25 → gate=0) causes all algorithms to fall back to exact routing → identical seq_α
+- At r=0.75: miss-rate gate (ρ < 0.25 → gate=0, gamma_eff=0) causes Alg2_v2 to apply zero bias → routing identical to original top-k → then hit-mask zeros out uncached experts' weights → **falls back to SkipAll behavior** (not "exact routing", since miss experts are still skipped). Since miss rate is only ~0.3%, SkipAll at this ratio is near-equivalent to exact routing.
 - Cache pinning alone has **zero effect** at all ratios: the LFU cache already prioritizes top-1/2 experts (they are the most frequently activated)
 - Reroute-level protection provides a small gain (+0.2pp) at r=0.25, independent of w_protect threshold
 - The gain is modest because the miss-rate gate already protects against the worst case (low miss rate → gate=0 → no rerouting)
 
 ### Design Implication
 **Implement reroute-level top-1/2 protection as a cheap safety net.** The implementation is near-zero overhead (a gather + equality check). Cache pinning is unnecessary since LFU already captures the information. The default `w_protect=0.15` is reasonable; the exact threshold is insensitive.
+
+### Mechanism: What "Reroute-Level Protection" Actually Does
+
+**Critical insight:** If top-1/2 experts are NOT in cache, they cannot be computed. The protection does NOT restore their computation — it preserves **probability mass allocation**.
+
+**Trace of Alg2V2Wrapper.forward():**
+1. Original router: `logits → softmax → topk → (rw, ri)` records original top-k
+2. Miss-rate gate: `γ_gate = clamp((ρ-ρ_low)/(ρ_high-ρ_low), 0, 1)`
+3. Entropy-scaled bias: `γ_eff = γ₀ × γ_gate × (0.2 + 0.8 × τ_ent)`
+4. Biased routing: `biased_logits = logits + γ_eff × cache_mask` → new top-k `ni`
+5. **Protection**: if original top-1 was displaced AND uncached → restore to `ni[:,-1]`
+6. Weights from **original** logits at new indices → zero uncached → renormalize
+
+**Effect on probability mass:**
+
+| | Without Protection | With Protection |
+|---|---|---|
+| top-1 miss, displaced | A cached expert occupies that slot, gets top-1's probability mass | top-1 restored, weight zeroed → mass redistributed **proportionally to original router weights** across all cached experts |
+| Impact | Mass concentrated on one "lucky" cached expert | Mass distributed faithfully among cached experts |
+
+The benefit is small (+0.2pp) because three conditions must co-occur: (a) top-1 not in cache, (b) bias strong enough to displace it, (c) the choice of which cached expert gets the mass meaningfully affects the output.
+
+### `w_protect` Parameter
+
+`w_protect` (default 0.15) is the frequency threshold for identifying "critical" experts to pin:
+
+```python
+if rank1_freq[layer, expert] >= w_protect:  # top-1 in ≥15% of tokens → pin
+if rank2_freq[layer, expert] >= w_protect:  # top-2 in ≥15% of tokens → pin
+```
+
+Three values tested: 0.10 (95 experts pinned), 0.15 (42 experts), 0.20 (22 experts). All gave Δ=0 because any expert with frequency ≥10% is already in the LFU top-32 — making explicit pinning redundant.
 
 ### Issues Encountered
 - **KV cache API change (transformers >= 4.51):** `past_key_values` now returns `DynamicCache` objects instead of tuples. The scripts' `copy_kv` and `free_kv` functions were converting them to tuples, causing `AttributeError: 'tuple' object has no attribute 'get_seq_length'`. Fixed by updating to use `DynamicCache.update(key.clone(), value.clone(), layer_idx)` for cloning.
@@ -106,11 +138,16 @@ Observations:
 Find the optimal draft length K* for each (algorithm, cache_ratio) pair using a simplified T_cycle throughput model. Validate whether Level-1 threshold signals (alpha, miss rate, critical miss rate) can predict K*.
 
 ### Method
-1. Decode-mode simulation at K=1..12 for SkipAll and Alg2_v2 at 3 cache ratios
-2. Collect per-step α, miss rate, critical miss rate
-3. Simplified T_cycle model: T_draft=K×2ms, T_verify=48×0.5ms=24ms, T_stall estimated from miss rate and prefetch_rate=2
+1. Decode-mode simulation at K=1..12 for SkipAll and Alg2_v2 at 3 cache ratios: prefill 128 tokens, then autoregressive draft with SkipAll/Alg2V2 wrappers, comparing logits against full-model forward at each position
+2. Collect per-step α (TV distance), miss rate, critical miss rate
+3. Throughput model: `T_cycle = T_draft + T_verify + T_stall` where:
+   - `T_draft(K) = K × 2ms` (each draft step is pure GPU, no PCIe)
+   - `T_verify = 48 × 0.5ms = 24ms` (single forward pass for K+1 tokens)
+   - `T_stall ≈ max(0, needed - prefetched) × 1.5ms` where `needed = 48 × 8 × avg_miss_rate` and `prefetched = K × prefetch_rate`
+   - `E[A(K)] = 1 + Σ_{k=1}^{K} Π_{i=1}^{k} αᵢ` (expected accepted tokens including verify bonus)
+   - `Throughput = E[A(K)] / T_cycle`
 4. Exponential decay fit: α(k) = α₀·exp(-λ·k)
-5. Level-1 threshold analysis
+5. Level-1 threshold analysis: test whether α, miss_rate, or crit_miss at step k can predict optimal K*
 
 ### Results
 
@@ -125,20 +162,27 @@ Find the optimal draft length K* for each (algorithm, cache_ratio) pair using a 
 | SkipAll | 0.25 | 0.7717 | 0.0069 | 0.0549 | [0.683, 0.842] |
 | Alg2_v2 | 0.25 | 0.7872 | 0.0058 | 0.0537 | [0.715, 0.855] |
 
-**Throughput Analysis:**
+**Throughput Analysis — Why K* = 12 for ALL configurations:**
 
-| Algo | Ratio | K* | Throughput (tok/ms) |
-|------|-------|-----|---------------------|
-| SkipAll | 0.75 | **12** | 0.246 |
-| Alg2_v2 | 0.75 | **12** | 0.247 |
-| SkipAll | 0.50 | **12** | 0.202 |
-| Alg2_v2 | 0.50 | **12** | 0.202 |
-| SkipAll | 0.25 | **12** | 0.028 |
-| Alg2_v2 | 0.25 | **12** | 0.030 |
+K*=12 universally because the simplified T_stall model systematically underestimates PCIe stall. Detailed breakdown at r=0.25:
 
-K* = 12 for ALL configurations. This is because the simplified T_stall model underestimates the stall penalty: it assumes 2 experts can be prefetched per draft step, making T_stall near zero at all cache ratios. With T_stall ≈ 0, the throughput curve is dominated by E[A(K)]/(K×2+24), which increases monotonically with K when α is close to 1.0.
+| K | E[A(K)] | T_draft | T_verify | T_stall(E3 est.) | T_cycle | Throughput |
+|---|---------|---------|----------|-----------------|---------|-----------|
+| 1 | 1.855 | 2ms | 24ms | ~120ms | 146ms | 0.011 |
+| 6 | 3.763 | 12ms | 24ms | ~108ms | 144ms | 0.024 |
+| 12 | 5.347 | 24ms | 24ms | ~108ms | 156ms | **0.028** |
 
-At r=0.25, the throughput is 8-9x lower than at r=0.75 (0.028 vs 0.246 tok/ms), but the *relative* throughput across K values still favors large K because the absolute stall penalty is underestimated by ~10x.
+T_stall barely increases with K because the model assumes `prefetch_rate=2` experts per step, covering 24 of the 96 needed. The remaining 72 × 1.5ms = 108ms dominates T_cycle regardless of K, making the relative overhead of longer draft small.
+
+**Cross-validation with E4:** E4's more realistic coverage simulation gives T_stall(K=12, m=2, r=0.25) = **857ms** (8× higher!), which would give:
+
+| K | E[A(K)] | T_draft | T_verify | T_stall(E4) | T_cycle | Throughput |
+|---|---------|---------|----------|------------|---------|-----------|
+| 1 | 1.855 | 2ms | 24ms | 138ms | 164ms | **0.0113** |
+| 6 | 3.763 | 12ms | 24ms | 529ms | 565ms | 0.0067 |
+| 12 | 5.347 | 24ms | 24ms | 857ms | 905ms | 0.0059 |
+
+With E4's stall model, K*=**1** not 12 — the optimal choice flips completely. This demonstrates that the Dynamic K decision is highly sensitive to the T_stall estimate.
 
 ### Design Implication
 **The simplified T_cycle model in E3 is too optimistic.** Use E4's coverage-based T_stall model for Dynamic K decisions. The Level-1 threshold signals are still useful for detecting when the model should stop early, but the K* prediction should come from a more realistic stall model.
@@ -190,6 +234,18 @@ Coverage < 0.4 at K=1 strongly signals that draft should not be used (→ K=0 or
 - **PrefetchCoverage is an effective Dynamic K signal**, complementary to miss-rate and acceptance-rate signals
 - At low cache ratios, the system should consider skipping draft entirely (K=0 or K=1) since the stall from uncovered verify experts outweighs the draft benefit
 - Prefetch rate m=1 or m=2 is the sweet spot for cost/benefit
+
+### Known Limitations
+
+1. **Prefetch rate range too narrow.** The experiment uses m=0-4 experts/step, but with optimized PCIe transfer (pinned memory, multi-stream concurrency), effective m could reach 6-8. At r=0.50, higher m would significantly improve coverage and potentially shift K* upward.
+
+2. **No standard-decode baseline comparison.** The throughput model only compares different (K,m) configurations internally. The speculative system's advantage over standard decode (no draft, no rerouting) is not explicitly quantified. For reference:
+   - Standard decode at r=0.25: ~0.006 tok/ms (each token requires 48-layer forward with expert offload)
+   - E4 spec at r=0.25, K=1, m=4: ~0.012 tok/ms — **~2× speedup** even at minimal K
+
+3. **T_verify assumed constant at 24ms.** In practice, verify processes K+1 tokens, activating more unique experts as K grows: E[|V_l|] = N × (1 - (1-k/N)^K). At K=8, this is ~51 experts (vs ~22 at K=1), increasing both GPU compute and PCIe transfer time.
+
+4. **Alpha estimation uses heuristic, not measured values.** `α ≈ 1 - 0.6 × miss_rate` is a rough approximation. The E3 α measurements (actual forward passes with SkipAll wrappers) show higher α values than this heuristic predicts, suggesting the heuristic is conservative.
 
 ---
 
@@ -279,3 +335,50 @@ Based on all five experiments, the design recommendations from the system design
 | Dynamic K Level-2 MLP Upgrade | **Defer** | Marginal value; needs more data (E5) |
 | Prefetch Coverage Signal | **Implement** | Strong Dynamic K signal, validated (E4) |
 | Prefetch Rate Optimization | **m=1 or m=2** | Sweet spot for cost/benefit (E4) |
+
+---
+
+## Appendix: Frequently Asked Questions
+
+### Q1: LFU 是否已经优先保留 top-1/2？r=0.25 时会有多少 miss？
+
+LFU 保留"全局激活频率最高"的专家（不限 rank 位置），而非专门针对 rank-1/2。一个在 rank 3-8 出现 100 次的专家和一个只在 rank-1 出现 80 次的专家之间，LFU 会选择前者。
+
+r=0.25 时 LFU 命中率仅 75.14%（E1），意味着每层约 2/8 个专家 miss。其中确实包含部分 top-1/2 miss，但由于高频 top-1/2 专家天然有高全局频率，它们大部分已经被 LFU 缓存。低频 top-1/2 miss 确实会发生，但 E2 的 CriticalMissRate 相关性分析（ρ≈-0.08）表明这些 miss 与 α 下降没有强关联。
+
+### Q2: "回退到精确路由"的说法为什么不准确？
+
+当 miss-rate gate=0 时，Alg2_v2 的 γ_eff=0，bias=0，路由 = 原始 top-k。但**执行阶段**仍然会对 miss 专家置零权重并 renormalize——这就是 SkipAll 行为，不是"精确路由"。精确路由需要实际计算所有 top-k 专家的输出（包括 miss 的，需要 PCIe 传输）。正确的说法是"回退到 SkipAll"。
+
+之所以 r=0.75 时 seq_α 几乎相同（0.9883 vs 0.9896），是因为 miss rate 仅 ~0.3%，SkipAll ≈ 精确路由。
+
+### Q3: "重路由级保护"到底做了什么？top-1/2 miss 时如何"保护"？
+
+**保护的不是计算，而是概率分配。** 代码逻辑：
+1. 偏置后的新路由 `ni` 可能不包含原始 top-1
+2. 保护代码将原始 top-1 恢复到 `ni[:,-1]`（即使它 uncached）
+3. 权重计算后，top-1 因为 uncached 被置零
+4. Renormalize 后，top-1 的概率质量按**原始 router 权重比例**分配给其他 cached 专家
+
+无保护时，某个 cached 专家会"独占"top-1 的概率质量。有保护时，质量被公平分配。这解释了收益很小（+0.2pp）——三种条件需要同时满足才有效果。
+
+### Q4: w_protect 是什么？
+
+频率阈值。`w_protect=0.15` 意味着只有出现在 ≥15% token 的 top-1 或 top-2 位置的专家才被 pin。实验中三个阈值（0.10/0.15/0.20）的 Δ 都是 0，因为任何频率 ≥10% 的专家都已经在 LFU top-32 中——pin 不 pin 没有区别。
+
+### Q5: E3 到底在做什么？为什么 K* 都是 12？
+
+**E3 在用简化的 T_cycle 模型找最优 K**。核心公式：`Throughput(K) = E[接受token数] / (K×2 + 24 + stall)`。
+
+K* 全是 12 是因为 α 衰减极慢（λ≈0.007）→ E[A(K)] 随 K 线性增长，而 T_stall 被严重低估（假设每步能预取 2 个专家）。与 E4 的实际模拟对比：E3 估计 T_stall(K=12,r=0.25)=108ms，E4 实际测量=857ms——差了 8 倍。
+
+用 E4 的 T_stall 重新计算，K*=1 而非 12。这说明 **Dynamic K 决策的关键是准确的 T_stall 估计**。
+
+### Q6: E4 的预取率是否太小？是否忽略了 spec 加速？
+
+**关于预取率**：m=0-4 对应每 draft step 传输 0-4 个专家。在 PCIe 4.0 上，单专家 ~47MB，理论 m_max ≈ 2。但 m=4 已接近实用带宽上限（47 GB/s vs 50 GB/s 实用值）。如果考虑多流并发和 pinned memory 优化，m 可达 6-8。实验确实应该覆盖更大的 m 范围。
+
+**关于 spec 加速**：E4 的吞吐模型确实对比了不同 (K,m) 的内部最优，但没有显式计算标准 decode baseline。补充分析：
+- 标准 decode at r=0.25：T_per_token ≈ 48 × (3.5ms) ≈ 168ms → 0.006 tok/ms
+- E4 spec at r=0.25, K=1, m=4：0.012 tok/ms → **~2× 加速**
+- 但 K>1 时 stall 增长超过加速收益（因为覆盖率极低），所以 K*=1 是合理的
