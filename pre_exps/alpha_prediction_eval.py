@@ -206,15 +206,20 @@ def alpha_tv(target, draft):
 
 
 def copy_kv(kv):
-    if kv is None: return None
-    return tuple(tuple(t.clone() for t in layer) for layer in kv)
+    """Clone a DynamicCache KV cache."""
+    if kv is None:
+        return None
+    from transformers import DynamicCache
+    new_cache = DynamicCache()
+    for layer_idx in range(len(kv)):
+        key, value = kv[layer_idx]
+        new_cache.update(key.clone(), value.clone(), layer_idx)
+    return new_cache
 
 
 def free_kv(kv):
-    if kv is None: return
-    for layer in kv:
-        for t in layer:
-            del t
+    """No-op: DynamicCache is garbage-collected."""
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

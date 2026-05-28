@@ -533,6 +533,9 @@ Dynamic K → 决定 draft 步数
 ## 7. 验证实验设计
 
 以下实验设计为独立的验证实验，不依赖完整系统实现，参考 `pre_exps/` 目录的风格。
+### 实验settings
+` model_path: "/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B" `
+
 
 ### 实验 E1: 双目标缓存必要性验证
 
