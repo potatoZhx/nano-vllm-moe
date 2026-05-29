@@ -73,7 +73,15 @@ class ModelRunner:
         self._profile = defaultdict(float)
         self.layer_caches = {}
         self.cpu_expert_pool = {}
-        self.cache_strategy = create_cache_strategy(config.cache_strategy)
+        if config.cache_strategy == "lfu_rankguard":
+            self.cache_strategy = create_cache_strategy(
+                config.cache_strategy,
+                num_experts=int(getattr(config.hf_config, "num_experts", 128)),
+                protect_threshold=float(getattr(config, "rank_guard_threshold", 0.15)),
+                ema_alpha=float(getattr(config, "rank_guard_ema_alpha", 0.95)),
+            )
+        else:
+            self.cache_strategy = create_cache_strategy(config.cache_strategy)
         self.prefetch_strategy = create_prefetch_strategy(config.prefetch_strategy, config)
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
         self.prefetch_runtime: PrefetchRuntime | None = None

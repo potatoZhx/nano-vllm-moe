@@ -10,7 +10,7 @@ import torch
 from nanovllm.config import Config
 from nanovllm.expert.cache import ActiveReservation, LayerExpertCache, PublishedExpert, StagingReservation
 from nanovllm.expert.runtime_meta import LayerRuntimeMetaCPU, ModelRuntimeMetaRecorder
-from nanovllm.scheduling.cache_strategy import CacheStrategy
+from nanovllm.scheduling.cache_strategy import CacheStrategy, LFURankGuardStrategy
 from nanovllm.scheduling.prefetch_strategy import PrefetchStrategy
 
 
@@ -568,13 +568,29 @@ class PrefetchRuntime:
 
     def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
         if bool(self.config.prefetch_use_verify_history):
-            return self.observe_runtime_meta(
+            result = self.observe_runtime_meta(
                 runtime_meta,
                 source="verify_history",
                 step_id=step_id,
                 segment_index=self.long_term_segment_index if self._segment_indexed_enabled() else None,
             )
+            self._update_rank_guard_scores(runtime_meta)
+            return result
         return {}
+
+    def _update_rank_guard_scores(
+        self,
+        runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
+    ) -> None:
+        if not isinstance(self.cache_strategy, LFURankGuardStrategy):
+            return
+        if not runtime_meta:
+            return
+        for layer_idx, meta in runtime_meta.items():
+            if meta.selected_experts is not None:
+                self.cache_strategy.update_rank_scores_from_routing(
+                    int(layer_idx), meta.selected_experts,
+                )
 
     def submit_from_global_queue(self, step_id: int, phase: str) -> int:
         _ = phase
@@ -917,6 +933,7 @@ class PrefetchRuntime:
                 cache,
                 expert_idx=expert_idx,
                 step_id=step_id,
+                layer_idx=layer_idx,
             )
             self._profile["draft_segment_indexed_victim_select_ms"] += (time.perf_counter() - victim_t0) * 1000.0
             if victim_slot is None:
@@ -1010,6 +1027,7 @@ class PrefetchRuntime:
         *,
         expert_idx: int,
         step_id: int,
+        layer_idx: int | None = None,
     ) -> int | None:
         _ = expert_idx, step_id
         for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
@@ -1017,6 +1035,19 @@ class PrefetchRuntime:
                 return slot_idx
 
         strategy_name = str(getattr(self.config, "cache_strategy", "lru")).strip().lower()
+
+        if (
+            strategy_name == "lfu_rankguard"
+            and isinstance(self.cache_strategy, LFURankGuardStrategy)
+            and layer_idx is not None
+        ):
+            return self.cache_strategy.select_victim_slot_cpu(
+                cache.slot_to_expert,
+                cache.access_count,
+                int(layer_idx),
+                cache.is_active_slot_pending,
+            )
+
         best_slot = None
         best_value = None
         for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
@@ -1025,7 +1056,7 @@ class PrefetchRuntime:
             if int(slot_expert) < 0:
                 return slot_idx
             expert = int(slot_expert)
-            if strategy_name == "lfu":
+            if strategy_name in ("lfu", "lfu_rankguard"):
                 value = int(cache.access_count[expert])
             else:
                 value = int(cache.last_access_step[expert])
