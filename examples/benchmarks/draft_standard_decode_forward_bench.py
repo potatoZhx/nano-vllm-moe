@@ -437,7 +437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     parser.add_argument("--max-draft-tokens", type=int, default=4)
     parser.add_argument("--draft-top-c", type=int, default=0)
-    parser.add_argument("--draft-reroute-policy", type=str, default="round_robin",
+    parser.add_argument("--draft-reroute-policy", type=str, default="entropy_cache_bias",
                         choices=["round_robin", "drop_miss", "entropy_cache_bias",
                                  "bounded_cache_bias", "similarity_replace"])
     parser.add_argument("--draft-reroute-artifact", type=str, default="")

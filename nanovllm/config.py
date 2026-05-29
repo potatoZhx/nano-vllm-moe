@@ -21,8 +21,8 @@ class Config:
     enable_heterogeneous: bool = False
     enable_speculative: bool = False
     max_draft_tokens: int = 8
-    draft_top_c: int = 2
-    draft_reroute_policy: str = "round_robin"
+    draft_top_c: int = 0
+    draft_reroute_policy: str = "entropy_cache_bias"
     draft_reroute_artifact: str = ""
     acceptance_strategy: str = "standard_sampling"
     acceptance_threshold: float = 0.7

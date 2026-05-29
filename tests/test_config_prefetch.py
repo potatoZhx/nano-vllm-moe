@@ -27,7 +27,7 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.draft_prefetch_min_per_boundary, 0)
         self.assertEqual(cfg.draft_prefetch_max_per_boundary, 4)
         self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
-        self.assertEqual(cfg.draft_reroute_policy, "round_robin")
+        self.assertEqual(cfg.draft_reroute_policy, "entropy_cache_bias")
         self.assertEqual(cfg.draft_reroute_artifact, "")
         self.assertTrue(cfg.prefetch_verify_layer_enabled)
         self.assertGreater(cfg.prefetch_verify_layer_transfer_bandwidth_gbps, 0.0)

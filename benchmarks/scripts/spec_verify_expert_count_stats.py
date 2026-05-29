@@ -314,8 +314,17 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_use_draft_live=args.prefetch_use_draft_live,
     )
 
-    prompt_texts = _make_prompts(args.num_seqs, args.input_len, args.seed)
-    prompts = _tokenize_prompts_to_length(llm.tokenizer, prompt_texts, args.input_len)
+    custom_prompt = args.prompt_text
+    if not custom_prompt and args.prompt_text_file:
+        custom_prompt = Path(args.prompt_text_file).read_text(encoding="utf-8")
+    if custom_prompt:
+        prompt_texts = [custom_prompt]
+        prompts = [llm.tokenizer.encode(custom_prompt)]
+        case_info["actual_input_tokens"] = [len(prompts[0])]
+    else:
+        prompt_texts = _make_prompts(args.num_seqs, args.input_len, args.seed)
+        prompts = _tokenize_prompts_to_length(llm.tokenizer, prompt_texts, args.input_len)
+        case_info["actual_input_tokens"] = [len(prompt) for prompt in prompts]
     case_info["actual_input_tokens"] = [len(prompt) for prompt in prompts]
     sampling = [
         SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=args.output_len)
@@ -684,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-len", type=int, default=24)
     p.add_argument("--max-draft-tokens", type=int, default=4)
     p.add_argument("--draft-top-c", type=int, default=0)
-    p.add_argument("--draft-reroute-policy", default="round_robin",
+    p.add_argument("--draft-reroute-policy", default="entropy_cache_bias",
                    choices=["round_robin", "drop_miss", "entropy_cache_bias",
                             "bounded_cache_bias", "similarity_replace"])
     p.add_argument("--draft-reroute-artifact", default="")
@@ -731,6 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sync-layer-timing", type=str2bool, default=True)
+    p.add_argument("--prompt-text", default="",
+                   help="Optional custom prompt text.")
+    p.add_argument("--prompt-text-file", default="",
+                   help="Optional path to file containing custom prompt text.")
     p.add_argument("--case-timeout-sec", type=int, default=1800)
     return p
 
