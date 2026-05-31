@@ -76,6 +76,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from nanovllm.scheduling.draft_reroute_profile import save_draft_reroute_profile
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hyper-parameters (tunable via constructor kwargs)
@@ -1159,7 +1161,7 @@ def main():
     p.add_argument("--sim_floor",   type=float, default=SIM_FLOOR,
                    help="Min substitute similarity floor (default 0.40).")
     p.add_argument("--calibration_artifact", default="",
-                   help="Optional .pt path for exporting cond_sim and skip_err for nano-vllm-moe.")
+                   help="Optional .pt/.safetensors path for exporting the full nano-vllm-moe offline profile.")
     p.add_argument("--calibration_only", action="store_true",
                    help="Exit after offline calibration and optional artifact export.")
     args = p.parse_args()
@@ -1197,13 +1199,24 @@ def main():
                       args.device, moe_cfg["num_experts"])
     if args.calibration_artifact:
         artifact_path = os.path.abspath(args.calibration_artifact)
-        os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
-        torch.save(
-            {
-                "cond_sim": calib.cond_sim.float().cpu().contiguous(),
-                "skip_err": calib.skip_err.float().cpu().contiguous(),
-            },
+        save_draft_reroute_profile(
             artifact_path,
+            tensors={
+                "cond_sim": calib.cond_sim,
+                "skip_err": calib.skip_err,
+                "sim": calib.sim,
+                "sens": calib.sens,
+                "act_freq": torch.tensor(calib.act_freq, dtype=torch.float32),
+            },
+            metadata={
+                "format_version": "2",
+                "num_layers": int(calib.L),
+                "num_experts": int(calib.N),
+                "top_k": int(moe_cfg["top_k"]),
+                "model_type": str(getattr(model.config, "model_type", "")),
+                "hidden_size": int(getattr(model.config, "hidden_size", 0)),
+                "source_model": os.path.abspath(args.model),
+            },
         )
         print(f"  Saved runtime calibration artifact: {artifact_path}")
     if args.calibration_only:

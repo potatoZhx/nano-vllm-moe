@@ -16,9 +16,13 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.scheduling.draft_scheduler import create_draft_scheduler
-from nanovllm.scheduling.cache_strategy import create_cache_strategy
+from nanovllm.scheduling.cache_strategy import LFURankGuardStrategy, create_cache_strategy
 from nanovllm.scheduling.prefetch_strategy import create_prefetch_strategy
-from nanovllm.scheduling.draft_reroute import SIMILARITY_REPLACE, load_draft_reroute_artifact
+from nanovllm.scheduling.draft_reroute import SIMILARITY_REPLACE
+from nanovllm.scheduling.draft_reroute_profile import (
+    load_draft_reroute_profile,
+    seed_lfu_rank_guard_from_profile,
+)
 from nanovllm.expert.prefetcher import PrefetchRuntime
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -119,22 +123,47 @@ class ModelRunner:
         setattr(hf_config, "enable_heterogeneous", config.enable_heterogeneous)
         self.model = self.MODEL_TYPE_DICT[hf_config.model_type](hf_config)
         if config.enable_heterogeneous and hasattr(self.model, "enable_heterogeneous_mode"):
-            loader = HeterogeneousModelLoader(config)
+            draft_reroute_profile = None
+            draft_reroute_artifact_path = getattr(config, "draft_reroute_artifact", "")
+            if draft_reroute_artifact_path:
+                draft_reroute_profile = load_draft_reroute_profile(
+                    draft_reroute_artifact_path,
+                    num_experts=int(getattr(hf_config, "num_experts")),
+                    expected_top_k=int(
+                        getattr(
+                            hf_config,
+                            "num_experts_per_tok",
+                            getattr(hf_config, "top_k", 0),
+                        )
+                    )
+                    or None,
+                    hf_config=hf_config,
+                )
+            if getattr(config, "draft_reroute_policy", "round_robin") == SIMILARITY_REPLACE:
+                if (
+                    draft_reroute_profile is None
+                    or draft_reroute_profile.cond_sim is None
+                    or draft_reroute_profile.skip_err is None
+                ):
+                    raise ValueError("similarity_replace requires cond_sim and skip_err calibration tensors")
+
+            loader = HeterogeneousModelLoader(config, draft_reroute_profile=draft_reroute_profile)
             layer_caches, cpu_expert_pool = loader.load(self.model, config.model)
             self.layer_caches = layer_caches
             self.cpu_expert_pool = cpu_expert_pool
+            if isinstance(self.cache_strategy, LFURankGuardStrategy):
+                seed_lfu_rank_guard_from_profile(
+                    self.cache_strategy,
+                    draft_reroute_profile,
+                    layer_indices=sorted(self.layer_caches),
+                    top_k=int(getattr(hf_config, "num_experts_per_tok", getattr(hf_config, "top_k", 1))),
+                )
             # Create shared GPU fallback workspace for unified Triton grouped-GEMM.
             # Pre-allocate one buffer pool for all layers so uncached expert routes
             # use the same kernel as cached routes (deterministic alignment).
             gpu_fallback_workspace = _create_gpu_fallback_workspace(
                 cpu_expert_pool, hf_config
             )
-            draft_reroute_artifact = None
-            if getattr(config, "draft_reroute_policy", "round_robin") == SIMILARITY_REPLACE:
-                draft_reroute_artifact = load_draft_reroute_artifact(
-                    getattr(config, "draft_reroute_artifact", ""),
-                    num_experts=int(getattr(hf_config, "num_experts")),
-                )
             self.model.enable_heterogeneous_mode(
                 layer_caches,
                 cpu_expert_pool,
@@ -155,7 +184,7 @@ class ModelRunner:
                 kt_threadpool_count=getattr(config, "kt_threadpool_count", 1),
                 kt_chunked_prefill_size=getattr(config, "kt_chunked_prefill_size", 4096),
                 draft_reroute_policy=getattr(config, "draft_reroute_policy", "round_robin"),
-                draft_reroute_artifact=draft_reroute_artifact,
+                draft_reroute_profile=draft_reroute_profile,
             )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
             self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"

@@ -24,8 +24,6 @@ def main():
         num_experts = int(getattr(hf_config, "num_experts"))
         slots = max(1, int(round(num_experts * args["cache_ratio"])))
         artifact = args.get("calibration_artifact", "")
-        if args["policy"] != "similarity_replace":
-            artifact = ""
 
         llm = LLM(
             args["model_path"], dist_port=args["dist_port"],
@@ -78,16 +76,37 @@ def main():
         profile = llm.get_profile(reset=True)
         drafted = 0
         accepted = 0
+        position_drafted = {}
+        position_accepted = {}
         traces = profile.get("spec_step_traces", [])
         for step in traces:
             for seq in step.get("sequences", []):
-                drafted += int(seq.get("drafted_tokens", 0) or 0)
-                accepted += int(seq.get("accepted_draft_tokens", 0) or 0)
+                d = int(seq.get("drafted_tokens", 0) or 0)
+                a = max(0, min(int(seq.get("accepted_draft_tokens", 0) or 0), d))
+                drafted += d
+                accepted += a
+                for position in range(1, d + 1):
+                    position_drafted[position] = position_drafted.get(position, 0) + 1
+                for position in range(1, a + 1):
+                    position_accepted[position] = position_accepted.get(position, 0) + 1
+        position_stats = []
+        for position in sorted(position_drafted):
+            drafted_count = int(position_drafted[position])
+            accepted_count = int(position_accepted.get(position, 0))
+            position_stats.append(
+                {
+                    "position": int(position),
+                    "drafted_count": drafted_count,
+                    "accepted_count": accepted_count,
+                    "acceptance_rate": float(accepted_count / drafted_count) if drafted_count else 0.0,
+                }
+            )
         dc = float(profile.get("run_draft_calls", 0))
         dt = float(profile.get("run_draft_infer_ms_total", 0))
         result["drafted"] = drafted
         result["accepted"] = accepted
         result["acceptance_rate"] = float(accepted / drafted) if drafted > 0 else 0.0
+        result["draft_position_acceptance"] = position_stats
         result["draft_forward_ms_avg"] = dt / dc if dc > 0 else 0.0
         result["draft_replays"] = int(profile.get("model_draft_graph_replay_count", 0) or 0)
         result["cpu_route_ratio"] = float(profile.get("cpu_route_ratio_sum", 0) or 0)

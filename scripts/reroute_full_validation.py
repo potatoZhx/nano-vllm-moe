@@ -106,7 +106,7 @@ def main() -> None:
 
                     # Determine temperature: 0 for greedy, configurable for sampling
                     temp = 0.0 if acc_strat == "greedy" else args.temperature
-                    artifact = args.calibration_artifact if policy == "similarity_replace" else ""
+                    artifact = args.calibration_artifact
 
                     cmd = [
                         sys.executable,
@@ -204,6 +204,7 @@ def main() -> None:
                                 "generated_output_tokens": raw.get("generated_output_tokens", 0),
                                 "outputs_digest": digest,
                                 "acceptance_rate": acc_rate,
+                                "draft_position_acceptance": acceptance.get("draft_position_acceptance", []),
                                 "draft_forward_ms_avg": draft_avg,
                                 "draft_replay_count": replays,
                                 "generated_token_ids_len": len(token_ids) if token_ids else 0,

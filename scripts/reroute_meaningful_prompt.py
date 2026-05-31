@@ -100,7 +100,7 @@ def main():
                     case_log = outdir / f"{name}.log"
 
                     temp = 0.0 if acc_strat == "greedy" else args.temperature
-                    artifact = args.calibration_artifact if policy == "similarity_replace" else ""
+                    artifact = args.calibration_artifact
 
                     # Determine input_len: use tokenizer to compute actual token count
                     # We'll let the subprocess do that by passing the prompt file
@@ -182,6 +182,7 @@ def main():
                                 "generated_output_tokens": raw.get("generated_output_tokens", 0),
                                 "outputs_digest": digest,
                                 "acceptance_rate": acc_rate,
+                                "draft_position_acceptance": acceptance.get("draft_position_acceptance", []),
                                 "draft_forward_ms_avg": draft_avg,
                                 "draft_replay_count": replays,
                                 "generated_token_ids_len": len(token_ids) if token_ids else 0,

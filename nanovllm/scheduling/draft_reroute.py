@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from pathlib import Path
 
 import torch
 from torch import nn
+
+from nanovllm.scheduling.draft_reroute_profile import load_draft_reroute_profile
 
 
 ROUND_ROBIN = "round_robin"
@@ -43,29 +44,7 @@ def load_draft_reroute_artifact(
     num_experts: int,
 ) -> dict[str, torch.Tensor]:
     """Load the offline v2 tensors required by similarity_replace."""
-    artifact_path = Path(path)
-    if artifact_path.suffix == ".safetensors":
-        from safetensors.torch import load_file
-
-        tensors = load_file(str(artifact_path), device="cpu")
-    else:
-        tensors = torch.load(str(artifact_path), map_location="cpu", weights_only=True)
-    if not isinstance(tensors, dict):
-        raise ValueError("draft reroute artifact must contain a tensor dictionary")
-    cond_sim = tensors.get("cond_sim")
-    skip_err = tensors.get("skip_err")
-    if not isinstance(cond_sim, torch.Tensor) or cond_sim.ndim != 3:
-        raise ValueError("draft reroute artifact must include cond_sim with shape [layers, experts, experts]")
-    if not isinstance(skip_err, torch.Tensor) or skip_err.ndim != 2:
-        raise ValueError("draft reroute artifact must include skip_err with shape [layers, experts]")
-    if tuple(cond_sim.shape[1:]) != (num_experts, num_experts):
-        raise ValueError(f"cond_sim expert dimensions do not match num_experts={num_experts}")
-    if int(skip_err.shape[0]) != int(cond_sim.shape[0]) or int(skip_err.shape[1]) != num_experts:
-        raise ValueError("skip_err dimensions do not match cond_sim")
-    return {
-        "cond_sim": cond_sim.float().contiguous(),
-        "skip_err": skip_err.float().contiguous(),
-    }
+    return load_draft_reroute_profile(path, num_experts=num_experts).similarity_artifact()
 
 
 class DraftReroutePolicy(nn.Module):

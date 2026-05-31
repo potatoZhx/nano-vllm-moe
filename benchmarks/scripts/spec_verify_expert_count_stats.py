@@ -155,18 +155,37 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
     accepted = 0
     accepted_dist: Counter[int] = Counter()
     drafted_dist: Counter[int] = Counter()
+    position_drafted: Counter[int] = Counter()
+    position_accepted: Counter[int] = Counter()
     rejection_count = 0
     step_count = 0
     for step in traces:
         for seq in step.get("sequences", []):
             d = int(seq.get("drafted_tokens", 0) or 0)
             a = int(seq.get("accepted_draft_tokens", 0) or 0)
+            a = max(0, min(a, d))
             drafted += d
             accepted += a
             accepted_dist[a] += 1
             drafted_dist[d] += 1
+            for position in range(1, d + 1):
+                position_drafted[position] += 1
+            for position in range(1, a + 1):
+                position_accepted[position] += 1
             rejection_count += int(bool(seq.get("rejected", False)))
             step_count += 1
+    draft_position_acceptance = []
+    for position in sorted(position_drafted):
+        drafted_count = int(position_drafted[position])
+        accepted_count = int(position_accepted[position])
+        draft_position_acceptance.append(
+            {
+                "position": int(position),
+                "drafted_count": drafted_count,
+                "accepted_count": accepted_count,
+                "acceptance_rate": float(accepted_count / drafted_count) if drafted_count else 0.0,
+            }
+        )
     return {
         "step_sequence_count": step_count,
         "drafted_tokens_total": drafted,
@@ -176,6 +195,7 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
         "rejection_rate_per_step": float(rejection_count / step_count) if step_count else 0.0,
         "accepted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(accepted_dist.items())},
         "drafted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(drafted_dist.items())},
+        "draft_position_acceptance": draft_position_acceptance,
     }
 
 

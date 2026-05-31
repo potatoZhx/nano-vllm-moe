@@ -30,6 +30,7 @@ from nanovllm.expert.placement import (
     build_verify_plan_gpu,
 )
 from nanovllm.scheduling.draft_reroute import ROUND_ROBIN, DraftReroutePolicy
+from nanovllm.scheduling.draft_reroute_profile import DraftRerouteProfile
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
 from nanovllm.utils.context import get_context
 
@@ -817,7 +818,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
         draft_reroute_policy: str = ROUND_ROBIN,
-        draft_reroute_artifact: dict[str, torch.Tensor] | None = None,
+        draft_reroute_profile: DraftRerouteProfile | None = None,
     ):
         reroute_layer_idx = 0
         for layer_idx, layer in enumerate(self.model.layers):
@@ -826,11 +827,13 @@ class Qwen3MoeForCausalLM(nn.Module):
                 assert layer_idx in cpu_expert_pool, f"No cpu expert pool for layer {layer_idx}"
                 cond_sim = None
                 skip_err = None
-                if draft_reroute_artifact is not None:
-                    if reroute_layer_idx >= int(draft_reroute_artifact["cond_sim"].shape[0]):
+                if draft_reroute_profile is not None and draft_reroute_profile.cond_sim is not None:
+                    if reroute_layer_idx >= int(draft_reroute_profile.cond_sim.shape[0]):
                         raise ValueError("draft reroute artifact has fewer layers than the model MoE blocks")
-                    cond_sim = draft_reroute_artifact["cond_sim"][reroute_layer_idx]
-                    skip_err = draft_reroute_artifact["skip_err"][reroute_layer_idx]
+                    cond_sim = draft_reroute_profile.cond_sim[reroute_layer_idx]
+                    if draft_reroute_profile.skip_err is None:
+                        raise ValueError("draft reroute artifact must include skip_err when cond_sim is present")
+                    skip_err = draft_reroute_profile.skip_err[reroute_layer_idx]
                 layer.mlp.enable_heterogeneous(
                     layer_caches[layer_idx],
                     cpu_expert_pool[layer_idx],
@@ -855,7 +858,11 @@ class Qwen3MoeForCausalLM(nn.Module):
                     draft_reroute_skip_err=skip_err,
                 )
                 reroute_layer_idx += 1
-        if draft_reroute_artifact is not None and reroute_layer_idx != int(draft_reroute_artifact["cond_sim"].shape[0]):
+        if (
+            draft_reroute_profile is not None
+            and draft_reroute_profile.cond_sim is not None
+            and reroute_layer_idx != int(draft_reroute_profile.cond_sim.shape[0])
+        ):
             raise ValueError("draft reroute artifact layer count does not match the model MoE block count")
 
     def set_speculative_execution_mode(

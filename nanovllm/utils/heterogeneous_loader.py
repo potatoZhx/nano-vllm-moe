@@ -10,6 +10,7 @@ from safetensors import safe_open
 from nanovllm.config import Config
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.cpu_weights import CpuExpertWeights
+from nanovllm.scheduling.draft_reroute_profile import DraftRerouteProfile
 from nanovllm.utils.loader import default_weight_loader
 
 if TYPE_CHECKING:
@@ -19,10 +20,15 @@ if TYPE_CHECKING:
 class HeterogeneousModelLoader:
     """Load non-expert weights to GPU and route expert weights through CPU pool."""
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        draft_reroute_profile: DraftRerouteProfile | None = None,
+    ):
         self.config = config
         self.hf_config = config.hf_config
         self.pin_memory = config.cpu_expert_pin_memory
+        self.draft_reroute_profile = draft_reroute_profile
 
     def load(
         self,
@@ -116,6 +122,7 @@ class HeterogeneousModelLoader:
     ) -> dict[int, LayerExpertCache]:
         slots_per_layer = self.config.heterogeneous_slots_per_layer
         layer_caches: dict[int, LayerExpertCache] = {}
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for layer_idx, experts in cpu_pool.items():
             num_experts = len(experts)
             slots = num_experts if slots_per_layer <= 0 else min(slots_per_layer, num_experts)
@@ -125,7 +132,7 @@ class HeterogeneousModelLoader:
                 slots_per_layer=slots,
                 gate_up_shape=tuple(sample["gate_up"].shape),
                 down_shape=tuple(sample["down"].shape),
-                device=torch.device("cuda"),
+                device=device,
                 dtype=self.hf_config.torch_dtype,
                 cpu_expert_pool=experts,
                 staging_slots_per_layer=getattr(self.config, "prefetch_staging_slots_per_layer", 0),
@@ -139,11 +146,45 @@ class HeterogeneousModelLoader:
         cpu_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> None:
         # First step default: S=N, so this maps expert i -> slot i where possible.
-        for layer_idx, cache in layer_caches.items():
+        for profile_row, layer_idx in enumerate(sorted(layer_caches)):
+            cache = layer_caches[layer_idx]
             expert_ids = sorted(cpu_pool[layer_idx].keys())
-            for slot_idx, expert_idx in enumerate(expert_ids[: cache.num_slots]):
+            initial_experts = self._initial_experts_for_layer(profile_row, expert_ids, cache.num_slots)
+            self._seed_cache_stats_from_profile(cache, profile_row, expert_ids)
+            for slot_idx, expert_idx in enumerate(initial_experts):
                 params = cpu_pool[layer_idx][expert_idx]
                 cache.put_to_slot(slot_idx, expert_idx, params["gate_up"], params["down"])
+
+    def _initial_experts_for_layer(
+        self,
+        profile_row: int,
+        expert_ids: list[int],
+        num_slots: int,
+    ) -> list[int]:
+        act_freq = None if self.draft_reroute_profile is None else self.draft_reroute_profile.act_freq
+        if act_freq is None or profile_row >= int(act_freq.shape[0]):
+            return expert_ids[:num_slots]
+        ranked = sorted(
+            expert_ids,
+            key=lambda expert_idx: (-float(act_freq[profile_row, expert_idx]), int(expert_idx)),
+        )
+        return ranked[:num_slots]
+
+    def _seed_cache_stats_from_profile(
+        self,
+        cache: LayerExpertCache,
+        profile_row: int,
+        expert_ids: list[int],
+    ) -> None:
+        act_freq = None if self.draft_reroute_profile is None else self.draft_reroute_profile.act_freq
+        if act_freq is None or profile_row >= int(act_freq.shape[0]):
+            return
+        for expert_idx in expert_ids:
+            if not (0 <= int(expert_idx) < cache.num_experts):
+                continue
+            freq = float(act_freq[profile_row, expert_idx])
+            cache.access_count[expert_idx] = int(round(freq * 1000.0))
+            cache.access_score_sum[expert_idx] = float(cache.access_count[expert_idx])
 
     def _to_cpu(self, x: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
         if dtype is None:
