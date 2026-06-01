@@ -95,6 +95,7 @@ class LFURankGuardStrategy(CacheStrategy):
         self._protect_threshold = float(protect_threshold)
         self._ema_alpha = float(ema_alpha)
         self._rank_scores: dict[int, list[float]] = {}
+        self.profile_seed_enabled = True
 
     @property
     def num_experts(self) -> int:
@@ -260,6 +261,23 @@ class LFURankGuardStrategy(CacheStrategy):
         return best_slot
 
 
+class LFUOnlineRankGuardStrategy(LFURankGuardStrategy):
+    """LFU-RankGuard variant that learns protection only from online routing."""
+
+    def __init__(
+        self,
+        num_experts: int = 128,
+        protect_threshold: float = 0.15,
+        ema_alpha: float = 0.95,
+    ) -> None:
+        super().__init__(
+            num_experts=num_experts,
+            protect_threshold=protect_threshold,
+            ema_alpha=ema_alpha,
+        )
+        self.profile_seed_enabled = False
+
+
 def create_cache_strategy(name: str, **kwargs: object) -> CacheStrategy:
     normalized = name.strip().lower()
     if normalized == "lru":
@@ -270,4 +288,6 @@ def create_cache_strategy(name: str, **kwargs: object) -> CacheStrategy:
         return AdaptiveCacheStrategy()
     if normalized == "lfu_rankguard":
         return LFURankGuardStrategy(**kwargs)  # type: ignore[arg-type]
+    if normalized == "lfu_rankguard_online":
+        return LFUOnlineRankGuardStrategy(**kwargs)  # type: ignore[arg-type]
     raise ValueError(f"Unsupported cache strategy: {name}")

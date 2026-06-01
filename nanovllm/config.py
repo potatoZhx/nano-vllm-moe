@@ -130,7 +130,7 @@ class Config:
             assert self.draft_top_c == 0, "draft reroute policies are implemented only for draft_top_c=0"
         if self.draft_reroute_policy == "similarity_replace":
             assert self.draft_reroute_artifact, "similarity_replace requires draft_reroute_artifact"
-        assert self.cache_strategy in {"lru", "lfu", "adaptive", "lfu_rankguard"}
+        assert self.cache_strategy in {"lru", "lfu", "adaptive", "lfu_rankguard", "lfu_rankguard_online"}
         assert 0.0 <= self.rank_guard_threshold <= 1.0
         assert 0.0 < self.rank_guard_ema_alpha <= 1.0
         assert self.prefetch_strategy in {"noop", "history_window"}

@@ -6,6 +6,7 @@ import torch
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.prefetcher import PrefetchRuntime
 from nanovllm.expert.runtime_meta import LayerRuntimeMetaCPU
+from nanovllm.scheduling.cache_strategy import LFURankGuardStrategy
 from nanovllm.scheduling.cache_strategy import create_cache_strategy
 from nanovllm.scheduling.prefetch_strategy import create_prefetch_strategy
 
@@ -367,6 +368,28 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertEqual(prof["draft_direct_active_prefetch_adaptive_budget"], 1)
         self.assertEqual(prof["draft_direct_active_prefetch_budget_increase_count"], 1)
         self.assertEqual(prof["draft_direct_active_prefetch_skipped_by_budget_count"], 1)
+
+    def test_lfu_rankguard_updates_scores_even_without_verify_history_queue(self):
+        runtime, _cache = self._build_runtime()
+        runtime.config.prefetch_use_verify_history = False
+        strategy = LFURankGuardStrategy(num_experts=3, ema_alpha=0.0)
+        runtime.cache_strategy = strategy
+
+        runtime.observe_verify(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=5,
+                    mode="verify",
+                    layer_idx=0,
+                    token_count=2,
+                    selected_experts=torch.tensor([[2, 1], [2, 0]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[0.6, 0.4], [0.7, 0.3]], dtype=torch.float32),
+                )
+            },
+            step_id=5,
+        )
+
+        self.assertEqual(strategy.get_rank_scores(0), [0.5, 0.5, 2.0])
 
 
 if __name__ == "__main__":

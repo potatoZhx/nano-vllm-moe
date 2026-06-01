@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 from safetensors.torch import save_file
 
-from nanovllm.scheduling.cache_strategy import LFURankGuardStrategy
+from nanovllm.scheduling.cache_strategy import LFURankGuardStrategy, create_cache_strategy
 from nanovllm.scheduling.draft_reroute_profile import (
     DraftRerouteProfile,
     load_draft_reroute_profile,
@@ -184,6 +184,22 @@ class TestDraftRerouteProfile(unittest.TestCase):
         seed_lfu_rank_guard_from_profile(strategy, profile, layer_indices=[7], top_k=4)
 
         self.assertEqual(strategy.get_rank_scores(7), [0.4, 0.8, 1.2, 1.6])
+
+    def test_online_lfu_rank_guard_skips_offline_profile_seed(self):
+        profile = DraftRerouteProfile(
+            cond_sim=None,
+            skip_err=None,
+            sim=None,
+            sens=None,
+            act_freq=torch.tensor([[0.10, 0.20, 0.30, 0.40]], dtype=torch.float32),
+            metadata={},
+            is_legacy=False,
+        )
+        strategy = create_cache_strategy("lfu_rankguard_online", num_experts=4)
+
+        seed_lfu_rank_guard_from_profile(strategy, profile, layer_indices=[7], top_k=4)
+
+        self.assertIsNone(strategy.get_rank_scores(7))
 
     @staticmethod
     def _config(slots_per_layer: int):

@@ -208,6 +208,10 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
     verify_calls = int(ep.get("spec_run_verify_calls", 0) or 0)
     generated_tokens = int(raw.get("generated_output_tokens", 0) or 0)
     spec_step_ms_total = float(ep.get("spec_spec_step_ms", 0.0) or 0.0)
+    cpu_route_ratio = float(ep.get("model_cpu_route_ratio", ep.get("cpu_route_ratio", 0.0)) or 0.0)
+    cpu_weight_mass_ratio = float(
+        ep.get("model_cpu_weight_mass_ratio", ep.get("cpu_weight_mass_ratio", 0.0)) or 0.0
+    )
     return {
         "case": raw.get("case", {}),
         "elapsed_sec": float(raw.get("elapsed_sec", 0.0)),
@@ -229,6 +233,14 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "standard_replay_count": int(ep.get("model_standard_graph_replay_count", 0) or 0),
             "total_replay_count": int(ep.get("model_graph_replay_count", 0) or 0),
             "hit_rate": float(ep.get("model_graph_hit_rate", 0.0) or 0.0),
+        },
+        "cache": {
+            "route_hit_rate": float(max(0.0, min(1.0, 1.0 - cpu_route_ratio))),
+            "route_miss_rate": cpu_route_ratio,
+            "weight_hit_rate": float(max(0.0, min(1.0, 1.0 - cpu_weight_mass_ratio))),
+            "weight_miss_rate": cpu_weight_mass_ratio,
+            "activated_expert_set_size": float(ep.get("model_activated_expert_set_size", 0.0) or 0.0),
+            "realized_cpu_expert_count": float(ep.get("model_realized_cpu_expert_count", 0.0) or 0.0),
         },
         "prefetch": {
             "enabled": bool(raw.get("case", {}).get("prefetch_enabled", False)),
@@ -281,6 +293,12 @@ def run_single_case(args: argparse.Namespace) -> None:
         "draft_reroute_artifact": args.draft_reroute_artifact,
         "cpu_expert_backend": args.cpu_expert_backend,
         "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
+        "cache_strategy": args.cache_strategy,
+        "rank_guard_threshold": float(args.rank_guard_threshold),
+        "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
+        "prefetch_runtime_mode": args.prefetch_runtime_mode,
+        "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
+        "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
     }
 
     llm = LLM(
@@ -315,7 +333,10 @@ def run_single_case(args: argparse.Namespace) -> None:
         engine_profile_cuda_sync=True,
         spec_enable_prefetch=args.prefetch_enabled,
         cache_strategy=args.cache_strategy,
+        rank_guard_threshold=args.rank_guard_threshold,
+        rank_guard_ema_alpha=args.rank_guard_ema_alpha,
         prefetch_strategy=args.prefetch_strategy,
+        prefetch_runtime_mode=args.prefetch_runtime_mode,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
         prefetch_max_inflight=args.prefetch_max_inflight,
         prefetch_step_budget=args.prefetch_step_budget,
@@ -332,6 +353,8 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_use_prefill_history=args.prefetch_use_prefill_history,
         prefetch_use_verify_history=args.prefetch_use_verify_history,
         prefetch_use_draft_live=args.prefetch_use_draft_live,
+        draft_cuda_graph_enabled=args.draft_cuda_graph_enabled,
+        draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
     )
 
     custom_prompt = args.prompt_text
@@ -364,6 +387,7 @@ def run_single_case(args: argparse.Namespace) -> None:
     llm.exit()
 
     token_ids = [x["token_ids"] for x in outputs]
+    generated_text = [x.get("text", "") for x in outputs]
     generated_output_tokens = sum(len(x) for x in token_ids)
     digest_payload = "|".join(",".join(str(t) for t in seq) for seq in token_ids).encode("utf-8")
     import hashlib
@@ -375,6 +399,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         "throughput_output_tok_s": generated_output_tokens / elapsed if elapsed > 0 else 0.0,
         "outputs_digest": hashlib.sha256(digest_payload).hexdigest(),
         "generated_token_ids": token_ids,
+        "generated_text": generated_text,
         "engine_profile": profile,
         "verify_layer_events": list(VERIFY_LAYER_EVENTS),
     }
@@ -383,8 +408,8 @@ def run_single_case(args: argparse.Namespace) -> None:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(raw, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, ensure_ascii=True, indent=2))
+    output_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 def _case_name(ratio: float, prefetch: bool, backend: str, policy: str) -> str:
@@ -622,6 +647,8 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(args.prefetch_staging_slots_per_layer),
                     "--cache-eviction-budget-per-step",
                     str(args.cache_eviction_budget_per_step),
+                    "--prefetch-runtime-mode",
+                    args.prefetch_runtime_mode,
                     "--prefetch-global-queue-capacity",
                     str(args.prefetch_global_queue_capacity),
                     "--prefetch-history-decay",
@@ -644,6 +671,14 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(args.prefetch_use_verify_history).lower(),
                     "--prefetch-use-draft-live",
                     str(args.prefetch_use_draft_live).lower(),
+                    "--draft-cuda-graph-enabled",
+                    str(args.draft_cuda_graph_enabled).lower(),
+                    "--draft-cuda-graph-cpu-backend",
+                    args.draft_cuda_graph_cpu_backend,
+                    "--rank-guard-threshold",
+                    str(args.rank_guard_threshold),
+                    "--rank-guard-ema-alpha",
+                    str(args.rank_guard_ema_alpha),
                     "--seed",
                     str(args.seed),
                     "--sync-layer-timing",
@@ -680,6 +715,10 @@ def run_suite(args: argparse.Namespace) -> None:
             "draft_top_c": int(args.draft_top_c),
             "draft_reroute_policy": args.draft_reroute_policy,
             "draft_reroute_artifact": args.draft_reroute_artifact,
+            "cache_strategy": args.cache_strategy,
+            "prefetch_runtime_mode": args.prefetch_runtime_mode,
+            "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
+            "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
             "acceptance_strategy": args.acceptance_strategy,
             "temperature": float(args.temperature),
             "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
@@ -739,7 +778,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--enforce-eager", type=str2bool, default=False)
     p.add_argument("--cache-strategy", default="lru")
+    p.add_argument("--rank-guard-threshold", type=float, default=0.15)
+    p.add_argument("--rank-guard-ema-alpha", type=float, default=0.95)
     p.add_argument("--prefetch-strategy", default="history_window")
+    p.add_argument(
+        "--prefetch-runtime-mode",
+        choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"],
+        default="baseline_staging",
+    )
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--prefetch-max-inflight", type=int, default=8)
     p.add_argument("--prefetch-step-budget", type=int, default=4)
@@ -756,6 +802,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-use-prefill-history", type=str2bool, default=True)
     p.add_argument("--prefetch-use-verify-history", type=str2bool, default=True)
     p.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
+    p.add_argument("--draft-cuda-graph-enabled", type=str2bool, default=True)
+    p.add_argument("--draft-cuda-graph-cpu-backend", choices=["none", "fused", "fused_sync"], default="none")
     p.add_argument("--dist-port", type=int, default=12345)
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)

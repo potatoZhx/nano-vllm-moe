@@ -567,15 +567,14 @@ class PrefetchRuntime:
         return {}
 
     def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
+        self._update_rank_guard_scores(runtime_meta)
         if bool(self.config.prefetch_use_verify_history):
-            result = self.observe_runtime_meta(
+            return self.observe_runtime_meta(
                 runtime_meta,
                 source="verify_history",
                 step_id=step_id,
                 segment_index=self.long_term_segment_index if self._segment_indexed_enabled() else None,
             )
-            self._update_rank_guard_scores(runtime_meta)
-            return result
         return {}
 
     def _update_rank_guard_scores(

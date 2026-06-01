@@ -31,6 +31,17 @@ from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
 from nanovllm.layers.fuse_moe.heterogeneous import GpuFallbackWorkspace
 
 
+def _create_cache_strategy_from_config(config: Config):
+    if str(config.cache_strategy).strip().lower() in {"lfu_rankguard", "lfu_rankguard_online"}:
+        return create_cache_strategy(
+            config.cache_strategy,
+            num_experts=int(getattr(config.hf_config, "num_experts", 128)),
+            protect_threshold=float(getattr(config, "rank_guard_threshold", 0.15)),
+            ema_alpha=float(getattr(config, "rank_guard_ema_alpha", 0.95)),
+        )
+    return create_cache_strategy(config.cache_strategy)
+
+
 def _create_gpu_fallback_workspace(
     cpu_expert_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
     hf_config,
@@ -77,15 +88,7 @@ class ModelRunner:
         self._profile = defaultdict(float)
         self.layer_caches = {}
         self.cpu_expert_pool = {}
-        if config.cache_strategy == "lfu_rankguard":
-            self.cache_strategy = create_cache_strategy(
-                config.cache_strategy,
-                num_experts=int(getattr(config.hf_config, "num_experts", 128)),
-                protect_threshold=float(getattr(config, "rank_guard_threshold", 0.15)),
-                ema_alpha=float(getattr(config, "rank_guard_ema_alpha", 0.95)),
-            )
-        else:
-            self.cache_strategy = create_cache_strategy(config.cache_strategy)
+        self.cache_strategy = _create_cache_strategy_from_config(config)
         self.prefetch_strategy = create_prefetch_strategy(config.prefetch_strategy, config)
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
         self.prefetch_runtime: PrefetchRuntime | None = None

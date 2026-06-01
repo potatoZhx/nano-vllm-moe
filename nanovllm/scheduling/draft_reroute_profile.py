@@ -103,6 +103,8 @@ def seed_lfu_rank_guard_from_profile(
     layer_indices: Iterable[int],
     top_k: int,
 ) -> None:
+    if not bool(getattr(strategy, "profile_seed_enabled", True)):
+        return
     if profile is None or profile.act_freq is None:
         return
     for profile_row, layer_idx in enumerate(layer_indices):
