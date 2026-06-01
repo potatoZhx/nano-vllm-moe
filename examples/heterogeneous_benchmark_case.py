@@ -128,6 +128,7 @@ def run_case(args: argparse.Namespace) -> dict:
         engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         max_draft_tokens=args.max_draft_tokens,
         heterogeneous_slots_per_layer=args.slots_per_layer,
+        spec_verify_miss_policy=args.spec_verify_miss_policy,
         spec_enable_prefetch=(mode == "spec" and args.spec_enable_prefetch),
         cache_strategy=args.cache_strategy,
         prefetch_strategy=args.prefetch_strategy,
@@ -149,6 +150,9 @@ def run_case(args: argparse.Namespace) -> dict:
         prefetch_use_draft_live=args.prefetch_use_draft_live,
         prefetch_metadata_host_buffer_pool_size=args.prefetch_metadata_host_buffer_pool_size,
         prefetch_runtime_mode=args.prefetch_runtime_mode,
+        prefetch_runtime_kind=args.prefetch_runtime_kind,
+        prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
+        predictive_phase1_budget=args.predictive_phase1_budget,
         draft_prefetch_frontier_granularity=args.draft_prefetch_frontier_granularity,
         draft_prefetch_segment_size=args.draft_prefetch_segment_size,
         draft_prefetch_segment_host_buffer_pool_size=args.draft_prefetch_segment_host_buffer_pool_size,
@@ -210,7 +214,11 @@ def run_case(args: argparse.Namespace) -> dict:
         "output_len": args.output_len,
         "seed": args.seed,
         "spec_enable_prefetch": bool(mode == "spec" and args.spec_enable_prefetch),
+        "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "prefetch_runtime_mode": args.prefetch_runtime_mode,
+        "prefetch_runtime_kind": args.prefetch_runtime_kind,
+        "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
+        "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "prefetch_metadata_host_buffer_pool_size": int(args.prefetch_metadata_host_buffer_pool_size),
         "draft_prefetch_frontier_granularity": args.draft_prefetch_frontier_granularity,
         "draft_prefetch_segment_size": int(args.draft_prefetch_segment_size),
@@ -283,6 +291,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-profile", type=str2bool, default=False)
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--spec-enable-prefetch", type=str2bool, default=True)
+    parser.add_argument("--spec-verify-miss-policy", type=str, default="cache_fill",
+                        choices=["cpu", "cache_fill"])
     parser.add_argument("--cache-strategy", type=str, default="lru")
     parser.add_argument("--prefetch-strategy", type=str, default="history_window")
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
@@ -304,6 +314,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     parser.add_argument("--prefetch-runtime-mode", type=str, default="baseline_staging",
                         choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"])
+    parser.add_argument("--prefetch-runtime-kind", type=str, default="legacy",
+                        choices=["legacy", "predictive"])
+    parser.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
+    parser.add_argument("--predictive-phase1-budget", type=int, default=4)
     parser.add_argument("--draft-prefetch-frontier-granularity", type=str, default="segment",
                         choices=["iteration", "segment", "layer"])
     parser.add_argument("--draft-prefetch-segment-size", type=int, default=12)

@@ -131,6 +131,12 @@ def run_case(
             str(args.spec_enable_prefetch).lower(),
             "--prefetch-runtime-mode",
             args.prefetch_runtime_mode,
+            "--prefetch-runtime-kind",
+            args.prefetch_runtime_kind,
+            "--prefetch-verify-attention-ratio",
+            str(args.prefetch_verify_attention_ratio),
+            "--predictive-phase1-budget",
+            str(args.predictive_phase1_budget),
             "--prefetch-metadata-host-buffer-pool-size",
             str(args.prefetch_metadata_host_buffer_pool_size),
             "--draft-prefetch-frontier-granularity",
@@ -453,7 +459,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--spec-enable-prefetch", type=str2bool, default=True)
     parser.add_argument("--prefetch-runtime-mode", type=str, default="baseline_staging",
-                        choices=["baseline_staging", "draft_direct_active"])
+                        choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"])
+    parser.add_argument("--prefetch-runtime-kind", type=str, default="legacy",
+                        choices=["legacy", "predictive"])
+    parser.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
+    parser.add_argument("--predictive-phase1-budget", type=int, default=4)
     parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     parser.add_argument("--draft-prefetch-frontier-granularity", type=str, default="segment",
                         choices=["iteration", "segment", "layer"])
@@ -551,6 +561,9 @@ def main() -> None:
             "engine_profile_cuda_sync": args.engine_profile_cuda_sync,
             "spec_enable_prefetch": args.spec_enable_prefetch,
             "prefetch_runtime_mode": args.prefetch_runtime_mode,
+            "prefetch_runtime_kind": args.prefetch_runtime_kind,
+            "prefetch_verify_attention_ratio": args.prefetch_verify_attention_ratio,
+            "predictive_phase1_budget": args.predictive_phase1_budget,
             "prefetch_metadata_host_buffer_pool_size": args.prefetch_metadata_host_buffer_pool_size,
             "draft_prefetch_frontier_granularity": args.draft_prefetch_frontier_granularity,
             "draft_prefetch_segment_size": args.draft_prefetch_segment_size,

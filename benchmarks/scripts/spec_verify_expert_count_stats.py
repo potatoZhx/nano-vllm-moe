@@ -23,6 +23,7 @@ BASE_PROMPTS = [
 ]
 
 
+DRAFT_LAYER_EVENTS: list[dict[str, Any]] = []
 VERIFY_LAYER_EVENTS: list[dict[str, Any]] = []
 SYNC_LAYER_TIMING = True
 
@@ -82,36 +83,40 @@ def _install_verify_layer_probe(sync_layer_timing: bool) -> None:
     original_forward = cls.forward
 
     def patched_forward(self, hidden_states):  # type: ignore[no-untyped-def]
-        is_verify = getattr(self, "execution_mode", "normal") == "verify"
+        mode = getattr(self, "execution_mode", "normal")
+        is_verify = mode == "verify"
+        is_draft = mode == "draft"
         if is_verify and SYNC_LAYER_TIMING and torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = perf_counter()
         out = original_forward(self, hidden_states)
-        if is_verify:
-            if SYNC_LAYER_TIMING and torch.cuda.is_available():
+        if is_verify or is_draft:
+            if is_verify and SYNC_LAYER_TIMING and torch.cuda.is_available():
                 torch.cuda.synchronize()
             prof = dict(getattr(self, "_last_profile", {}) or {})
             cpu_routes = int(round(float(prof.get("cpu_routes_sum", 0.0))))
             cpu_compute_ms = float(prof.get("cpu_compute_ms", 0.0))
             per_route_cpu_compute_ms = cpu_compute_ms / float(cpu_routes) if cpu_routes > 0 else 0.0
-            VERIFY_LAYER_EVENTS.append(
-                {
-                    "layer_idx": int(getattr(self, "layer_idx", -1)),
-                    "token_count": int(hidden_states.shape[0]),
-                    "total_expert_count": int(round(float(prof.get("activated_expert_set_size_sum", 0.0)))),
-                    "cpu_expert_count": int(round(float(prof.get("realized_cpu_expert_count_sum", 0.0)))),
-                    "cpu_route_count": cpu_routes,
-                    "layer_moe_wall_ms": (perf_counter() - t0) * 1000.0,
-                    "route_ms": float(prof.get("route_ms", 0.0)),
-                    "plan_ms": float(prof.get("plan_ms", 0.0)),
-                    "gpu_compute_ms": float(prof.get("gpu_compute_ms", 0.0)),
-                    "cpu_prepare_ms": float(prof.get("cpu_prepare_ms", 0.0)),
-                    "cpu_compute_ms": cpu_compute_ms,
-                    "cpu_to_gpu_merge_ms": float(prof.get("cpu_to_gpu_merge_ms", 0.0)),
-                    "cpu_route_ratio": float(prof.get("cpu_route_ratio_sum", 0.0)),
-                    "per_route_cpu_compute_ms": per_route_cpu_compute_ms,
-                }
-            )
+            event = {
+                "layer_idx": int(getattr(self, "layer_idx", -1)),
+                "token_count": int(hidden_states.shape[0]),
+                "total_expert_count": int(round(float(prof.get("activated_expert_set_size_sum", 0.0)))),
+                "cpu_expert_count": int(round(float(prof.get("realized_cpu_expert_count_sum", 0.0)))),
+                "cpu_route_count": cpu_routes,
+                "layer_moe_wall_ms": (perf_counter() - t0) * 1000.0,
+                "route_ms": float(prof.get("route_ms", 0.0)),
+                "plan_ms": float(prof.get("plan_ms", 0.0)),
+                "gpu_compute_ms": float(prof.get("gpu_compute_ms", 0.0)),
+                "cpu_prepare_ms": float(prof.get("cpu_prepare_ms", 0.0)),
+                "cpu_compute_ms": cpu_compute_ms,
+                "cpu_to_gpu_merge_ms": float(prof.get("cpu_to_gpu_merge_ms", 0.0)),
+                "cpu_route_ratio": float(prof.get("cpu_route_ratio_sum", 0.0)),
+                "per_route_cpu_compute_ms": per_route_cpu_compute_ms,
+            }
+            if is_verify:
+                VERIFY_LAYER_EVENTS.append(event)
+            else:
+                DRAFT_LAYER_EVENTS.append(event)
         return out
 
     cls.forward = patched_forward
@@ -147,6 +152,66 @@ def _hist_by(events: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[s
         row["route"] = _stat([float(x["route_ms"]) for x in group])
         rows.append(row)
     return rows
+
+
+def _layer_groups(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    if not events:
+        return []
+    valid_layers = [int(event.get("layer_idx", -1)) for event in events if int(event.get("layer_idx", -1)) >= 0]
+    if not valid_layers:
+        return []
+    num_layers = max(valid_layers) + 1
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for event in events:
+        layer_idx = int(event.get("layer_idx", -1))
+        if current and layer_idx == 0:
+            groups.append(current)
+            current = []
+        current.append(event)
+        if len(current) == num_layers:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _m3_perfect_fraction(
+    draft_layer_events: list[dict[str, Any]],
+    draft_steps_per_step: list[int] | None = None,
+) -> dict[str, Any]:
+    groups = _layer_groups(draft_layer_events)
+    perfect_flags = [
+        bool(group) and all(int(event.get("cpu_expert_count", 0) or 0) == 0 for event in group)
+        for group in groups
+    ]
+    route_hits = [
+        1.0 - (sum(float(event.get("cpu_route_ratio", 0.0) or 0.0) for event in group) / float(len(group)))
+        for group in groups
+        if group
+    ]
+    step0_indices: list[int] = []
+    group_index = 0
+    for draft_steps in draft_steps_per_step or []:
+        steps = int(draft_steps)
+        if steps <= 0:
+            continue
+        if group_index < len(groups):
+            step0_indices.append(group_index)
+        group_index += steps
+    if not step0_indices and groups:
+        step0_indices = [0]
+    step0_flags = [perfect_flags[i] for i in step0_indices if i < len(perfect_flags)]
+    return {
+        "group_count": int(len(groups)),
+        "perfect_count": int(sum(1 for flag in perfect_flags if flag)),
+        "perfect_fraction": float(sum(1 for flag in perfect_flags if flag) / len(perfect_flags)) if perfect_flags else 0.0,
+        "step0_group_count": int(len(step0_flags)),
+        "step0_perfect_count": int(sum(1 for flag in step0_flags if flag)),
+        "step0_perfect_fraction": float(sum(1 for flag in step0_flags if flag) / len(step0_flags)) if step0_flags else 0.0,
+        "draft_layer_route_hit_rate_mean": float(mean(route_hits)) if route_hits else 0.0,
+    }
 
 
 def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
@@ -212,6 +277,24 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
     cpu_weight_mass_ratio = float(
         ep.get("model_cpu_weight_mass_ratio", ep.get("cpu_weight_mass_ratio", 0.0)) or 0.0
     )
+    m3 = _m3_perfect_fraction(
+        raw.get("draft_layer_events", []),
+        draft_steps_per_step=list(ep.get("spec_draft_steps_per_step", []) or []),
+    )
+    runtime_m3_groups = int(ep.get("model_draft_m3_group_count", 0) or 0)
+    if runtime_m3_groups > 0:
+        m3 = {
+            "group_count": runtime_m3_groups,
+            "perfect_count": int(ep.get("model_draft_m3_perfect_count", 0) or 0),
+            "perfect_fraction": float(ep.get("model_draft_m3_perfect_fraction", 0.0) or 0.0),
+            "step0_group_count": int(ep.get("model_draft_m3_step0_group_count", 0) or 0),
+            "step0_perfect_count": int(ep.get("model_draft_m3_step0_perfect_count", 0) or 0),
+            "step0_perfect_fraction": float(ep.get("model_draft_m3_step0_perfect_fraction", 0.0) or 0.0),
+            "draft_layer_route_hit_rate_mean": float(m3.get("draft_layer_route_hit_rate_mean", 0.0) or 0.0),
+            "source": "runtime_metadata",
+        }
+    else:
+        m3["source"] = "draft_layer_probe"
     return {
         "case": raw.get("case", {}),
         "elapsed_sec": float(raw.get("elapsed_sec", 0.0)),
@@ -249,6 +332,18 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "consumed_count": int(ep.get("model_prefetch_consumed_count", 0) or 0),
             "wait_ms_total": float(ep.get("model_prefetch_wait_ms", 0.0)),
             "verify_wait_ms_total": float(ep.get("spec_verify_prefetch_wait_ms", 0.0)),
+            "draft_segment_indexed_submit_count": int(ep.get("model_draft_segment_indexed_prefetch_submit_count", 0) or 0),
+            "draft_segment_indexed_ready_count": int(ep.get("model_draft_segment_indexed_prefetch_ready_count", 0) or 0),
+            "draft_segment_indexed_publish_count": int(ep.get("model_draft_segment_indexed_prefetch_publish_count", 0) or 0),
+            "draft_segment_indexed_consumed_count": int(ep.get("model_draft_segment_indexed_prefetch_consumed_count", 0) or 0),
+            "draft_segment_indexed_submit_by_segment": ep.get("model_draft_segment_indexed_prefetch_submit_count_by_segment", {}),
+            "draft_segment_indexed_consumed_by_segment": ep.get("model_draft_segment_indexed_prefetch_consumed_count_by_segment", {}),
+            "predictive_phase1_submit_count": int(ep.get("model_predictive_phase1_prefetch_submit_count", 0) or 0),
+            "predictive_draft_stale_observe_count": int(ep.get("model_predictive_draft_stale_observe_count", 0) or 0),
+            "verify_layer_submit_count": int(ep.get("model_verify_layer_prefetch_submit_count", 0) or 0),
+            "verify_layer_ready_count": int(ep.get("model_verify_layer_prefetch_ready_count", 0) or 0),
+            "verify_layer_publish_count": int(ep.get("model_verify_layer_prefetch_publish_count", 0) or 0),
+            "verify_layer_consumed_count": int(ep.get("model_verify_layer_prefetch_consumed_count", 0) or 0),
         },
         "verify_cache_fill": {
             "policy": raw.get("case", {}).get("spec_verify_miss_policy", "cpu"),
@@ -259,7 +354,9 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "transfer_ms_total": float(ep.get("model_verify_cache_fill_transfer_ms", 0.0)),
         },
         "acceptance": _acceptance_stats(ep),
+        "m3": m3,
         "verify_layer_event_count": len(layer_events),
+        "draft_layer_event_count": len(raw.get("draft_layer_events", [])),
         "hist_by_total_and_cpu_experts": pair_hist,
         "hist_by_total_experts": total_hist,
         "hist_by_cpu_experts": cpu_hist,
@@ -274,6 +371,7 @@ def run_single_case(args: argparse.Namespace) -> None:
     from nanovllm import LLM, SamplingParams
     from transformers import AutoConfig
 
+    DRAFT_LAYER_EVENTS.clear()
     VERIFY_LAYER_EVENTS.clear()
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -306,6 +404,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         "rank_guard_threshold": float(args.rank_guard_threshold),
         "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
         "prefetch_runtime_mode": args.prefetch_runtime_mode,
+        "prefetch_runtime_kind": args.prefetch_runtime_kind,
+        "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
+        "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
         "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
     }
@@ -347,6 +448,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         rank_guard_ema_alpha=args.rank_guard_ema_alpha,
         prefetch_strategy=args.prefetch_strategy,
         prefetch_runtime_mode=args.prefetch_runtime_mode,
+        prefetch_runtime_kind=args.prefetch_runtime_kind,
+        prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
+        predictive_phase1_budget=args.predictive_phase1_budget,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
         prefetch_max_inflight=args.prefetch_max_inflight,
         prefetch_step_budget=args.prefetch_step_budget,
@@ -387,6 +491,7 @@ def run_single_case(args: argparse.Namespace) -> None:
     warmup_params = SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=4)
     llm.generate(["Warmup request for verify layer profile."], warmup_params, use_tqdm=False)
     llm.get_profile(reset=True)
+    DRAFT_LAYER_EVENTS.clear()
     VERIFY_LAYER_EVENTS.clear()
 
     t0 = time.time()
@@ -411,6 +516,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         "generated_token_ids": token_ids,
         "generated_text": generated_text,
         "engine_profile": profile,
+        "draft_layer_events": list(DRAFT_LAYER_EVENTS),
         "verify_layer_events": list(VERIFY_LAYER_EVENTS),
     }
     summary = _summarize_case(raw, list(VERIFY_LAYER_EVENTS))
@@ -661,6 +767,12 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(args.cache_eviction_budget_per_step),
                     "--prefetch-runtime-mode",
                     args.prefetch_runtime_mode,
+                    "--prefetch-runtime-kind",
+                    args.prefetch_runtime_kind,
+                    "--prefetch-verify-attention-ratio",
+                    str(args.prefetch_verify_attention_ratio),
+                    "--predictive-phase1-budget",
+                    str(args.predictive_phase1_budget),
                     "--prefetch-global-queue-capacity",
                     str(args.prefetch_global_queue_capacity),
                     "--prefetch-history-decay",
@@ -730,6 +842,9 @@ def run_suite(args: argparse.Namespace) -> None:
             "cache_strategy": args.cache_strategy,
             "spec_verify_miss_policy": args.spec_verify_miss_policy,
             "prefetch_runtime_mode": args.prefetch_runtime_mode,
+            "prefetch_runtime_kind": args.prefetch_runtime_kind,
+            "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
+            "predictive_phase1_budget": int(args.predictive_phase1_budget),
             "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
             "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
             "acceptance_strategy": args.acceptance_strategy,
@@ -800,6 +915,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"],
         default="baseline_staging",
     )
+    p.add_argument("--prefetch-runtime-kind", choices=["legacy", "predictive"], default="legacy")
+    p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
+    p.add_argument("--predictive-phase1-budget", type=int, default=4)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--prefetch-max-inflight", type=int, default=8)
     p.add_argument("--prefetch-step-budget", type=int, default=4)

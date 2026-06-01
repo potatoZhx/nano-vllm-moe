@@ -2,13 +2,17 @@
 
 ## Summary
 
-Add an opt-in verify miss policy without changing default behavior. The current `cpu` policy keeps verify-layer miss experts on CPU. The new `cache_fill` policy synchronously promotes verify miss experts into GPU expert cache before building the verify execution plan, leaving experts on CPU only when the active unique expert count exceeds available cache slots.
+Add a verify miss policy that synchronously promotes verify miss experts into
+the GPU expert cache before building the verify execution plan, leaving experts
+on CPU only when the active unique expert count exceeds available cache slots.
+The implemented default is `cache_fill`; the legacy `cpu` behavior remains
+available explicitly through `spec_verify_miss_policy="cpu"`.
 
 Status: implemented and validated on A100 job 28363.
 
 ## Implementation Changes
 
-- [x] Add `spec_verify_miss_policy` to public config and benchmark CLI, with allowed values `cpu` and `cache_fill`; default is `cpu`.
+- [x] Add `spec_verify_miss_policy` to public config and benchmark CLI, with allowed values `cpu` and `cache_fill`; default is `cache_fill`.
 - [x] In verify mode, before `build_verify_plan_gpu()`, run a cache-fill planner when `spec_verify_miss_policy="cache_fill"`.
 - [x] Cache-fill planner behavior:
   - Count per-expert active routes in the current verify layer.

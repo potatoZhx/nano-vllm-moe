@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -124,6 +125,17 @@ class TestPredictiveDataSeparation(unittest.TestCase):
         self.assertEqual(cache.access_count[2], 0)  # no ground-truth pollution
         self.assertEqual(self._queue_size(rt), 1)
 
+    def test_observe_draft_records_m3_cache_hit_group(self):
+        rt, _cache = self._single_layer()
+        rt.begin_draft_iteration(step_id=3)
+        rt.observe_draft(_meta(0, [0], step_id=3), step_id=3)
+
+        prof = rt.get_profile(reset=False)
+        self.assertEqual(prof["draft_m3_group_count"], 1)
+        self.assertEqual(prof["draft_m3_perfect_count"], 1)
+        self.assertEqual(prof["draft_m3_step0_group_count"], 1)
+        self.assertEqual(prof["draft_m3_step0_perfect_count"], 1)
+
     def test_observe_draft_stale_step_dropped(self):
         rt, _cache = self._single_layer()
         # step 99 never armed via begin_draft_iteration -> stale, dropped.
@@ -203,6 +215,17 @@ class TestPredictiveLifecycle(unittest.TestCase):
         rt.begin_draft_iteration(step_id=2)  # next round clears it
         self.assertEqual(self._queue_size(rt), 0)
 
+    def test_late_same_round_draft_metadata_after_end_still_updates_queue(self):
+        rt = self._rt()
+        rt.begin_draft_iteration(step_id=1)
+        rt.end_draft_iteration()
+
+        rt.observe_draft(_meta(0, [2], step_id=1), step_id=1)
+
+        self.assertEqual(self._queue_size(rt), 1)
+        prof = rt.get_profile(reset=False)
+        self.assertEqual(prof["predictive_draft_stale_observe_count"], 0)
+
     def test_round_loaded_reset_next_round(self):
         rt = self._rt()
         rt.begin_draft_iteration(step_id=1)
@@ -255,6 +278,53 @@ class TestPredictivePhase1(unittest.TestCase):
         rt.maybe_submit_phase1(step_id=1)
         self.assertIn((1, 2), rt.inflight)   # highest freq
         self.assertNotIn((1, 3), rt.inflight)  # lower freq excluded by budget=1
+
+
+class TestPredictivePhase2(unittest.TestCase):
+    def _two_segment_runtime(self):
+        pool = {0: {}, 1: {2: _weights()}}
+        caches = {}
+        for li in (0, 1):
+            cache = _make_cache(slots=2, cpu_pool=pool[li])
+            cache.put_to_slot(0, 0, _weights()["gate_up"], _weights()["down"])
+            caches[li] = cache
+        rt = _build_runtime(caches, pool, cfg=_config(draft_prefetch_segment_size=1))
+        return rt
+
+    def test_segment_zero_frontier_targets_last_segment_for_non_first_draft(self):
+        rt = self._two_segment_runtime()
+        rt.begin_draft_iteration(step_id=1)
+        rt.observe_draft(_meta(1, [2], step_id=1), step_id=1)
+
+        submitted = rt.submit_draft_segment_indexed_prefetch(
+            step_id=1,
+            phase="draft",
+            frontier_layer_idx=0,
+            visible_budget_ms=10.0,
+        )
+
+        self.assertEqual(submitted, 1)
+        self.assertIn((1, 2), rt.inflight)
+        self.assertEqual(rt.inflight[(1, 2)].segment_id, 1)
+
+    def test_failed_draft_reservation_does_not_keep_round_protection(self):
+        pool = {0: {2: _weights()}}
+        cache = _make_cache(slots=1, cpu_pool=pool[0])
+        cache.put_to_slot(0, 0, _weights()["gate_up"], _weights()["down"])
+        rt = _build_runtime({0: cache}, pool, cfg=_config(draft_prefetch_segment_size=1))
+        rt.begin_draft_iteration(step_id=1)
+        rt.observe_draft(_meta(0, [2], step_id=1), step_id=1)
+
+        with patch.object(cache, "reserve_active_slot_for_prefetch_deferred", return_value=None):
+            submitted = rt.submit_draft_segment_indexed_prefetch(
+                step_id=1,
+                phase="draft",
+                frontier_layer_idx=0,
+                visible_budget_ms=10.0,
+            )
+
+        self.assertEqual(submitted, 0)
+        self.assertNotIn(2, rt._round_loaded.get(0, set()))
 
 
 class TestPredictiveVerifyPrefetch(unittest.TestCase):

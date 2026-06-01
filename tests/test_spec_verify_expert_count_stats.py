@@ -76,6 +76,25 @@ class TestSpecVerifyExpertCountStats(unittest.TestCase):
 
         self.assertEqual(summary["cache"]["route_hit_rate"], 0.75)
 
+    def test_m3_perfect_fraction_groups_draft_layers_and_step0(self):
+        events = [
+            {"layer_idx": 0, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},
+            {"layer_idx": 1, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},
+            {"layer_idx": 0, "cpu_expert_count": 1, "cpu_route_ratio": 0.5},
+            {"layer_idx": 1, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},
+            {"layer_idx": 0, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},
+            {"layer_idx": 1, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},
+        ]
+
+        metrics = self.mod._m3_perfect_fraction(events, draft_steps_per_step=[2, 1])
+
+        self.assertEqual(metrics["group_count"], 3)
+        self.assertEqual(metrics["perfect_count"], 2)
+        self.assertAlmostEqual(metrics["perfect_fraction"], 2 / 3)
+        self.assertEqual(metrics["step0_group_count"], 2)
+        self.assertEqual(metrics["step0_perfect_count"], 2)
+        self.assertAlmostEqual(metrics["step0_perfect_fraction"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -439,6 +439,9 @@ class PrefetchRuntime:
         self._draft_segment_indexed_ready_by_segment = defaultdict(int)
         self._draft_segment_indexed_success_by_segment = defaultdict(int)
         self._draft_segment_indexed_consumed_by_segment = defaultdict(int)
+        self._draft_m3_layers_by_step: dict[int, dict[int, bool]] = {}
+        self._draft_m3_step0_steps: set[int] = set()
+        self._draft_m3_next_is_step0 = True
 
     def _initial_draft_direct_active_budget(self) -> int:
         return max(
@@ -452,6 +455,62 @@ class PrefetchRuntime:
     def _segment_id_for_layer(self, layer_idx: int) -> int:
         return int(layer_idx) // int(self.draft_segment_index.segment_size)
 
+    def _draft_segment_indexed_target_segment_id(self, frontier_layer_idx: int | None) -> int | None:
+        frontier = None if frontier_layer_idx is None else int(frontier_layer_idx)
+        if frontier is None:
+            if not self.layer_caches:
+                return None
+            frontier = max(int(layer_idx) for layer_idx in self.layer_caches.keys())
+        return self._segment_id_for_layer(int(frontier))
+
+    def _rollback_round_loaded_prefetch(self, layer_idx: int, expert_idx: int) -> None:
+        return None
+
+    def _mark_draft_m3_step_start(self, step_id: int) -> None:
+        sid = int(step_id)
+        if self._draft_m3_next_is_step0:
+            self._draft_m3_step0_steps.add(sid)
+            self._draft_m3_next_is_step0 = False
+
+    def _record_draft_m3_cache_hits(
+        self,
+        runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
+        step_id: int,
+    ) -> None:
+        if not runtime_meta or not self.layer_caches:
+            return
+        sid = int(step_id)
+        layer_hits = self._draft_m3_layers_by_step.setdefault(sid, {})
+        for layer_idx, meta in runtime_meta.items():
+            li = int(layer_idx)
+            cache = self.layer_caches.get(li)
+            if cache is None:
+                continue
+            if meta.aggregated_expert_ids is not None:
+                expert_ids = meta.aggregated_expert_ids.reshape(-1)
+            elif meta.selected_experts is not None:
+                expert_ids = meta.selected_experts.reshape(-1)
+            else:
+                continue
+            if expert_ids.numel() <= 0:
+                continue
+            unique_ids = torch.unique(expert_ids.to(device=torch.device("cpu"), dtype=torch.int64))
+            layer_hits[li] = all(cache.is_cached_cpu(int(eid)) for eid in unique_ids.tolist())
+
+        expected_layers = len(self.layer_caches)
+        if len(layer_hits) < expected_layers:
+            return
+        perfect = all(layer_hits.get(int(layer_idx), False) for layer_idx in self.layer_caches)
+        self._profile["draft_m3_group_count"] += 1.0
+        if perfect:
+            self._profile["draft_m3_perfect_count"] += 1.0
+        if sid in self._draft_m3_step0_steps:
+            self._profile["draft_m3_step0_group_count"] += 1.0
+            if perfect:
+                self._profile["draft_m3_step0_perfect_count"] += 1.0
+            self._draft_m3_step0_steps.discard(sid)
+        self._draft_m3_layers_by_step.pop(sid, None)
+
     @staticmethod
     def _format_segment_counts(counts: defaultdict[int, int] | dict[int, int]) -> dict[str, int]:
         return {str(int(segment_id)): int(value) for segment_id, value in sorted(counts.items())}
@@ -462,6 +521,7 @@ class PrefetchRuntime:
         if not self._draft_iteration_open:
             self.draft_segment_index.clear()
             self._active_draft_iteration_steps.clear()
+            self._mark_draft_m3_step_start(step_id)
             self._draft_iteration_open = True
         self._active_draft_iteration_steps.add(int(step_id))
 
@@ -556,6 +616,8 @@ class PrefetchRuntime:
                 is_active = not active_steps or int(step_id) in active_steps
                 if not is_active:
                     self._profile["draft_segment_indexed_stale_metadata_observe_count"] += 1
+                else:
+                    self._record_draft_m3_cache_hits(runtime_meta, step_id)
                 return self.observe_runtime_meta(
                     runtime_meta,
                     source="draft_live",
@@ -862,12 +924,9 @@ class PrefetchRuntime:
             return 0
         dispatch_budget = min(max_submit, inflight_budget)
 
-        frontier = None if frontier_layer_idx is None else int(frontier_layer_idx)
-        if frontier is None:
-            if not self.layer_caches:
-                return 0
-            frontier = max(int(layer_idx) for layer_idx in self.layer_caches.keys())
-        segment_id = self._segment_id_for_layer(int(frontier))
+        segment_id = self._draft_segment_indexed_target_segment_id(frontier_layer_idx)
+        if segment_id is None:
+            return 0
         transfer_budget_ms = (
             float(visible_budget_ms)
             if visible_budget_ms is not None
@@ -936,6 +995,7 @@ class PrefetchRuntime:
             )
             self._profile["draft_segment_indexed_victim_select_ms"] += (time.perf_counter() - victim_t0) * 1000.0
             if victim_slot is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 self._profile["draft_segment_indexed_prefetch_skipped_by_pending_count"] += 1
                 continue
 
@@ -945,6 +1005,7 @@ class PrefetchRuntime:
                 expert_idx=expert_idx,
             )
             if reservation is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 self._profile["draft_segment_indexed_prefetch_skipped_by_pending_count"] += 1
                 continue
 
@@ -1622,6 +1683,23 @@ class PrefetchRuntime:
             "draft_segment_indexed_missed_prefetch_window_count": int(self._profile.get("draft_segment_indexed_missed_prefetch_window_count", 0.0)),
             "verify_ready_before_wait_count": int(self._profile.get("verify_ready_before_wait_count", 0.0)),
             "verify_ready_after_wait_count": int(self._profile.get("verify_ready_after_wait_count", 0.0)),
+            "draft_m3_group_count": int(self._profile.get("draft_m3_group_count", 0.0)),
+            "draft_m3_perfect_count": int(self._profile.get("draft_m3_perfect_count", 0.0)),
+            "draft_m3_perfect_fraction": (
+                float(self._profile.get("draft_m3_perfect_count", 0.0) / self._profile.get("draft_m3_group_count", 0.0))
+                if self._profile.get("draft_m3_group_count", 0.0) > 0
+                else 0.0
+            ),
+            "draft_m3_step0_group_count": int(self._profile.get("draft_m3_step0_group_count", 0.0)),
+            "draft_m3_step0_perfect_count": int(self._profile.get("draft_m3_step0_perfect_count", 0.0)),
+            "draft_m3_step0_perfect_fraction": (
+                float(
+                    self._profile.get("draft_m3_step0_perfect_count", 0.0)
+                    / self._profile.get("draft_m3_step0_group_count", 0.0)
+                )
+                if self._profile.get("draft_m3_step0_group_count", 0.0) > 0
+                else 0.0
+            ),
         }
         if reset:
             self._profile.clear()
@@ -1631,6 +1709,9 @@ class PrefetchRuntime:
             self._draft_segment_indexed_ready_by_segment.clear()
             self._draft_segment_indexed_success_by_segment.clear()
             self._draft_segment_indexed_consumed_by_segment.clear()
+            self._draft_m3_layers_by_step.clear()
+            self._draft_m3_step0_steps.clear()
+            self._draft_m3_next_is_step0 = True
         return out
 
 
@@ -1659,6 +1740,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         super().__init__(*args, **kwargs)
         # layer_idx -> set of expert_idx prefetched this round (B.7).
         self._round_loaded: dict[int, set[int]] = defaultdict(set)
+        self._valid_draft_iteration_steps: set[int] = set()
         # Phase-1 fires once per round; begin_draft_iteration arms this and
         # maybe_submit_phase1 (called after the run_draft drain) consumes it.
         self._phase1_pending: bool = False
@@ -1693,9 +1775,10 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         # Draft prediction queue only; no mark_access (no ground-truth pollution).
         if not runtime_meta:
             return {}
-        if int(step_id) not in self._active_draft_iteration_steps:
+        if int(step_id) not in self._valid_draft_iteration_steps:
             self._profile["predictive_draft_stale_observe_count"] += 1.0
             return {}
+        self._record_draft_m3_cache_hits(runtime_meta, step_id)
         self.draft_segment_index.update_from_runtime_meta(
             runtime_meta=runtime_meta,
             source="draft_live",
@@ -1710,14 +1793,18 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             # New round: clear draft queue + round protection.
             self.draft_segment_index.clear()
             self._active_draft_iteration_steps.clear()
+            self._valid_draft_iteration_steps.clear()
             self._round_loaded.clear()
             self._draft_iteration_open = True
+            self._mark_draft_m3_step_start(step_id)
             self._active_draft_iteration_steps.add(int(step_id))
+            self._valid_draft_iteration_steps.add(int(step_id))
             # Arm phase-1; it must be submitted AFTER the run_draft drain (E.9.1),
             # not here (this runs before the drain, which would synchronize on it).
             self._phase1_pending = True
         else:
             self._active_draft_iteration_steps.add(int(step_id))
+            self._valid_draft_iteration_steps.add(int(step_id))
 
     def maybe_submit_phase1(self, step_id: int) -> int:
         """Submit phase-1 once per round, after the run_draft drain (E.9.1)."""
@@ -1741,6 +1828,22 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
     def _round_protected(self, layer_idx: int, expert_idx: int) -> bool:
         s = self._round_loaded.get(int(layer_idx))
         return s is not None and int(expert_idx) in s
+
+    def _draft_segment_indexed_target_segment_id(self, frontier_layer_idx: int | None) -> int | None:
+        segment_id = super()._draft_segment_indexed_target_segment_id(frontier_layer_idx)
+        if segment_id is None:
+            return None
+        if segment_id == 0 and self.layer_caches:
+            return max(self._segment_id_for_layer(int(layer_idx)) for layer_idx in self.layer_caches)
+        return segment_id
+
+    def _rollback_round_loaded_prefetch(self, layer_idx: int, expert_idx: int) -> None:
+        loaded = self._round_loaded.get(int(layer_idx))
+        if loaded is None:
+            return
+        loaded.discard(int(expert_idx))
+        if not loaded:
+            self._round_loaded.pop(int(layer_idx), None)
 
     def _select_protected_victim(self, cache, layer_idx, incoming_expert_idx) -> int | None:
         if layer_idx is not None:
@@ -1827,6 +1930,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 cache, expert_idx=expert_idx, step_id=step_id, layer_idx=layer_idx,
             )
             if victim_slot is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
             # Non-deferred reserve (E.9.2): segment n-1 is still computed this
             # forward, so the slot must be unmapped immediately (LUT cleared) to
@@ -1836,6 +1940,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
             )
             if reservation is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
             ready_event = cache.begin_async_put_to_active(
                 reservation=reservation,
@@ -1924,11 +2029,13 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 cache, layer_idx=layer_idx, expert_idx=expert_idx, step_id=step_id,
             )
             if victim_slot is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
             reservation = cache.reserve_active_slot_for_prefetch(
                 layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
             )
             if reservation is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
             ready_event = cache.begin_async_put_to_active(
                 reservation=reservation,
