@@ -180,6 +180,7 @@ class ModelRunner:
                 cpu_expert_strict_dtype=getattr(config, "cpu_expert_strict_dtype", True),
                 cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", "auto"),
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.0),
+                spec_verify_miss_policy=getattr(config, "spec_verify_miss_policy", "cpu"),
                 gpu_fallback_workspace=gpu_fallback_workspace,
                 kt_weight_path=getattr(config, "model", ""),
                 kt_method=getattr(config, "kt_method", "BF16"),

@@ -48,6 +48,8 @@ class TestSpecVerifyExpertCountStats(unittest.TestCase):
                 "0.12",
                 "--rank-guard-ema-alpha",
                 "0.9",
+                "--spec-verify-miss-policy",
+                "cache_fill",
             ]
         )
 
@@ -56,6 +58,7 @@ class TestSpecVerifyExpertCountStats(unittest.TestCase):
         self.assertEqual(args.draft_cuda_graph_cpu_backend, "none")
         self.assertEqual(args.rank_guard_threshold, 0.12)
         self.assertEqual(args.rank_guard_ema_alpha, 0.9)
+        self.assertEqual(args.spec_verify_miss_policy, "cache_fill")
 
     def test_summary_reports_cache_hit_rate_from_cpu_route_ratio(self):
         summary = self.mod._summarize_case(

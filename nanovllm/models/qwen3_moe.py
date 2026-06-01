@@ -24,6 +24,7 @@ from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
+    apply_verify_cache_fill_policy,
     build_cached_draft_plan_gpu,
     build_draft_plan_gpu,
     build_prefill_plan_gpu,
@@ -319,6 +320,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_backend: TorchPackedCpuMoeBackend | None = None
         self.cpu_gpu_parallel_execution_enabled = "auto"
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.0
+        self.spec_verify_miss_policy = "cpu"
         self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
@@ -339,6 +341,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
+        spec_verify_miss_policy: str = "cpu",
         gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
         kt_weight_path: str = "",
         kt_method: str = "BF16",
@@ -400,6 +403,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             raise ValueError(f"Unsupported CPU expert backend: {cpu_expert_backend}")
         self.cpu_gpu_parallel_execution_enabled = str(cpu_gpu_parallel_execution_enabled)
         self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
+        self.spec_verify_miss_policy = str(spec_verify_miss_policy)
         self._parallel_stream = None
         if draft_reroute_policy == ROUND_ROBIN:
             self.draft_reroute_policy = None
@@ -522,6 +526,15 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     active_token_mask=active_token_mask if use_graph_cpu_plan else None,
                 )
         elif self.execution_mode == "verify":
+            if self.spec_verify_miss_policy == "cache_fill":
+                apply_verify_cache_fill_policy(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    expert_cache=self.expert_cache,
+                    step_id=0,
+                    profile=profile,
+                )
             plan = build_verify_plan_gpu(
                 layer_idx=self.layer_idx,
                 selected_experts=selected_experts,
@@ -811,6 +824,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_expert_strict_dtype: bool = True,
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
+        spec_verify_miss_policy: str = "cpu",
         gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
         kt_weight_path: str = "",
         kt_method: str = "BF16",
@@ -847,6 +861,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_expert_strict_dtype=cpu_expert_strict_dtype,
                     cpu_gpu_parallel_execution_enabled=cpu_gpu_parallel_execution_enabled,
                     cpu_gpu_parallel_min_cpu_route_ratio=cpu_gpu_parallel_min_cpu_route_ratio,
+                    spec_verify_miss_policy=spec_verify_miss_policy,
                     gpu_fallback_workspace=gpu_fallback_workspace,
                     kt_weight_path=kt_weight_path,
                     kt_method=kt_method,

@@ -4,8 +4,10 @@ import torch
 
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
+    apply_verify_cache_fill_policy,
     build_draft_plan,
     build_prefill_plan,
+    build_verify_plan,
     build_runtime_meta_view,
     flatten_selected_and_weights,
 )
@@ -13,6 +15,25 @@ from nanovllm.scheduling.draft_scheduler import SimpleDraftScheduler
 
 
 class TestPlacementSpec(unittest.TestCase):
+    def _build_cache_with_slots(self, slots: int, cached: list[int], num_experts: int = 8):
+        fake_pool = {
+            expert: {"gate_up": torch.full((4, 4), float(expert)), "down": torch.full((4, 2), float(expert))}
+            for expert in range(num_experts)
+        }
+        cache = LayerExpertCache(
+            num_experts=num_experts,
+            slots_per_layer=slots,
+            gate_up_shape=(4, 4),
+            down_shape=(4, 2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            cpu_expert_pool=fake_pool,
+        )
+        for slot_idx, expert_idx in enumerate(cached):
+            cache.put_to_slot(slot_idx, expert_idx, fake_pool[expert_idx]["gate_up"], fake_pool[expert_idx]["down"])
+            cache.last_access_step[expert_idx] = slot_idx + 10
+        return cache
+
     def _build_cache(self):
         cache = LayerExpertCache(
             num_experts=8,
@@ -29,6 +50,112 @@ class TestPlacementSpec(unittest.TestCase):
         cache.put_to_slot(1, 1, fake, fake_down)
         cache.put_to_slot(2, 2, fake, fake_down)
         return cache
+
+    def test_verify_cache_fill_promotes_all_misses_when_active_unique_fits(self):
+        cache = self._build_cache_with_slots(slots=4, cached=[0, 1])
+        selected = torch.tensor([[0, 2], [3, 2]], dtype=torch.int64)
+        routing_w = torch.ones(2, 2, dtype=torch.float32)
+        profile = {}
+
+        result = apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=7,
+            profile=profile,
+        )
+        plan = build_verify_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            num_experts=8,
+        )
+
+        self.assertEqual(result.promoted_expert_count, 2)
+        self.assertEqual(result.cpu_expert_count, 0)
+        self.assertTrue(cache.is_cached_cpu(2))
+        self.assertTrue(cache.is_cached_cpu(3))
+        self.assertTrue(plan.cpu_route_indices is None or plan.cpu_route_indices.numel() == 0)
+        self.assertEqual(profile["verify_cache_fill_promoted_expert_count"], 2.0)
+
+    def test_verify_cache_fill_leaves_lowest_count_misses_on_cpu_when_over_capacity(self):
+        cache = self._build_cache_with_slots(slots=3, cached=[0, 1])
+        selected = torch.tensor([[0, 1], [2, 2], [3, 4]], dtype=torch.int64)
+        routing_w = torch.ones(3, 2, dtype=torch.float32)
+
+        result = apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=8,
+            profile={},
+        )
+        plan = build_verify_plan(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            num_experts=8,
+        )
+
+        self.assertEqual(result.promoted_expert_ids, [2])
+        self.assertEqual(result.cpu_expert_ids, [3, 4])
+        self.assertTrue(cache.is_cached_cpu(2))
+        self.assertFalse(cache.is_cached_cpu(3))
+        self.assertFalse(cache.is_cached_cpu(4))
+        self.assertEqual(plan.cpu_task_expert_ids.tolist(), [3, 4])
+
+    def test_verify_cache_fill_never_evicts_active_cached_experts(self):
+        cache = self._build_cache_with_slots(slots=3, cached=[0, 1, 5])
+        cache.last_access_step[0] = -100
+        cache.last_access_step[1] = -50
+        cache.last_access_step[5] = 99
+        selected = torch.tensor([[0, 1], [2, 2]], dtype=torch.int64)
+        routing_w = torch.ones(2, 2, dtype=torch.float32)
+
+        result = apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=9,
+            profile={},
+        )
+
+        self.assertEqual(result.evicted_expert_ids, [5])
+        self.assertTrue(cache.is_cached_cpu(0))
+        self.assertTrue(cache.is_cached_cpu(1))
+        self.assertTrue(cache.is_cached_cpu(2))
+        self.assertFalse(cache.is_cached_cpu(5))
+
+    def test_verify_cache_fill_skips_pending_slots(self):
+        cache = self._build_cache_with_slots(slots=3, cached=[0, 1, 5])
+        reservation = cache.reserve_active_slot_for_prefetch_deferred(
+            layer_idx=0,
+            active_slot_idx=2,
+            expert_idx=6,
+        )
+        self.assertIsNotNone(reservation)
+        selected = torch.tensor([[0, 1], [2, 2]], dtype=torch.int64)
+        routing_w = torch.ones(2, 2, dtype=torch.float32)
+
+        result = apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=10,
+            profile={},
+        )
+
+        self.assertEqual(result.promoted_expert_count, 0)
+        self.assertEqual(result.cpu_expert_ids, [2])
+        self.assertTrue(cache.is_cached_cpu(5))
+        self.assertFalse(cache.is_cached_cpu(2))
+        self.assertEqual(result.skipped_pending_count, 1)
 
     def test_prefill_plan_splits_gpu_cpu(self):
         cache = self._build_cache()

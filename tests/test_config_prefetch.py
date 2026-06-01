@@ -29,6 +29,7 @@ class TestConfigPrefetch(unittest.TestCase):
         self.assertEqual(cfg.draft_cuda_graph_cpu_backend, "none")
         self.assertEqual(cfg.draft_reroute_policy, "entropy_cache_bias")
         self.assertEqual(cfg.draft_reroute_artifact, "")
+        self.assertEqual(cfg.spec_verify_miss_policy, "cpu")
         self.assertTrue(cfg.prefetch_verify_layer_enabled)
         self.assertGreater(cfg.prefetch_verify_layer_transfer_bandwidth_gbps, 0.0)
 
@@ -148,6 +149,22 @@ class TestConfigPrefetch(unittest.TestCase):
                 enable_heterogeneous=True,
                 inference_mode="heter",
                 cache_strategy="bad",
+            )
+
+    def test_verify_cache_fill_policy_is_opt_in(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            spec_verify_miss_policy="cache_fill",
+        )
+        self.assertEqual(cfg.spec_verify_miss_policy, "cache_fill")
+
+    def test_invalid_verify_miss_policy_fails(self):
+        with self.assertRaises(AssertionError):
+            self._build_config(
+                enable_heterogeneous=True,
+                inference_mode="spec",
+                spec_verify_miss_policy="gpu",
             )
 
     def test_invalid_prefetch_decay_fails(self):

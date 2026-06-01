@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 
@@ -45,6 +46,23 @@ class MoEExecutionPlan:
         return out
 
 
+@dataclass
+class VerifyCacheFillResult:
+    promoted_expert_ids: list[int]
+    cpu_expert_ids: list[int]
+    evicted_expert_ids: list[int]
+    skipped_pending_count: int
+    transfer_ms: float
+
+    @property
+    def promoted_expert_count(self) -> int:
+        return len(self.promoted_expert_ids)
+
+    @property
+    def cpu_expert_count(self) -> int:
+        return len(self.cpu_expert_ids)
+
+
 def _build_grouped_layout(
     gpu_slots: torch.Tensor,
     gpu_route_indices: torch.Tensor,
@@ -63,6 +81,128 @@ def _build_grouped_layout(
     ones = torch.ones_like(sorted_slots, dtype=torch.int32)
     m_sizes.scatter_add_(0, sorted_slots.to(torch.int64), ones)
     return m_sizes, sorted_gpu_route_indices
+
+
+def _select_verify_cache_fill_slot(
+    expert_cache: LayerExpertCache,
+    active_expert_ids: set[int],
+) -> tuple[int | None, int, int]:
+    skipped_pending_slots: set[int] = set()
+    for slot_idx, slot_expert in enumerate(expert_cache.slot_to_expert):
+        if expert_cache.is_active_slot_pending(slot_idx):
+            skipped_pending_slots.add(slot_idx)
+            continue
+        if int(slot_expert) < 0:
+            return slot_idx, int(slot_expert), len(skipped_pending_slots)
+
+    best_slot: int | None = None
+    best_prev_expert = -1
+    best_last_access: int | None = None
+    for slot_idx, slot_expert in enumerate(expert_cache.slot_to_expert):
+        if expert_cache.is_active_slot_pending(slot_idx):
+            skipped_pending_slots.add(slot_idx)
+            continue
+        prev_expert = int(slot_expert)
+        if prev_expert in active_expert_ids:
+            continue
+        last_access = int(expert_cache.last_access_step[prev_expert]) if prev_expert >= 0 else -1
+        if best_last_access is None or last_access < best_last_access:
+            best_slot = slot_idx
+            best_prev_expert = prev_expert
+            best_last_access = last_access
+
+    return best_slot, best_prev_expert, len(skipped_pending_slots)
+
+
+def apply_verify_cache_fill_policy(
+    layer_idx: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    step_id: int,
+    profile: dict[str, float] | None = None,
+) -> VerifyCacheFillResult:
+    """Promote verify miss experts into active cache slots before planning.
+
+    The policy keeps active cached experts resident. Miss experts with the fewest
+    active routes remain on CPU only when the active unique set exceeds cache
+    capacity.
+    """
+    _ = layer_idx, routing_weights, step_id
+    flat_selected = selected_experts.reshape(-1).to(torch.int64)
+    if flat_selected.numel() == 0:
+        return VerifyCacheFillResult([], [], [], 0, 0.0)
+
+    flat_cpu = flat_selected.detach().to(device=torch.device("cpu"), dtype=torch.int64)
+    unique_ids, counts = torch.unique(flat_cpu, sorted=True, return_counts=True)
+    route_counts = {int(eid): int(count) for eid, count in zip(unique_ids.tolist(), counts.tolist())}
+    active_expert_ids = set(route_counts)
+
+    miss_ids = [expert_idx for expert_idx in sorted(active_expert_ids) if not expert_cache.is_cached_cpu(expert_idx)]
+    if not miss_ids:
+        if profile is not None:
+            profile["verify_cache_fill_promoted_expert_count"] = float(
+                profile.get("verify_cache_fill_promoted_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_cpu_expert_count"] = float(
+                profile.get("verify_cache_fill_cpu_expert_count", 0.0)
+            )
+        return VerifyCacheFillResult([], [], [], 0, 0.0)
+
+    overflow = max(0, len(active_expert_ids) - int(expert_cache.num_slots))
+    cpu_expert_ids = set()
+    if overflow > 0:
+        ranked_cpu = sorted(miss_ids, key=lambda expert_idx: (route_counts[expert_idx], expert_idx))
+        cpu_expert_ids.update(ranked_cpu[:overflow])
+    promote_ids = sorted(
+        (expert_idx for expert_idx in miss_ids if expert_idx not in cpu_expert_ids),
+        key=lambda expert_idx: (-route_counts[expert_idx], expert_idx),
+    )
+
+    promoted: list[int] = []
+    evicted: list[int] = []
+    skipped_pending_count = 0
+    transfer_t0 = perf_counter()
+    for expert_idx in promote_ids:
+        slot_idx, prev_expert, skipped = _select_verify_cache_fill_slot(expert_cache, active_expert_ids)
+        skipped_pending_count += skipped
+        if slot_idx is None:
+            cpu_expert_ids.add(expert_idx)
+            continue
+        params = expert_cache.get_cpu_expert_weights(expert_idx)
+        if params is None or "gate_up" not in params or "down" not in params:
+            raise RuntimeError(f"Missing CPU expert weights for verify cache fill expert {expert_idx}")
+        expert_cache.put_to_slot(slot_idx, expert_idx, params["gate_up"], params["down"])
+        promoted.append(expert_idx)
+        if prev_expert >= 0 and prev_expert != expert_idx:
+            evicted.append(prev_expert)
+    transfer_ms = (perf_counter() - transfer_t0) * 1000.0 if promoted else 0.0
+
+    cpu_sorted = sorted(cpu_expert_ids)
+    if profile is not None:
+        profile["verify_cache_fill_promoted_expert_count"] = float(
+            profile.get("verify_cache_fill_promoted_expert_count", 0.0) + len(promoted)
+        )
+        profile["verify_cache_fill_cpu_expert_count"] = float(
+            profile.get("verify_cache_fill_cpu_expert_count", 0.0) + len(cpu_sorted)
+        )
+        profile["verify_cache_fill_evicted_expert_count"] = float(
+            profile.get("verify_cache_fill_evicted_expert_count", 0.0) + len(evicted)
+        )
+        profile["verify_cache_fill_skipped_pending_count"] = float(
+            profile.get("verify_cache_fill_skipped_pending_count", 0.0) + skipped_pending_count
+        )
+        profile["verify_cache_fill_transfer_ms"] = float(
+            profile.get("verify_cache_fill_transfer_ms", 0.0) + transfer_ms
+        )
+
+    return VerifyCacheFillResult(
+        promoted_expert_ids=promoted,
+        cpu_expert_ids=cpu_sorted,
+        evicted_expert_ids=evicted,
+        skipped_pending_count=skipped_pending_count,
+        transfer_ms=transfer_ms,
+    )
 
 
 def _build_topc0_substitution_lut(
@@ -221,6 +361,22 @@ def build_prefill_plan(
     num_experts: int,
 ) -> MoEExecutionPlan:
     return build_prefill_plan_gpu(
+        layer_idx=layer_idx,
+        selected_experts=selected_experts,
+        routing_weights=routing_weights,
+        expert_cache=expert_cache,
+        num_experts=num_experts,
+    )
+
+
+def build_verify_plan(
+    layer_idx: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    num_experts: int,
+) -> MoEExecutionPlan:
+    return build_verify_plan_gpu(
         layer_idx=layer_idx,
         selected_experts=selected_experts,
         routing_weights=routing_weights,

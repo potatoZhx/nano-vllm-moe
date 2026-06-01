@@ -250,6 +250,14 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "wait_ms_total": float(ep.get("model_prefetch_wait_ms", 0.0)),
             "verify_wait_ms_total": float(ep.get("spec_verify_prefetch_wait_ms", 0.0)),
         },
+        "verify_cache_fill": {
+            "policy": raw.get("case", {}).get("spec_verify_miss_policy", "cpu"),
+            "promoted_expert_count": int(ep.get("model_verify_cache_fill_promoted_expert_count", 0) or 0),
+            "cpu_expert_count": int(ep.get("model_verify_cache_fill_cpu_expert_count", 0) or 0),
+            "evicted_expert_count": int(ep.get("model_verify_cache_fill_evicted_expert_count", 0) or 0),
+            "skipped_pending_count": int(ep.get("model_verify_cache_fill_skipped_pending_count", 0) or 0),
+            "transfer_ms_total": float(ep.get("model_verify_cache_fill_transfer_ms", 0.0)),
+        },
         "acceptance": _acceptance_stats(ep),
         "verify_layer_event_count": len(layer_events),
         "hist_by_total_and_cpu_experts": pair_hist,
@@ -293,6 +301,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         "draft_reroute_artifact": args.draft_reroute_artifact,
         "cpu_expert_backend": args.cpu_expert_backend,
         "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
+        "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "cache_strategy": args.cache_strategy,
         "rank_guard_threshold": float(args.rank_guard_threshold),
         "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
@@ -328,6 +337,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         cpu_expert_num_threads=args.cpu_expert_num_threads,
         cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
         cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
+        spec_verify_miss_policy=args.spec_verify_miss_policy,
         spec_profile=True,
         engine_profile=True,
         engine_profile_cuda_sync=True,
@@ -627,6 +637,8 @@ def run_suite(args: argparse.Namespace) -> None:
                     args.cpu_gpu_parallel_execution_enabled,
                     "--cpu-gpu-parallel-min-cpu-route-ratio",
                     str(args.cpu_gpu_parallel_min_cpu_route_ratio),
+                    "--spec-verify-miss-policy",
+                    args.spec_verify_miss_policy,
                     "--max-num-batched-tokens",
                     str(args.max_num_batched_tokens),
                     "--max-num-seqs",
@@ -716,6 +728,7 @@ def run_suite(args: argparse.Namespace) -> None:
             "draft_reroute_policy": args.draft_reroute_policy,
             "draft_reroute_artifact": args.draft_reroute_artifact,
             "cache_strategy": args.cache_strategy,
+            "spec_verify_miss_policy": args.spec_verify_miss_policy,
             "prefetch_runtime_mode": args.prefetch_runtime_mode,
             "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
             "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
@@ -772,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
     p.add_argument("--cpu-gpu-parallel-execution-enabled", default="auto")
     p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.0)
+    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill"], default="cpu")
     p.add_argument("--max-num-batched-tokens", type=int, default=512)
     p.add_argument("--max-num-seqs", type=int, default=1)
     p.add_argument("--max-model-len", type=int, default=512)
