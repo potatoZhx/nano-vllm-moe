@@ -1632,3 +1632,342 @@ class PrefetchRuntime:
             self._draft_segment_indexed_success_by_segment.clear()
             self._draft_segment_indexed_consumed_by_segment.clear()
         return out
+
+
+class PredictivePrefetchRuntime(PrefetchRuntime):
+    """Conservative-mode predictive prefetcher (see docs/prefetch_redesign_plan.md Part E).
+
+    Data sources are split cleanly (B.2): the expert cache ``access_count`` records
+    *only* prefill/verify ground-truth frequency, while the draft prediction queue
+    (``draft_segment_index``) is fed *only* by draft routing.  Draft prefetch reuses
+    the inherited segment-indexed submit (each completed segment is prefetched =
+    conservative safety rule); the draft-only queue arises naturally by never
+    feeding ``long_term_segment_index``.
+
+    Single-round eviction protection (B.7) lives entirely in the victim selectors:
+    the incoming expert is recorded into ``_round_loaded`` and round-loaded experts
+    are skipped as victims (composed with rankguard protection, E.7-A), with a
+    safety valve that ignores protection when every slot is protected (E.7-B).
+    Protection spans draft+verify prefetch evictions and is released per layer at
+    verify compute start (``on_verify_layer_start``).
+
+    Selected as ``prefetch_runtime_kind == "predictive"`` (forces
+    ``prefetch_runtime_mode == "draft_segment_indexed"`` so model_runner gates fire).
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # layer_idx -> set of expert_idx prefetched this round (B.7).
+        self._round_loaded: dict[int, set[int]] = defaultdict(set)
+        # Phase-1 fires once per round; begin_draft_iteration arms this and
+        # maybe_submit_phase1 (called after the run_draft drain) consumes it.
+        self._phase1_pending: bool = False
+
+    # Always use the segment-indexed plumbing regardless of the config string.
+    def _segment_indexed_enabled(self) -> bool:
+        return True
+
+    # ----- data-source separation (B.2) -----------------------------------
+    def observe_prefill(self, runtime_meta, step_id: int) -> dict[str, float]:
+        # Ground-truth frequency only (mark_access); never feed the queue.
+        return self.observe_runtime_meta(
+            runtime_meta,
+            source="prefill_history",
+            step_id=step_id,
+            update_global_queue=False,
+            segment_index=None,
+        )
+
+    def observe_verify(self, runtime_meta, step_id: int) -> dict[str, float]:
+        out = self.observe_runtime_meta(
+            runtime_meta,
+            source="verify_history",
+            step_id=step_id,
+            update_global_queue=False,
+            segment_index=None,
+        )
+        self._update_rank_guard_scores(runtime_meta)
+        return out
+
+    def observe_draft(self, runtime_meta, step_id: int) -> dict[str, float]:
+        # Draft prediction queue only; no mark_access (no ground-truth pollution).
+        if not runtime_meta:
+            return {}
+        if int(step_id) not in self._active_draft_iteration_steps:
+            self._profile["predictive_draft_stale_observe_count"] += 1.0
+            return {}
+        self.draft_segment_index.update_from_runtime_meta(
+            runtime_meta=runtime_meta,
+            source="draft_live",
+            step_id=step_id,
+            layer_caches=self.layer_caches,
+        )
+        return {}
+
+    # ----- round lifecycle (queue lives draft->verify; E.3) ---------------
+    def begin_draft_iteration(self, step_id: int) -> None:
+        if not self._draft_iteration_open:
+            # New round: clear draft queue + round protection.
+            self.draft_segment_index.clear()
+            self._active_draft_iteration_steps.clear()
+            self._round_loaded.clear()
+            self._draft_iteration_open = True
+            self._active_draft_iteration_steps.add(int(step_id))
+            # Arm phase-1; it must be submitted AFTER the run_draft drain (E.9.1),
+            # not here (this runs before the drain, which would synchronize on it).
+            self._phase1_pending = True
+        else:
+            self._active_draft_iteration_steps.add(int(step_id))
+
+    def maybe_submit_phase1(self, step_id: int) -> int:
+        """Submit phase-1 once per round, after the run_draft drain (E.9.1)."""
+        if not self._phase1_pending:
+            return 0
+        self._phase1_pending = False
+        return self.submit_phase1_prefetch(step_id=int(step_id))
+
+    def end_draft_iteration(self) -> None:
+        # Keep draft queue + _round_loaded alive through verify; they are reset
+        # at the next round's begin_draft_iteration.
+        self._active_draft_iteration_steps.clear()
+        self._draft_iteration_open = False
+
+    def on_verify_layer_start(self, layer_idx: int) -> None:
+        # Release this layer's round protection as verify reaches it (hygiene;
+        # cache_fill does not consult it anyway, E.7-C).
+        self._round_loaded.pop(int(layer_idx), None)
+
+    # ----- round-protected victim selection (B.7 + E.7-A/B) ---------------
+    def _round_protected(self, layer_idx: int, expert_idx: int) -> bool:
+        s = self._round_loaded.get(int(layer_idx))
+        return s is not None and int(expert_idx) in s
+
+    def _select_protected_victim(self, cache, layer_idx, incoming_expert_idx) -> int | None:
+        if layer_idx is not None:
+            self._round_loaded[int(layer_idx)].add(int(incoming_expert_idx))
+        strategy_name = str(getattr(self.config, "cache_strategy", "lru")).strip().lower()
+        use_lfu = strategy_name in ("lfu", "lfu_rankguard", "lfu_rankguard_online")
+        rankguard = self.cache_strategy if isinstance(self.cache_strategy, LFURankGuardStrategy) else None
+        li = None if layer_idx is None else int(layer_idx)
+
+        best_slot: int | None = None
+        best_value: int | None = None
+        fb_slot: int | None = None      # fallback ignoring protection (safety valve)
+        fb_value: int | None = None
+        for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
+            if cache.is_active_slot_pending(slot_idx):
+                continue
+            e = int(slot_expert)
+            if e < 0:
+                return slot_idx  # empty slot: no eviction needed
+            value = int(cache.access_count[e]) if use_lfu else int(cache.last_access_step[e])
+            if fb_value is None or value < fb_value:
+                fb_value = value
+                fb_slot = slot_idx
+            if li is not None and self._round_protected(li, e):
+                continue
+            if rankguard is not None and li is not None and rankguard.is_protected(li, e):
+                continue
+            if best_value is None or value < best_value:
+                best_value = value
+                best_slot = slot_idx
+        if best_slot is not None:
+            return best_slot
+        return fb_slot  # all protected -> safety valve keeps prefetch progressing
+
+    def _select_publish_slot_cpu(self, cache, *, expert_idx, step_id, layer_idx=None) -> int | None:
+        return self._select_protected_victim(cache, layer_idx, expert_idx)
+
+    def _select_publish_slot(self, cache, *, layer_idx, expert_idx, step_id) -> int | None:
+        return self._select_protected_victim(cache, layer_idx, expert_idx)
+
+    # ----- phase-1 cold start (E.9) ---------------------------------------
+    def submit_phase1_prefetch(self, *, step_id: int) -> int:
+        budget = int(getattr(self.config, "predictive_phase1_budget", 4))
+        if budget <= 0 or not self.layer_caches:
+            return 0
+        if int(self.config.prefetch_step_budget) <= 0:
+            return 0
+        last_segment_id = max(self._segment_id_for_layer(int(l)) for l in self.layer_caches)
+
+        # Highest ground-truth-frequency uncached experts in segment n-1.
+        candidates: list[tuple[int, int, int]] = []
+        for layer_idx, cache in self.layer_caches.items():
+            if self._segment_id_for_layer(int(layer_idx)) != last_segment_id:
+                continue
+            pool = self.cpu_expert_pool.get(layer_idx)
+            if not pool:
+                continue
+            ac = cache.access_count
+            for expert_idx in pool.keys():
+                eid = int(expert_idx)
+                if cache.is_cached_cpu(eid) or cache.is_pending_cpu(eid):
+                    continue
+                candidates.append((int(ac[eid]), int(layer_idx), eid))
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        max_submit = min(budget, inflight_budget)
+        submitted = 0
+        for _freq, layer_idx, expert_idx in candidates:
+            if submitted >= max_submit:
+                break
+            key = (layer_idx, expert_idx)
+            if key in self.inflight:
+                continue
+            cache = self.layer_caches.get(layer_idx)
+            if cache is None:
+                continue
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+            victim_slot = self._select_publish_slot_cpu(
+                cache, expert_idx=expert_idx, step_id=step_id, layer_idx=layer_idx,
+            )
+            if victim_slot is None:
+                continue
+            # Non-deferred reserve (E.9.2): segment n-1 is still computed this
+            # forward, so the slot must be unmapped immediately (LUT cleared) to
+            # avoid a buffer race with the segment n-1 read. Pairs with the
+            # commit_active path (source != "draft_segment_indexed").
+            reservation = cache.reserve_active_slot_for_prefetch(
+                layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
+            )
+            if reservation is None:
+                continue
+            ready_event = cache.begin_async_put_to_active(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+            self.inflight[key] = PrefetchTicket(
+                step_id=step_id,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source="predictive_phase1",
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=time.perf_counter() * 1000.0,
+                ready_event=ready_event,
+                ready=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                segment_id=int(last_segment_id),
+            )
+            submitted += 1
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile["predictive_phase1_prefetch_submit_count"] += 1
+        return submitted
+
+    # ----- verify prefetch from draft queue, attention-window budget (B.4/E.13)
+    def submit_verify_layer_prefetch(self, *, step_id: int, target_layer_idx: int, available_ms: float) -> int:
+        if not bool(getattr(self.config, "prefetch_verify_layer_enabled", True)):
+            return 0
+        if int(self.config.prefetch_step_budget) <= 0:
+            return 0
+        # E.13 (approach A): confine prefetch to ~attention window.
+        available_ms = float(available_ms) * float(getattr(self.config, "prefetch_verify_attention_ratio", 0.3))
+        if available_ms <= 0.0:
+            return 0
+        layer_idx = int(target_layer_idx)
+        cache = self.layer_caches.get(layer_idx)
+        if cache is None:
+            return 0
+        self.publish_direct_active_ready(step_id=step_id)
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        if inflight_budget <= 0:
+            return 0
+
+        segment_id = self._segment_id_for_layer(layer_idx)
+        inflight_keys = set(self.inflight.keys())
+        ranked = self.draft_segment_index.candidates(
+            segment_id=segment_id,
+            step_id=step_id,
+            layer_caches=self.layer_caches,
+            inflight_keys=inflight_keys,
+        )
+        ranked = [c for c in ranked if int(c.layer_idx) == layer_idx]
+        if not ranked:
+            return 0
+        ranked.sort(key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+
+        max_submit = min(
+            max(0, int(self.config.prefetch_step_budget)),
+            max(0, int(getattr(self.config, "prefetch_verify_layer_max_budget", self.config.prefetch_step_budget))),
+            inflight_budget,
+        )
+        submitted = 0
+        used_budget_ms = 0.0
+        for candidate in ranked:
+            if submitted >= max_submit:
+                break
+            expert_idx = int(candidate.expert_idx)
+            key = (layer_idx, expert_idx)
+            if cache.is_cached_cpu(expert_idx) or key in self.inflight:
+                continue
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+            transfer_ms = self._estimated_expert_transfer_ms(weights)
+            if not isfinite(transfer_ms):
+                continue
+            if used_budget_ms + transfer_ms > available_ms:
+                self._profile["verify_layer_prefetch_budget_stop_count"] += 1
+                break
+            victim_slot = self._select_publish_slot(
+                cache, layer_idx=layer_idx, expert_idx=expert_idx, step_id=step_id,
+            )
+            if victim_slot is None:
+                continue
+            reservation = cache.reserve_active_slot_for_prefetch(
+                layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
+            )
+            if reservation is None:
+                continue
+            ready_event = cache.begin_async_put_to_active(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+            self.inflight[key] = PrefetchTicket(
+                step_id=step_id,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source="verify_layer_predict",
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=time.perf_counter() * 1000.0,
+                ready_event=ready_event,
+                ready=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+            )
+            submitted += 1
+            used_budget_ms += transfer_ms
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile["verify_layer_prefetch_submit_count"] += 1
+            self._profile["verify_layer_prefetch_est_transfer_ms"] += transfer_ms
+        return submitted
+
+    def get_profile(self, reset: bool = False) -> dict:
+        extra = {
+            "predictive_phase1_prefetch_submit_count": int(
+                self._profile.get("predictive_phase1_prefetch_submit_count", 0.0)
+            ),
+            "predictive_draft_stale_observe_count": int(
+                self._profile.get("predictive_draft_stale_observe_count", 0.0)
+            ),
+        }
+        out = super().get_profile(reset=reset)
+        out.update(extra)
+        return out

@@ -210,9 +210,7 @@ E2 中 reroute 保护的 +0.2pp 收益看似微小，但其机制是正确的：
 
 ### 4.1 问题重新定位
 
-E3 的简化 T_cycle 模型严重低估 T_stall（108ms vs E4 实测 857ms），导致 K*=12 不可信。E4 的覆盖率模拟更接近真实，但也有局限：没有模拟 verify 阶段的层间预取（实际系统的 `PrefetchRuntime` 在 verify 中也会预取后续层专家）。
-
-**核心洞察**：Dynamic K 的决策质量完全取决于 T_stall 估计的准确性，而 T_stall 高度依赖预取的实际表现，这在离线仿真中很难精确模拟。
+Dynamic K 的决策质量取决于 T_stall 估计的准确性，而 T_stall 高度依赖预取的实际表现，这在离线仿真中很难精确模拟。
 
 ### 4.2 新方案：基于离线 Profiling 的 Dynamic K
 
@@ -446,72 +444,165 @@ def _online_fit_alpha(self):
 
 ## 5. 预取调度优化
 
-### 5.1 实验启示
+### 5.1 当前预取架构梳理
 
-E4 最重要的发现是**预取率 m 的边际收益递减**：m=0→1 提升 23%，m=3→4 仅提升 1%。这表明预取的价值不在于"尽可能多预取"，而在于"预取对的专家"。
+nano-vllm-moe 的预取系统由 `PrefetchRuntime`（`prefetcher.py`）和 `ModelRunner`（`model_runner.py`）协作完成，具备完整的两阶段异步预取能力。
 
-### 5.2 两阶段预取的优先级优化
+#### 5.1.1 信息源
 
-nano-vllm-moe 的预取已有两阶段设计（`PrefetchRuntime`），优化方向是**优先级函数**。
+预取候选队列的信息来源有三个，分别通过 `observe_*()` 方法注入 `GlobalWarmStartQueue`（及 `SegmentCandidateIndex`）：
 
-**Draft 阶段预取优先级**
+| 信息源 | 入口方法 | 数据内容 | 目标队列 |
+|--------|---------|---------|---------|
+| Prefill routing | `observe_prefill()` | prefill 阶段 router 输出的 expert ids + routing weights | GlobalWarmStartQueue + long_term SegmentIndex |
+| Draft routing | `observe_draft()` | draft 阶段每步 forward 的 gating metadata | draft SegmentIndex（segment_indexed 模式）或 GlobalWarmStartQueue |
+| Verify routing | `observe_verify()` | verify 阶段 router 输出 + rank_guard scores 更新 | GlobalWarmStartQueue + long_term SegmentIndex |
 
-当前 `GlobalWarmStartQueue` 维护一个按频率排序的预取候选队列。基于实验结果的优化：
+三个信息源通过 `source_weight` 配置各自的优先级贡献权重（`prefetch_source_weight_prefill/draft/verify`）。
+
+#### 5.1.2 候选优先级计算
+
+当前 `compute_priority()` 公式（`prefetcher.py:47`）：
+
+```
+priority = source_weight × score_sum + activation_count_weight × activation_count − age_penalty × age
+```
+
+其中：
+- `score_sum`：routing weight 的 decay 累加（`decay * old_score + new_score`），反映专家的激活强度
+- `activation_count`：出现次数的 decay 累加，反映激活频率
+- `age`：`current_step - last_update_step`，惩罚长时间未被观察到的候选
+
+#### 5.1.3 两阶段预取流程
+
+**Draft 阶段预取**
+
+Draft 阶段有三种预取模式（由 `prefetch_runtime_mode` 配置）：
+
+| 模式 | 方法 | 特点 |
+|------|------|------|
+| `baseline_staging` | `submit_from_global_queue()` | 预取到 staging buffer，后续在安全点 publish 到 active cache |
+| `draft_direct_active` | `submit_draft_direct_active_prefetch()` | 直接预取到 active cache slot，有 frontier 约束保护未执行层 |
+| `draft_segment_indexed` | `submit_draft_segment_indexed_prefetch()` | 推荐模式。按 segment 边界提交，合并 long_term + draft 两个 SegmentIndex 的候选 |
+
+Draft 预取的关键约束：
+- **Frontier 保护**：仅预取 `layer_idx ≤ frontier_layer_idx` 的专家，避免替换后续 segment replay 需要读取的 active slot
+- **Adaptive budget**：根据可见开销（visible_overhead_ms）自适应调整每次 boundary 提交数量
+- **Stale metadata guard**：metadata 的 step_id ≠ 当前 active draft step_id 时跳过 direct-active 提交
+
+整体时序：
+```
+run_draft()
+  → begin_draft_iteration()                      # 清空 draft SegmentIndex
+  → arm() metadata recorder                      # 准备捕获 gating metadata
+  → model forward (MoE layers execute)            # GPU 写入 routing metadata
+  → offload_async() → 异步 D2H copy              # metadata 从 GPU 到 pinned CPU
+  → prefetch worker thread:
+      → collect() → observe_draft()               # 聚合 metadata → 更新候选队列
+      → _submit_prefetch_after_metadata()          # 排序候选 → 发起 H2D 专家传输
+```
+
+**Verify 阶段预取**
+
+Verify 阶段的预取发生在**逐层执行时**，通过 `model_runner.before_verify_layer()` hook 触发：
+
+```
+before_verify_layer(layer_idx=l)
+  → publish_direct_active_ready()           # 完成已就绪的 direct-active 传输
+  → 计算 available_ms = EMA(layer_compute_ms) × safety_ratio
+  → submit_verify_layer_prefetch(
+        target_layer_idx=l+1,               # 只预取下一层
+        available_ms=available_ms            # 时间预算 ≤ 当前层计算时间
+    )
+```
+
+Verify 层预取的特点：
+- **时间预算驱动**：available_ms 来自当前层计算耗时的 EMA 估计 × 0.8 安全系数
+- **单层范围**：`submit_verify_layer_prefetch()` 仅过滤 `layer_idx == target_layer_idx` 的候选
+- **候选来源**：排序后的 `GlobalWarmStartQueue`，即依赖 draft/prefill/verify 历史的混合信号
+- **无独立信息源**：verify 层预取不使用当前 verify 正在执行的层的精确路由来预测后续层
+
+### 5.2 优化分析
+
+#### 5.2.1 当前预取系统的优势与局限
+
+**已有的优势：**
+
+1. 异步流水线架构成熟：metadata offload（D2H）、候选排序、H2D 传输完全在后台 worker thread 完成
+2. Segment-indexed 模式能按 segment 粒度精准投递，避免一次性预取浪费带宽
+3. Verify 层预取已实现 `before_verify_layer` hook + 时间预算机制，框架完整
+
+**需要关注的局限：**
+
+1. **优先级函数未区分 top-1/2 重要性**：当前 `compute_priority()` 纯粹基于 score_sum（routing weight 累加）和 activation_count。LFU-RankGuard（§2.2）的 `rank_scores` 信息未反映到预取优先级中。一个 top-1 高频专家和一个 top-8 高频专家在预取优先级上没有区别，但 miss 造成的质量损失差异巨大。
+
+2. **Verify 层预取的候选池未充分利用 draft original routing**：`submit_verify_layer_prefetch()` 从 `GlobalWarmStartQueue` 中取候选，这个队列已经包含了 draft routing 的历史信息（通过 `observe_draft()`）。但问题在于 GlobalWarmStartQueue 是跨层混合的队列，verify 层预取过滤 `layer_idx == target` 后剩余的候选可能很少。如果 draft metadata 的 observe 延迟较大或被 stale guard 跳过，target_layer 的候选可能不完整。
+
+3. **Draft SegmentIndex 与 Verify 层预取的信息断层**：在 `draft_segment_indexed` 模式中，draft routing 进入 `draft_segment_index`，但 verify 开始前 `end_draft_iteration()` 会清空 draft_segment_index。Verify 层预取只能依赖 GlobalWarmStartQueue 和 long_term_segment_index 中的残留信息，**draft 当前轮次的 per-layer routing 预测被丢弃了**。
+
+#### 5.2.2 优化方向 1：Top-1/2 Boost 优先级
+
+在 `compute_priority()` 中引入 `rank_score` 提升因子，使 top-1/2 高频专家在预取排序中获得优先权：
 
 ```python
-def priority(layer_idx, expert_id, step_id):
-    # 基础优先级：verify routing 预测的激活概率
-    base = predicted_activation_prob(layer_idx, expert_id)
-    
-    # Top-1/2 boost：top-1/2 高频专家优先预取
-    rank_boost = 1.0
-    if rank_score(layer_idx, expert_id) >= 0.15:
-        rank_boost = 1.5  # 50% priority boost
-    
-    # 层序紧迫性：前层专家更紧急（verify 先执行前层）
-    urgency = (L - layer_idx + 1) / L
-    
-    # 时效性：最近观察到的专家优先
-    recency = 1.0 / (step_id - last_seen_step + 1)
-    
-    return base * rank_boost * urgency * recency
+def compute_priority(source, score_sum, activation_count, age, config,
+                     rank_score=0.0, rank_boost_threshold=0.15):
+    source_weight = { ... }.get(source, 1.0)
+    base = (
+        source_weight * float(score_sum)
+        + float(config.prefetch_activation_count_weight) * float(activation_count)
+        - float(config.prefetch_age_penalty) * float(age)
+    )
+    # top-1/2 boost
+    if rank_score >= rank_boost_threshold:
+        base *= 1.5
+    return base
 ```
 
-**Verify 阶段层间预取**
+这与 §2.2 LFU-RankGuard 协同：RankGuard 保护 cache 中已有的 top-1/2 不被驱逐，Top-1/2 Boost 确保未缓存的 top-1/2 优先被预取。两者共同形成"优先进、不轻出"的 top-1/2 保护闭环。
 
-E4 没有模拟但实际系统支持的关键优化：当 verify 第 l 层完成后，可以利用 l 层的**精确路由信息**预取 l+1 到 l+Δ 层的专家。
+**实现位置**：修改 `prefetcher.py:compute_priority()`，`rank_score` 从 `LFURankGuardStrategy.rank_scores` 查表获取。
 
-```
-Verify 层间预取时序：
-  Layer 0: verify compute → 得到 exact routing for layer 0
-  Layer 1: verify compute ← 同时预取 layer 2,3 的高概率 miss 专家
-  Layer 2: verify compute ← 预取的 layer 2 专家已到位（如果 PCIe 够快）
-  ...
-```
+**开销**：每个候选增加一次 dict 查表，≈0 开销。
 
-层间路由相关性（routing analysis: 连续 Jaccard ≈ 0.442）为预测后续层专家提供了信号。但单纯靠相邻层相关性预取效率不高，更好的策略是**结合 draft original routing 的 per-layer 预测**：
+#### 5.2.3 优化方向 2：保留 Draft Per-Layer Routing 信息到 Verify 阶段
+
+当前 `end_draft_iteration()` 清空 `draft_segment_index`，导致 verify 阶段无法利用 draft 当前轮次的 per-layer 精确路由信息。
+
+**方案**：在 `end_draft_iteration()` 中将 draft_segment_index 的候选 merge 到 long_term_segment_index（或一个专用的 verify_hint 缓存），而非直接丢弃。
 
 ```python
-def verify_layer_prefetch_candidates(current_layer, current_routing, 
-                                      draft_original_routing, cache):
-    """Generate prefetch candidates for upcoming verify layers."""
-    candidates = []
-    
-    for future_layer in range(current_layer + 1, 
-                              min(current_layer + lookahead, L)):
-        # Primary signal: draft original routing for this layer
-        draft_experts = draft_original_routing.get(future_layer, set())
-        
-        for expert_id in draft_experts:
-            if not cache.is_cached(future_layer, expert_id):
-                # Priority: routing weight from draft × urgency
-                priority = draft_routing_weight(future_layer, expert_id)
-                candidates.append((future_layer, expert_id, priority))
-    
-    # Sort by priority, return top-m for PCIe budget
-    candidates.sort(key=lambda x: -x[2])
-    return candidates[:pcie_budget]
+def end_draft_iteration(self):
+    if self._draft_iteration_open and self.draft_segment_index is not None:
+        # 将 draft 候选合入 long_term，供 verify 层预取使用
+        self.long_term_segment_index.merge_from(self.draft_segment_index)
+    self.draft_segment_index.clear()
+    self._active_draft_iteration_steps.clear()
+    self._draft_iteration_open = False
 ```
+
+这样 verify 层预取通过 GlobalWarmStartQueue（已含 draft observe 数据）+ 增强后的 long_term_segment_index 能获得更完整的 per-layer 候选。
+
+**前提验证**：需要确认 draft routing 对 verify routing 的预测准确性。现有 `record_verify_consumed()` 已经记录了 verify 实际消费了哪些预取专家，可以从 profile 中提取 draft→verify 命中率作为验证。
+
+#### 5.2.4 优化方向 3：Verify 层预取的层序紧迫性
+
+当前 `submit_verify_layer_prefetch()` 只预取 `target_layer_idx = current_layer + 1`（单层向前看）。如果当前层计算耗时足够长且 PCIe 带宽有余，可以扩展到 `current_layer + 1 ... current_layer + Δ`。
+
+但这个优化需要谨慎评估：
+- verify 每层计算耗时约 0.5-1ms（取决于 token 数），PCIe 传输一个专家约 1.18ms
+- 在 available_ms 内最多传输 0-1 个专家，lookahead 增大不会增加实际传输量
+- 更大的 lookahead 主要价值是**选择更紧急的候选**（如 l+2 层有一个 top-1 miss，比 l+1 层的 top-7 miss 更值得预取）
+
+**方案**：将 `submit_verify_layer_prefetch()` 的过滤条件从 `layer_idx == target` 改为 `target ≤ layer_idx ≤ target + Δ`，在排序时加入层序紧迫性因子：
+
+```python
+# 在 ranked_candidates 过滤后，按 (priority × urgency) 重排
+urgency = 1.0 / (candidate.layer_idx - current_layer + 1)
+effective_priority = candidate.priority * urgency
+```
+
+Δ 建议设为 2-3（对应 2-3 层 lookahead），过大无实际收益。
 
 ### 5.3 Prefetch Profiling 指标
 
@@ -531,7 +622,17 @@ class PrefetchStepMetrics:
         return self.verify_miss_covered / max(1, self.verify_miss_total)
 ```
 
-这些指标已可从 `PrefetchRuntime._profile` 中提取，只需要在 `spec_engine.py` 的 step trace 中聚合。
+这些指标大部分已可从 `PrefetchRuntime._profile` 中提取：
+
+| 指标 | 现有 profile key | 说明 |
+|------|-----------------|------|
+| draft_prefetch_submitted | `draft_*_prefetch_submit_count` | 已有 |
+| draft_prefetch_completed | `direct_active_prefetch_publish_count` | 已有 |
+| verify_miss_covered | `verify_layer_prefetch_consumed_count` | 已有（`record_verify_consumed` 路径） |
+| verify_miss_total | — | 需新增：verify 阶段每层 uncached expert 计数 |
+| verify_stall_ms | — | 需新增：verify 计算中等待 PCIe 的时间 |
+
+`verify_miss_total` 和 `verify_stall_ms` 需要在 `run_verify()` 路径中新增采集点，与 `before_verify_layer()` / `after_verify_layer()` hook 结合。
 
 ---
 

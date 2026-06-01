@@ -57,6 +57,13 @@ class Config:
     prefetch_verify_layer_max_budget: int = 2
     prefetch_metadata_host_buffer_pool_size: int = 3
     prefetch_runtime_mode: str = "baseline_staging"
+    prefetch_runtime_kind: str = "legacy"
+    # Predictive prefetcher: fraction of layer compute used as the verify-prefetch
+    # transfer budget, confining prefetch to roughly the attention window so the
+    # MoE-stage demand-load keeps PCIe bandwidth (E.13, approach A).
+    prefetch_verify_attention_ratio: float = 0.3
+    # Phase-1 cold-start prefetch budget (number of experts) for segment n-1.
+    predictive_phase1_budget: int = 4
     draft_prefetch_frontier_granularity: str = "segment"
     draft_prefetch_segment_size: int = 12
     draft_prefetch_segment_host_buffer_pool_size: int = 0
@@ -148,6 +155,13 @@ class Config:
         assert self.prefetch_verify_layer_transfer_bandwidth_gbps > 0.0
         assert self.prefetch_verify_layer_max_budget >= 0
         assert self.prefetch_metadata_host_buffer_pool_size >= 1
+        assert self.prefetch_runtime_kind in {"legacy", "predictive"}
+        assert 0.0 < self.prefetch_verify_attention_ratio <= 1.0
+        assert self.predictive_phase1_budget >= 0
+        if self.prefetch_runtime_kind == "predictive":
+            # The predictive prefetcher reuses the segment-indexed integration
+            # gates in model_runner; force the mode so those gates fire.
+            self.prefetch_runtime_mode = "draft_segment_indexed"
         assert self.prefetch_runtime_mode in {"baseline_staging", "draft_direct_active", "draft_segment_indexed"}
         assert self.draft_prefetch_frontier_granularity in {"iteration", "segment", "layer"}
         assert self.draft_prefetch_segment_size >= 1

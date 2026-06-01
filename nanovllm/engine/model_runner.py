@@ -23,7 +23,7 @@ from nanovllm.scheduling.draft_reroute_profile import (
     load_draft_reroute_profile,
     seed_lfu_rank_guard_from_profile,
 )
-from nanovllm.expert.prefetcher import PrefetchRuntime
+from nanovllm.expert.prefetcher import PredictivePrefetchRuntime, PrefetchRuntime
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -195,7 +195,12 @@ class ModelRunner:
 
             if self.prefetch_effective_enabled:
                 self.runtime_meta_recorder = ModelRuntimeMetaRecorder(config=config, hf_config=config.hf_config)
-                self.prefetch_runtime = PrefetchRuntime(
+                prefetch_cls = (
+                    PredictivePrefetchRuntime
+                    if str(getattr(config, "prefetch_runtime_kind", "legacy")) == "predictive"
+                    else PrefetchRuntime
+                )
+                self.prefetch_runtime = prefetch_cls(
                     config=config,
                     layer_caches=self.layer_caches,
                     cpu_expert_pool=self.cpu_expert_pool,
@@ -1327,6 +1332,14 @@ class ModelRunner:
 
                 with self._prefetch_runtime_lock:
                     prefetch_runtime.drain_direct_active_ready(step_id=step_id)
+                # Predictive prefetcher: submit phase-1 cold-start here, AFTER the
+                # drain (so it is not synchronized by it) and BEFORE self.run, so
+                # its async H2D overlaps with segment-0 compute (guarded; legacy
+                # runtime has no such method -> no-op).
+                maybe_submit_phase1 = getattr(prefetch_runtime, "maybe_submit_phase1", None)
+                if maybe_submit_phase1 is not None:
+                    with self._prefetch_runtime_lock:
+                        maybe_submit_phase1(step_id)
                 self._wait_for_prefetch_device_reuse(mode="draft", token_capacity=draft_capacity)
                 runtime_meta_recorder.arm(
                     mode="draft",
@@ -1494,6 +1507,12 @@ class ModelRunner:
 
         self._poll_verify_layer_timing_events()
         step_id = int(getattr(self, "_current_verify_prefetch_step_id", -1))
+        # Predictive prefetcher: release this layer's single-round protection as
+        # verify reaches it (guarded; legacy runtime has no such method -> no-op).
+        on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
+        if on_verify_layer_start is not None:
+            with self._prefetch_runtime_lock:
+                on_verify_layer_start(int(layer_idx))
         with self._prefetch_runtime_lock:
             prefetch_runtime.publish_direct_active_ready(step_id=step_id)
         target_layer_idx = int(layer_idx) + 1
