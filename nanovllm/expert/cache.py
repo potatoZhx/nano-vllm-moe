@@ -101,6 +101,8 @@ class LayerExpertCache:
         self.access_count = [0] * self.num_experts
         self.access_score_sum = [0.0] * self.num_experts
         self.slot_generation = [0] * self.num_slots
+        self._cache_fill_no_cpu_flag_device: torch.Tensor | None = None
+        self._cache_fill_no_cpu_flag_host: torch.Tensor | None = None
 
         if self.num_staging_slots > 0:
             self.staging_gate_up_buffer = torch.empty(
@@ -511,6 +513,19 @@ class LayerExpertCache:
 
     def get_slot_to_expert_lut(self) -> torch.Tensor:
         return self.slot_to_expert_lut
+
+    def get_cache_fill_no_cpu_flag_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self.expert_to_slot_lut.device
+        flags = self._cache_fill_no_cpu_flag_device
+        if flags is None or flags.device != device or flags.size(1) != self.num_experts:
+            flags = torch.empty((2, self.num_experts), dtype=torch.bool, device=device)
+            self._cache_fill_no_cpu_flag_device = flags
+        host = self._cache_fill_no_cpu_flag_host
+        if host is None or host.size(1) != self.num_experts:
+            host_kwargs = {"pin_memory": True} if device.type == "cuda" else {}
+            host = torch.empty((2, self.num_experts), dtype=torch.bool, device="cpu", **host_kwargs)
+            self._cache_fill_no_cpu_flag_host = host
+        return flags, host
 
     def get_cpu_expert_weights(self, expert_idx: int) -> dict[str, torch.Tensor] | None:
         return self.cpu_expert_pool.get(expert_idx)

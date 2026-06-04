@@ -205,6 +205,236 @@ def apply_verify_cache_fill_policy(
     )
 
 
+def collect_cache_fill_no_cpu_expert_ids(
+    selected_experts: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    profile: dict[str, float] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Return active expert ids and currently-missing active expert ids.
+
+    The hot path keeps all route metadata on the device and transfers only two
+    fixed-size bitsets to the host: active experts and miss experts.
+    """
+    flat_selected = selected_experts.reshape(-1).to(torch.int64)
+    if flat_selected.numel() == 0:
+        if profile is not None:
+            profile["verify_cache_fill_no_cpu_active_expert_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_active_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_miss_expert_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_miss_expert_count", 0.0)
+            )
+        return [], []
+
+    t0 = perf_counter()
+    flags_device, flags_host = expert_cache.get_cache_fill_no_cpu_flag_buffers()
+    active_flags = flags_device[0]
+    miss_flags = flags_device[1]
+    active_flags.zero_()
+    miss_flags.zero_()
+
+    active_flags.scatter_(0, flat_selected, torch.ones_like(flat_selected, dtype=torch.bool))
+    slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
+    miss_routes = slots.lt(0)
+    miss_flags.scatter_(0, flat_selected, miss_routes)
+
+    flags_host.copy_(flags_device, non_blocking=flags_device.is_cuda)
+    if flags_device.is_cuda:
+        torch.cuda.current_stream(flags_device.device).synchronize()
+    active_ids = torch.nonzero(flags_host[0], as_tuple=False).flatten().tolist()
+    miss_ids = torch.nonzero(flags_host[1], as_tuple=False).flatten().tolist()
+    elapsed_ms = (perf_counter() - t0) * 1000.0
+
+    if profile is not None:
+        profile["verify_cache_fill_no_cpu_flag_ms"] = float(
+            profile.get("verify_cache_fill_no_cpu_flag_ms", 0.0) + elapsed_ms
+        )
+        profile["verify_cache_fill_no_cpu_active_expert_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_active_expert_count", 0.0) + len(active_ids)
+        )
+        profile["verify_cache_fill_no_cpu_miss_expert_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_miss_expert_count", 0.0) + len(miss_ids)
+        )
+    return [int(x) for x in active_ids], [int(x) for x in miss_ids]
+
+
+def _select_cache_fill_no_cpu_slots(
+    expert_cache: LayerExpertCache,
+    active_expert_ids: set[int],
+    needed_count: int,
+    cache_strategy: str,
+) -> tuple[list[tuple[int, int]], int]:
+    skipped_pending_count = 0
+    empty_slots: list[tuple[int, int]] = []
+    victim_slots: list[tuple[tuple[int, int, int], int, int]] = []
+    use_lfu = str(cache_strategy).strip().lower() == "lfu"
+    for slot_idx, slot_expert in enumerate(expert_cache.slot_to_expert):
+        if expert_cache.is_active_slot_pending(slot_idx):
+            skipped_pending_count += 1
+            continue
+        prev_expert = int(slot_expert)
+        if prev_expert < 0:
+            empty_slots.append((slot_idx, prev_expert))
+            continue
+        if prev_expert in active_expert_ids:
+            continue
+        primary = int(expert_cache.access_count[prev_expert]) if use_lfu else int(expert_cache.last_access_step[prev_expert])
+        secondary = int(expert_cache.last_access_step[prev_expert]) if use_lfu else int(expert_cache.access_count[prev_expert])
+        victim_slots.append(((primary, secondary, slot_idx), slot_idx, prev_expert))
+
+    selected: list[tuple[int, int]] = empty_slots[:needed_count]
+    if len(selected) < needed_count:
+        victim_slots.sort(key=lambda item: item[0])
+        selected.extend((slot_idx, prev_expert) for _, slot_idx, prev_expert in victim_slots[: needed_count - len(selected)])
+    return selected, skipped_pending_count
+
+
+def apply_verify_cache_fill_no_cpu_policy_ids(
+    layer_idx: int,
+    active_expert_ids: list[int],
+    miss_expert_ids: list[int],
+    expert_cache: LayerExpertCache,
+    step_id: int,
+    cache_strategy: str = "lru",
+    profile: dict[str, float] | None = None,
+) -> VerifyCacheFillResult:
+    """Promote miss experts from compact id lists for cache_fill_no_cpu verify."""
+    _ = layer_idx, step_id
+    active_ids = sorted({int(eid) for eid in active_expert_ids if 0 <= int(eid) < expert_cache.num_experts})
+    miss_ids = sorted(
+        {
+            int(eid)
+            for eid in miss_expert_ids
+            if 0 <= int(eid) < expert_cache.num_experts and not expert_cache.is_cached_cpu(int(eid))
+        }
+    )
+
+    if len(active_ids) > int(expert_cache.num_slots):
+        if profile is not None:
+            profile["verify_cache_fill_promoted_expert_count"] = float(
+                profile.get("verify_cache_fill_promoted_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_cpu_expert_count"] = float(
+                profile.get("verify_cache_fill_cpu_expert_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_expert_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_expert_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_route_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0) + 1.0
+            )
+        return VerifyCacheFillResult([], miss_ids, [], 0, 0.0)
+
+    if not miss_ids:
+        if profile is not None:
+            profile["verify_cache_fill_promoted_expert_count"] = float(
+                profile.get("verify_cache_fill_promoted_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_cpu_expert_count"] = float(
+                profile.get("verify_cache_fill_cpu_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_expert_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_route_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0)
+            )
+        return VerifyCacheFillResult([], [], [], 0, 0.0)
+
+    slots, skipped_pending_count = _select_cache_fill_no_cpu_slots(
+        expert_cache=expert_cache,
+        active_expert_ids=set(active_ids),
+        needed_count=len(miss_ids),
+        cache_strategy=cache_strategy,
+    )
+    if len(slots) < len(miss_ids):
+        if profile is not None:
+            profile["verify_cache_fill_promoted_expert_count"] = float(
+                profile.get("verify_cache_fill_promoted_expert_count", 0.0)
+            )
+            profile["verify_cache_fill_cpu_expert_count"] = float(
+                profile.get("verify_cache_fill_cpu_expert_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_skipped_pending_count"] = float(
+                profile.get("verify_cache_fill_skipped_pending_count", 0.0) + skipped_pending_count
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_expert_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_expert_count", 0.0) + len(miss_ids)
+            )
+            profile["verify_cache_fill_no_cpu_remaining_miss_route_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0)
+            )
+            profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0) + 1.0
+            )
+        return VerifyCacheFillResult([], miss_ids, [], skipped_pending_count, 0.0)
+
+    promoted: list[int] = []
+    evicted: list[int] = []
+    transfer_t0 = perf_counter()
+    for expert_idx, (slot_idx, prev_expert) in zip(miss_ids, slots):
+        params = expert_cache.get_cpu_expert_weights(expert_idx)
+        if params is None or "gate_up" not in params or "down" not in params:
+            raise RuntimeError(f"Missing CPU expert weights for verify cache fill expert {expert_idx}")
+        expert_cache.put_to_slot(slot_idx, expert_idx, params["gate_up"], params["down"])
+        promoted.append(expert_idx)
+        if prev_expert >= 0 and prev_expert != expert_idx:
+            evicted.append(prev_expert)
+    transfer_ms = (perf_counter() - transfer_t0) * 1000.0 if promoted else 0.0
+
+    if profile is not None:
+        profile["verify_cache_fill_promoted_expert_count"] = float(
+            profile.get("verify_cache_fill_promoted_expert_count", 0.0) + len(promoted)
+        )
+        profile["verify_cache_fill_cpu_expert_count"] = float(
+            profile.get("verify_cache_fill_cpu_expert_count", 0.0)
+        )
+        profile["verify_cache_fill_evicted_expert_count"] = float(
+            profile.get("verify_cache_fill_evicted_expert_count", 0.0) + len(evicted)
+        )
+        profile["verify_cache_fill_skipped_pending_count"] = float(
+            profile.get("verify_cache_fill_skipped_pending_count", 0.0) + skipped_pending_count
+        )
+        profile["verify_cache_fill_transfer_ms"] = float(
+            profile.get("verify_cache_fill_transfer_ms", 0.0) + transfer_ms
+        )
+        profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0)
+        )
+        profile["verify_cache_fill_no_cpu_remaining_miss_expert_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_expert_count", 0.0)
+        )
+        profile["verify_cache_fill_no_cpu_remaining_miss_route_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0)
+        )
+        profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0)
+        )
+
+    return VerifyCacheFillResult(
+        promoted_expert_ids=promoted,
+        cpu_expert_ids=[],
+        evicted_expert_ids=evicted,
+        skipped_pending_count=skipped_pending_count,
+        transfer_ms=transfer_ms,
+    )
+
+
 def _build_topc0_substitution_lut(
     num_experts: int,
     cached_expert_mask: torch.Tensor,
@@ -438,6 +668,7 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
     expert_cache: LayerExpertCache,
     num_experts: int,
     profile: dict[str, float] | None = None,
+    check_remaining_misses: bool = True,
 ) -> MoEExecutionPlan:
     """Build a verify plan optimized for cache-fill cases that become all-GPU.
 
@@ -450,13 +681,15 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
     flat_selected = _flatten_experts(selected_experts)
     _ = routing_weights, num_experts
     gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
-    remaining_miss_mask = gpu_slots.lt(0)
-    remaining_route_count = int(remaining_miss_mask.sum().item()) if flat_selected.numel() > 0 else 0
+    remaining_route_count = 0
     remaining_expert_count = 0
-    if remaining_route_count > 0:
-        remaining_expert_count = int(torch.unique(flat_selected[remaining_miss_mask]).numel())
+    if check_remaining_misses:
+        remaining_miss_mask = gpu_slots.lt(0)
+        remaining_route_count = int(remaining_miss_mask.sum().item()) if flat_selected.numel() > 0 else 0
+        if remaining_route_count > 0:
+            remaining_expert_count = int(torch.unique(flat_selected[remaining_miss_mask]).numel())
 
-    if profile is not None:
+    if profile is not None and check_remaining_misses:
         profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
             profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0) + remaining_expert_count
         )
@@ -467,7 +700,7 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
             profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0) + remaining_route_count
         )
 
-    if remaining_route_count > 0:
+    if check_remaining_misses and remaining_route_count > 0:
         if profile is not None:
             profile["verify_cache_fill_no_cpu_fallback_count"] = float(
                 profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0) + 1.0
@@ -480,7 +713,7 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
             num_experts=num_experts,
         )
 
-    if profile is not None:
+    if profile is not None and check_remaining_misses:
         profile["verify_cache_fill_no_cpu_fallback_count"] = float(
             profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0)
         )
@@ -494,8 +727,6 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
         )
     else:
         m_sizes = None
-    gpu_route_mask = torch.ones_like(flat_selected, dtype=torch.bool)
-    cpu_route_mask = torch.zeros_like(flat_selected, dtype=torch.bool)
     return MoEExecutionPlan(
         layer_idx=layer_idx,
         gpu_route_indices=gpu_route_indices,
@@ -508,8 +739,8 @@ def build_cache_fill_no_cpu_verify_plan_gpu(
         flat_selected_original=flat_selected,
         flat_selected_effective=flat_selected,
         substitution_lut=None,
-        gpu_route_mask=gpu_route_mask,
-        cpu_route_mask=cpu_route_mask,
+        gpu_route_mask=None,
+        cpu_route_mask=None,
     )
 
 

@@ -5,10 +5,12 @@ import torch
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
     apply_verify_cache_fill_policy,
+    apply_verify_cache_fill_no_cpu_policy_ids,
     build_cache_fill_no_cpu_verify_plan_gpu,
     build_draft_plan,
     build_prefill_plan,
     build_verify_plan,
+    collect_cache_fill_no_cpu_expert_ids,
     build_runtime_meta_view,
     flatten_selected_and_weights,
 )
@@ -213,6 +215,63 @@ class TestPlacementSpec(unittest.TestCase):
         self.assertEqual(profile["verify_cache_fill_no_cpu_remaining_miss_count"], 2.0)
         self.assertEqual(profile["verify_cache_fill_no_cpu_fallback_count"], 1.0)
         self.assertEqual(plan.cpu_task_expert_ids.tolist(), [3, 4])
+
+    def test_cache_fill_no_cpu_collects_only_active_and_miss_expert_ids(self):
+        cache = self._build_cache_with_slots(slots=4, cached=[0, 1], num_experts=8)
+        selected = torch.tensor([[0, 2], [3, 2]], dtype=torch.int64)
+        profile = {}
+
+        active_ids, miss_ids = collect_cache_fill_no_cpu_expert_ids(
+            selected_experts=selected,
+            expert_cache=cache,
+            profile=profile,
+        )
+
+        self.assertEqual(active_ids, [0, 2, 3])
+        self.assertEqual(miss_ids, [2, 3])
+        self.assertEqual(profile["verify_cache_fill_no_cpu_active_expert_count"], 3.0)
+        self.assertEqual(profile["verify_cache_fill_no_cpu_miss_expert_count"], 2.0)
+
+    def test_cache_fill_no_cpu_policy_ids_promotes_misses_without_route_counts(self):
+        cache = self._build_cache_with_slots(slots=4, cached=[0, 1, 5, 6], num_experts=8)
+        cache.last_access_step[5] = -100
+        cache.last_access_step[6] = 100
+        profile = {}
+
+        result = apply_verify_cache_fill_no_cpu_policy_ids(
+            layer_idx=0,
+            active_expert_ids=[0, 1, 2],
+            miss_expert_ids=[2],
+            expert_cache=cache,
+            step_id=13,
+            cache_strategy="lru",
+            profile=profile,
+        )
+
+        self.assertEqual(result.promoted_expert_ids, [2])
+        self.assertEqual(result.cpu_expert_ids, [])
+        self.assertEqual(result.evicted_expert_ids, [5])
+        self.assertTrue(cache.is_cached_cpu(2))
+        self.assertFalse(cache.is_cached_cpu(5))
+        self.assertEqual(profile["verify_cache_fill_no_cpu_fallback_count"], 0.0)
+
+    def test_cache_fill_no_cpu_policy_ids_records_fallback_cpu_experts(self):
+        cache = self._build_cache_with_slots(slots=2, cached=[0, 1], num_experts=8)
+        profile = {}
+
+        result = apply_verify_cache_fill_no_cpu_policy_ids(
+            layer_idx=0,
+            active_expert_ids=[0, 1, 2],
+            miss_expert_ids=[2],
+            expert_cache=cache,
+            step_id=14,
+            cache_strategy="lru",
+            profile=profile,
+        )
+
+        self.assertEqual(result.cpu_expert_ids, [2])
+        self.assertEqual(profile["verify_cache_fill_cpu_expert_count"], 1.0)
+        self.assertEqual(profile["verify_cache_fill_no_cpu_fallback_count"], 1.0)
 
     def test_prefill_plan_splits_gpu_cpu(self):
         cache = self._build_cache()
