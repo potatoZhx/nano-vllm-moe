@@ -18,12 +18,17 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
+from nanovllm.layers.fuse_moe.functional import fused_moe_linear
 from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
 from nanovllm.layers.fuse_moe.kt_backend import KtKernelCpuMoeBackend
-from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
+from nanovllm.layers.fuse_moe.heterogeneous import (
+    heterogeneous_moe_forward,
+    _accumulate_gpu_routes_deterministic,
+)
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
+    _build_grouped_layout,
     apply_verify_cache_fill_policy,
     build_cache_fill_no_cpu_verify_plan_gpu,
     build_cached_draft_plan_gpu,
@@ -729,6 +734,78 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
+    def forward_verify_prefix(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        residual_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prefix: attention + norm + gate/topk.  Graph-capturable for fixed shapes.
+
+        Writes the pre-MoE residual into *residual_out* (in-place) so that the
+        caller can pass it to the suffix after the eager gap.  Returns
+        (post_layernorm_hidden, selected_experts, routing_weights).
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual_out.copy_(hidden_states)
+
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        mlp = self.mlp
+        router_logits = mlp.gate(hidden_states)
+        router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(
+            router_probs, mlp.num_selected, dim=-1,
+        )
+        if mlp.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        return hidden_states, selected_experts, routing_weights
+
+    def forward_verify_suffix_gpu_only(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Suffix: GPU-only plan build + grouped GEMM + scatter + residual.
+
+        Assumes all active experts are resident in the GPU cache (no CPU routes).
+        Called after the eager gap has finished cache-fill.
+        """
+        mlp = self.mlp
+        expert_cache = mlp.expert_cache
+        top_k = routing_weights.size(1)
+
+        flat_selected = selected_experts.reshape(-1).to(torch.int64)
+        flat_weights = routing_weights.reshape(-1)
+
+        gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
+        gpu_route_indices = torch.arange(
+            flat_selected.numel(), dtype=torch.int64, device=flat_selected.device,
+        )
+        m_sizes, gpu_route_indices = _build_grouped_layout(
+            gpu_slots, gpu_route_indices, expert_cache.num_slots,
+        )
+
+        gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
+        gpu_hidden = hidden_states[gpu_token_indices]
+        gpu_weights = flat_weights.index_select(0, gpu_route_indices)
+
+        gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
+        gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, m_sizes)
+        gpu_expert_out = fused_moe_linear(mlp.act_fn(gate_up), down_buffer, m_sizes)
+        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+
+        output = torch.zeros_like(hidden_states)
+        _accumulate_gpu_routes_deterministic(output, gpu_route_indices, gpu_expert_out, top_k)
+        return residual + output
+
 
 class Qwen3MoeModel(nn.Module):
 
@@ -779,6 +856,41 @@ class Qwen3MoeModel(nn.Module):
                 hidden_states,
                 position_ids,
             )
+            if controller is not None:
+                controller.after_verify_layer(layer_idx)
+        if apply_norm:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def forward_verify_prefix_suffix(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        residual_buf: torch.Tensor,
+        selected_experts_buf: torch.Tensor,
+        routing_weights_buf: torch.Tensor,
+        *,
+        prefix_replay_fn,
+        eager_gap_fn,
+        suffix_fn,
+        dense_replay_fn,
+        apply_norm: bool,
+    ) -> torch.Tensor:
+        """Three-phase verify loop: prefix graph → eager gap → suffix per layer."""
+        for decoder_layer in self.layers:
+            layer_idx = decoder_layer.layer_idx
+            is_moe = isinstance(decoder_layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock)
+            controller = self.verify_prefetch_controller
+            if controller is not None:
+                controller.before_verify_layer(layer_idx)
+            if is_moe:
+                prefix_replay_fn(layer_idx, decoder_layer, hidden_states, position_ids, residual_buf,
+                                 selected_experts_buf, routing_weights_buf)
+                fallback = eager_gap_fn(layer_idx, decoder_layer, selected_experts_buf, routing_weights_buf)
+                hidden_states = suffix_fn(layer_idx, decoder_layer, hidden_states,
+                                          selected_experts_buf, routing_weights_buf, residual_buf, fallback)
+            else:
+                hidden_states = dense_replay_fn(layer_idx, decoder_layer, hidden_states, position_ids)
             if controller is not None:
                 controller.after_verify_layer(layer_idx)
         if apply_norm:

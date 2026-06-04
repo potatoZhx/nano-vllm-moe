@@ -94,6 +94,8 @@ class Config:
     draft_cuda_graph_max_bs: int = 512
     draft_cuda_graph_bucket_steps: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
     draft_cuda_graph_cpu_backend: str = "none"  # "none" | "fused" | "fused_sync"; experimental top_c>0 graph bridge
+    verify_cuda_graph: bool = False
+    verify_cuda_graph_bucket_steps: list[int] = field(default_factory=lambda: [4, 8, 12, 16])
     perf_profile_level: str = "basic"
 
     def __post_init__(self):
@@ -183,6 +185,10 @@ class Config:
         assert len(self.draft_cuda_graph_bucket_steps) > 0
         assert all(x >= 1 for x in self.draft_cuda_graph_bucket_steps)
         assert self.draft_cuda_graph_cpu_backend in {"none", "fused", "fused_sync"}
+        assert len(self.verify_cuda_graph_bucket_steps) > 0
+        assert all(x >= 1 for x in self.verify_cuda_graph_bucket_steps)
+        if self.verify_cuda_graph and self.enforce_eager:
+            self.verify_cuda_graph = False
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

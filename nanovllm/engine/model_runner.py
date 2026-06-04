@@ -23,6 +23,7 @@ from nanovllm.scheduling.draft_reroute_profile import (
     load_draft_reroute_profile,
     seed_lfu_rank_guard_from_profile,
 )
+from nanovllm.expert.placement import apply_verify_cache_fill_policy
 from nanovllm.expert.prefetcher import PredictivePrefetchRuntime, PrefetchRuntime
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -237,6 +238,7 @@ class ModelRunner:
                 self.graph_vars = {}
                 self.graph_pool = None
             self.capture_draft_cudagraph()
+            self.capture_verify_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -1636,8 +1638,12 @@ class ModelRunner:
                     )
                 self._verify_torch_profile_done = True
             else:
-                hidden_states = self.model(input_ids, positions)
-                logits = F.linear(hidden_states, self.model.lm_head.weight)
+                if self._can_use_verify_cudagraph(int(input_ids.numel())):
+                    hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
+                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                else:
+                    hidden_states = self.model(input_ids, positions)
+                    logits = F.linear(hidden_states, self.model.lm_head.weight)
             if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
                 prof = self.model.get_and_reset_heterogeneous_profile()
                 for key, value in prof.items():
@@ -1949,3 +1955,262 @@ class ModelRunner:
             outputs=segment_outputs[-1],
             segment_outputs=segment_outputs,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Verify CUDA Graph: prefix graph capture and replay                 #
+    # ------------------------------------------------------------------ #
+
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self):
+        """Capture per-layer prefix CUDA graphs for verify (prefill-like) mode."""
+        from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
+
+        config = self.config
+        if not getattr(config, "verify_cuda_graph", False):
+            self.verify_prefix_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+            self.verify_dense_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+            self.verify_graph_bs: list[int] = []
+            self.verify_graph_vars: dict = {}
+            return
+
+        hf_config = config.hf_config
+        hidden_size = int(hf_config.hidden_size)
+        num_experts_per_tok = int(getattr(hf_config, "num_experts_per_tok", 8))
+        max_seqs = min(config.max_num_seqs, 64)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        bucket_steps = sorted(set(getattr(config, "verify_cuda_graph_bucket_steps", [4, 8, 12, 16])))
+        self.verify_graph_bs = bucket_steps
+        max_bucket = max(bucket_steps)
+
+        input_ids = torch.zeros(max_bucket, dtype=torch.int64)
+        positions = torch.zeros(max_bucket, dtype=torch.int64)
+        cu_seqlens_q = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        slot_mapping = torch.full((max_bucket,), -1, dtype=torch.int32)
+        block_tables = torch.zeros(max_seqs, max_num_blocks, dtype=torch.int32)
+        hidden_states = torch.zeros(max_bucket, hidden_size, dtype=self.model.lm_head.weight.dtype,
+                                    device=self.model.lm_head.weight.device)
+        residual_buf = torch.zeros_like(hidden_states)
+        selected_experts_buf = torch.zeros(max_bucket, num_experts_per_tok, dtype=torch.int64,
+                                           device=hidden_states.device)
+        routing_weights_buf = torch.zeros(max_bucket, num_experts_per_tok, dtype=hidden_states.dtype,
+                                          device=hidden_states.device)
+
+        self.verify_prefix_graphs = {}
+        self.verify_dense_graphs = {}
+        verify_graph_pool = getattr(self, "draft_graph_pool", None)
+
+        self._set_speculative_execution_mode("verify")
+        try:
+            for bs in reversed(bucket_steps):
+                cu_seqlens_q[0] = 0
+                cu_seqlens_q[1] = bs
+                cu_seqlens_k[0] = 0
+                cu_seqlens_k[1] = bs
+                set_context(
+                    True,
+                    cu_seqlens_q=cu_seqlens_q[:2],
+                    cu_seqlens_k=cu_seqlens_k[:2],
+                    max_seqlen_q=bs,
+                    max_seqlen_k=config.max_model_len,
+                    slot_mapping=slot_mapping[:bs],
+                    block_tables=block_tables[:1],
+                )
+
+                hidden_states[:bs] = self.model.model.embed_tokens(input_ids[:bs])
+
+                for layer in self.model.model.layers:
+                    layer_idx = layer.layer_idx
+                    is_moe = isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock)
+
+                    if is_moe:
+                        h, se, rw = layer.forward_verify_prefix(
+                            hidden_states[:bs], positions[:bs], residual_buf[:bs],
+                        )
+                        selected_experts_buf[:bs].copy_(se)
+                        routing_weights_buf[:bs].copy_(rw)
+                        hidden_states[:bs].copy_(h)
+                        torch.cuda.synchronize()
+
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, pool=verify_graph_pool):
+                            h, se, rw = layer.forward_verify_prefix(
+                                hidden_states[:bs], positions[:bs], residual_buf[:bs],
+                            )
+                            selected_experts_buf[:bs].copy_(se)
+                            routing_weights_buf[:bs].copy_(rw)
+                            hidden_states[:bs].copy_(h)
+                        if verify_graph_pool is None:
+                            verify_graph_pool = graph.pool()
+                        self.verify_prefix_graphs[(bs, layer_idx)] = graph
+
+                        layer.forward_verify_suffix_gpu_only(
+                            hidden_states[:bs], selected_experts_buf[:bs],
+                            routing_weights_buf[:bs], residual_buf[:bs],
+                        )
+                    else:
+                        hidden_states[:bs] = layer(hidden_states[:bs], positions[:bs])
+                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, pool=verify_graph_pool):
+                            hidden_states[:bs] = layer(hidden_states[:bs], positions[:bs])
+                        if verify_graph_pool is None:
+                            verify_graph_pool = graph.pool()
+                        self.verify_dense_graphs[(bs, layer_idx)] = graph
+
+                torch.cuda.synchronize()
+                reset_context()
+        finally:
+            self._set_speculative_execution_mode("normal")
+
+        self.verify_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            hidden_states=hidden_states,
+            residual_buf=residual_buf,
+            selected_experts_buf=selected_experts_buf,
+            routing_weights_buf=routing_weights_buf,
+        )
+        self._verify_graph_pool = verify_graph_pool
+
+    def _can_use_verify_cudagraph(self, num_tokens: int) -> bool:
+        if not getattr(self.config, "verify_cuda_graph", False):
+            return False
+        if not self.verify_prefix_graphs:
+            return False
+        context = get_context()
+        if context.cu_seqlens_q is not None and context.cu_seqlens_q.numel() > 2:
+            return False
+        return any(b >= num_tokens for b in self.verify_graph_bs)
+
+    def _select_verify_bucket(self, num_tokens: int) -> int:
+        for b in self.verify_graph_bs:
+            if b >= num_tokens:
+                return b
+        return self.verify_graph_bs[-1]
+
+    def _run_verify_with_prefix_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute verify forward using prefix CUDA graphs + eager gap + eager suffix."""
+        from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
+
+        num_tokens = input_ids.numel()
+        bucket = self._select_verify_bucket(num_tokens)
+        gv = self.verify_graph_vars
+        context = get_context()
+
+        gv["input_ids"][:num_tokens].copy_(input_ids)
+        gv["positions"][:num_tokens].copy_(positions)
+        if context.cu_seqlens_q is not None:
+            n_seqs = context.cu_seqlens_q.numel()
+            gv["cu_seqlens_q"][:n_seqs].copy_(context.cu_seqlens_q)
+        if context.cu_seqlens_k is not None:
+            n_seqs = context.cu_seqlens_k.numel()
+            gv["cu_seqlens_k"][:n_seqs].copy_(context.cu_seqlens_k)
+        gv["slot_mapping"].fill_(-1)
+        if context.slot_mapping is not None:
+            gv["slot_mapping"][:context.slot_mapping.numel()].copy_(context.slot_mapping)
+        if context.block_tables is not None:
+            bt = context.block_tables
+            gv["block_tables"][:bt.shape[0], :bt.shape[1]].copy_(bt)
+
+        n_seqs_actual = (context.cu_seqlens_q.numel() - 1) if context.cu_seqlens_q is not None else 1
+        set_context(
+            True,
+            cu_seqlens_q=gv["cu_seqlens_q"][:n_seqs_actual + 1],
+            cu_seqlens_k=gv["cu_seqlens_k"][:n_seqs_actual + 1],
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=gv["slot_mapping"][:bucket],
+            block_tables=gv["block_tables"][:n_seqs_actual],
+        )
+
+        gv["hidden_states"][:num_tokens] = self.model.model.embed_tokens(gv["input_ids"][:num_tokens])
+
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+
+        def prefix_replay_fn(layer_idx, layer, hidden_states, position_ids, residual_buf,
+                             selected_experts_buf, routing_weights_buf):
+            key = (bucket, layer_idx)
+            if key in self.verify_prefix_graphs:
+                self.verify_prefix_graphs[key].replay()
+            else:
+                h, se, rw = layer.forward_verify_prefix(
+                    hidden_states[:num_tokens], position_ids[:num_tokens], residual_buf[:num_tokens],
+                )
+                selected_experts_buf[:num_tokens].copy_(se)
+                routing_weights_buf[:num_tokens].copy_(rw)
+                hidden_states[:num_tokens].copy_(h)
+
+        def eager_gap_fn(layer_idx, layer, selected_experts_buf, routing_weights_buf):
+            mlp = layer.mlp
+            sel = selected_experts_buf[:num_tokens]
+            rw = routing_weights_buf[:num_tokens]
+
+            if runtime_meta_recorder is not None:
+                runtime_meta_recorder.record_layer(
+                    layer_idx=mlp.layer_idx,
+                    selected_experts=sel,
+                    routing_weights=rw,
+                )
+
+            if mlp.spec_verify_miss_policy in {"cache_fill", "cache_fill_no_cpu"}:
+                apply_verify_cache_fill_policy(
+                    layer_idx=mlp.layer_idx,
+                    selected_experts=sel,
+                    routing_weights=rw,
+                    expert_cache=mlp.expert_cache,
+                    step_id=0,
+                    profile=mlp._last_profile,
+                )
+                flat = sel.reshape(-1).to(torch.int64)
+                slots = mlp.expert_cache.expert_to_slot_lut.index_select(0, flat)
+                return bool(slots.lt(0).any().item())
+            return True
+
+        def suffix_fn(layer_idx, layer, hidden_states, selected_experts_buf,
+                      routing_weights_buf, residual_buf, fallback):
+            sel = selected_experts_buf[:num_tokens]
+            rw = routing_weights_buf[:num_tokens]
+            h = hidden_states[:num_tokens]
+            res = residual_buf[:num_tokens]
+
+            if not fallback:
+                out = layer.forward_verify_suffix_gpu_only(h, sel, rw, res)
+                hidden_states[:num_tokens] = out
+            else:
+                out = layer.mlp(h)
+                hidden_states[:num_tokens] = res + out
+            return hidden_states
+
+        def dense_replay_fn(layer_idx, layer, hidden_states, position_ids):
+            key = (bucket, layer_idx)
+            if key in self.verify_dense_graphs:
+                self.verify_dense_graphs[key].replay()
+            else:
+                hidden_states[:num_tokens] = layer(
+                    hidden_states[:num_tokens], position_ids[:num_tokens],
+                )
+            return hidden_states
+
+        hidden = self.model.model.forward_verify_prefix_suffix(
+            gv["hidden_states"],
+            gv["positions"],
+            gv["residual_buf"],
+            gv["selected_experts_buf"],
+            gv["routing_weights_buf"],
+            prefix_replay_fn=prefix_replay_fn,
+            eager_gap_fn=eager_gap_fn,
+            suffix_fn=suffix_fn,
+            dense_replay_fn=dense_replay_fn,
+            apply_norm=True,
+        )
+        return hidden[:num_tokens]

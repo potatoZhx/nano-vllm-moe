@@ -161,7 +161,7 @@ direct_torchprof_l512_torch_profile/verify_forward_rank0_summary.json
 ## 优化优先级
 
 1. **Verify CUDA Graph**
-   - 覆盖主形状 `verify_len ~= K + 1 = 9`，以及尾部短 verify。
+   - 覆盖主形状 `verify_len = 2~12`
    - 目标是降低 `forward residual` 中的 launch/调度/固定 transformer 成本。
 
 2. **Verify 全 GPU fast plan**
