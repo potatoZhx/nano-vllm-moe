@@ -78,7 +78,7 @@ M0论点得到充分支持。在消费级硬件上，MoE-SpeQ的INT4 draft model
 - **Routing收集**: 使用forward hooks捕获gate logits，batch forward处理全部token。正确。
 - **DynamicLFUCache**: per-layer LRU-on-evict, LFU-on-access。`ensure_loaded`时对新expert设置freq = min_freq + 1.0，策略合理。
 - **Cycle仿真**: Draft阶段测量miss rate；Verify阶段加载target routing进cache（仅update_cache=True时）。
-- **Frozen cache**: 仅用calibration数据初始化，永不更新。模拟无draft质量反馈的场景（类比MoE-SpeQ的固定量化误差）。
+- **Frozen cache**: 仅用calibration数据初始化，永不更新。模拟无draft质量反馈的场景。
 
 潜在问题：
 - Batch forward收集的routing与step-by-step decode可能略有差异。但对Qwen3 MoE模型，由于causal attention的特性，同一位置的hidden state应该一致。**影响可忽略。**
@@ -139,7 +139,7 @@ M2论点得到支持但效应量适中（7-12%相对改善）。应调整为强�
 
 2. **Draft阶段**: 使用`SkipAllWrapper`/`Alg2v2Wrapper`替换MoE层。Step-by-step decode with KV cache。**Wrappers正确实现** — 它们通过`self.orig.gate(h)`获取路由，通过`self.orig.experts[ei](h)`计算expert输出，仅修改了top-k选择和权重分配。
 
-3. **KV cache复用**: 每个cycle从target KV cache出发生成draft KV，draft结束后删除。这简化了仿真（假设target KV总是可用），但使draft质量略高于实际（因为attention到exact past而非approximate past）。对hit rate测量的影响可忽略。
+3. **KV cache复用**: 每个cycle从target KV cache出发生成draft KV，draft结束后删除。
 
 4. **Verify仿真**: 不运行实际verify forward，而是直接按target routing更新LFU cache。这是cache-centric仿真，适合测量cache效应。
 
