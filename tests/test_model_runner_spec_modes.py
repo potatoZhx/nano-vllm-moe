@@ -1,6 +1,7 @@
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -60,6 +61,40 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         self.assertEqual(traces, [[0, 1, 0]])
         self.assertEqual(mr.model.mode_calls[0][0], "verify")
         self.assertEqual(mr.model.mode_calls[-1][0], "normal")
+
+    def test_run_verify_cache_fill_no_cpu_skips_verify_metadata_offload(self):
+        mr = object.__new__(ModelRunner)
+        mr.model = _DummyModel()
+        mr.config = SimpleNamespace(
+            draft_top_c=1,
+            spec_verify_miss_policy="cache_fill_no_cpu",
+            prefetch_runtime_mode="draft_segment_indexed",
+        )
+        mr.draft_scheduler = object()
+        mr.profile_enabled = True
+        mr.profile_cuda_sync = False
+        mr.world_size = 1
+        mr.rank = 0
+        mr._profile = defaultdict(float)
+        mr._prefetch_step_id = 0
+        mr.prepare_prefill = lambda seqs: (torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
+
+        recorder = MagicMock()
+        recorder.offload_async.return_value = None
+        mr.runtime_meta_recorder = recorder
+        runtime = MagicMock()
+        runtime.metadata_stream = None
+        mr.prefetch_runtime = runtime
+
+        traces = ModelRunner.run_verify(mr, [SimpleNamespace(seq_id=1)], [3])
+
+        self.assertEqual(traces, [[0, 1, 0]])
+        recorder.arm.assert_not_called()
+        recorder.offload_async.assert_not_called()
+        recorder.reset.assert_not_called()
+        runtime.publish_direct_active_ready.assert_called_once()
+        runtime.end_draft_iteration.assert_called_once()
+        self.assertEqual(mr._profile["verify_metadata_skipped_count"], 1.0)
 
     def test_get_profile_exposes_phase2_post_core_fields(self):
         mr = object.__new__(ModelRunner)

@@ -182,6 +182,7 @@ class ModelRunner:
                 cpu_gpu_parallel_execution_enabled=getattr(config, "cpu_gpu_parallel_execution_enabled", "auto"),
                 cpu_gpu_parallel_min_cpu_route_ratio=getattr(config, "cpu_gpu_parallel_min_cpu_route_ratio", 0.0),
                 spec_verify_miss_policy=getattr(config, "spec_verify_miss_policy", "cpu"),
+                cache_strategy=getattr(config, "cache_strategy", "lru"),
                 gpu_fallback_workspace=gpu_fallback_workspace,
                 kt_weight_path=getattr(config, "model", ""),
                 kt_method=getattr(config, "kt_method", "BF16"),
@@ -367,6 +368,10 @@ class ModelRunner:
         if self._draft_prefetch_granularity() == "layer":
             return 1
         return max(1, int(getattr(self.config, "draft_prefetch_segment_size", 12)))
+
+    def _skip_verify_metadata_offload(self) -> bool:
+        policy = str(getattr(getattr(self, "config", None), "spec_verify_miss_policy", "")).strip()
+        return policy == "cache_fill_no_cpu"
 
     def _draft_segment_boundaries(self) -> list[tuple[int, int]]:
         num_layers = int(getattr(getattr(self.config, "hf_config", None), "num_hidden_layers", 0))
@@ -1568,7 +1573,8 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
 
-        if prefetch_runtime is not None and runtime_meta_recorder is not None:
+        skip_verify_metadata = self._skip_verify_metadata_offload()
+        if prefetch_runtime is not None and runtime_meta_recorder is not None and not skip_verify_metadata:
             token_count = int(input_ids.numel())
             self._wait_for_prefetch_device_reuse(mode="verify", token_capacity=token_count)
             runtime_meta_recorder.arm(
@@ -1690,6 +1696,14 @@ class ModelRunner:
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
             with self._prefetch_runtime_lock:
                 prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+            if skip_verify_metadata:
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["verify_metadata_skipped_count"] += 1
+                if self._prefetch_runtime_mode() == "draft_segment_indexed":
+                    with self._prefetch_runtime_lock:
+                        prefetch_runtime.end_draft_iteration()
+                return verify_outputs
             host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
                 mode="verify",
                 token_capacity=int(input_ids.numel()),

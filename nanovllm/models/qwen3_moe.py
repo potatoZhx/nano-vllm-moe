@@ -29,12 +29,14 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
     _build_grouped_layout,
+    apply_verify_cache_fill_no_cpu_policy_ids,
     apply_verify_cache_fill_policy,
     build_cache_fill_no_cpu_verify_plan_gpu,
     build_cached_draft_plan_gpu,
     build_draft_plan_gpu,
     build_prefill_plan_gpu,
     build_verify_plan_gpu,
+    collect_cache_fill_no_cpu_expert_ids,
 )
 from nanovllm.scheduling.draft_reroute import ROUND_ROBIN, DraftReroutePolicy
 from nanovllm.scheduling.draft_reroute_profile import DraftRerouteProfile
@@ -327,6 +329,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_gpu_parallel_execution_enabled = "auto"
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.0
         self.spec_verify_miss_policy = "cpu"
+        self.cache_strategy = "lru"
         self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
@@ -348,6 +351,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
         spec_verify_miss_policy: str = "cpu",
+        cache_strategy: str = "lru",
         gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
         kt_weight_path: str = "",
         kt_method: str = "BF16",
@@ -410,6 +414,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cpu_gpu_parallel_execution_enabled = str(cpu_gpu_parallel_execution_enabled)
         self.cpu_gpu_parallel_min_cpu_route_ratio = float(cpu_gpu_parallel_min_cpu_route_ratio)
         self.spec_verify_miss_policy = str(spec_verify_miss_policy)
+        self.cache_strategy = str(cache_strategy)
         self._parallel_stream = None
         if draft_reroute_policy == ROUND_ROBIN:
             self.draft_reroute_policy = None
@@ -532,40 +537,67 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     active_token_mask=active_token_mask if use_graph_cpu_plan else None,
                 )
         elif self.execution_mode == "verify":
-            if self.spec_verify_miss_policy in {"cache_fill", "cache_fill_no_cpu"}:
+            if self.spec_verify_miss_policy == "cache_fill_no_cpu":
                 _flat_sel = selected_experts.reshape(-1)
-                _total_active = float(_flat_sel.numel())
-                if _total_active > 0:
-                    _flat_cpu = _flat_sel.detach().to(device=torch.device("cpu"), dtype=torch.int64)
-                    _unique_ids, _counts = torch.unique(_flat_cpu, sorted=True, return_counts=True)
-                    _miss_count = sum(
-                        int(_counts[_i].item())
-                        for _i, _eid in enumerate(_unique_ids.tolist())
-                        if not self.expert_cache.is_cached_cpu(int(_eid))
-                    )
-                    profile["pre_transfer_cache_miss_sum"] = float(_miss_count)
-                    profile["pre_transfer_active_count_sum"] = _total_active
-                else:
-                    profile["pre_transfer_cache_miss_sum"] = 0.0
-                    profile["pre_transfer_active_count_sum"] = 0.0
-                apply_verify_cache_fill_policy(
-                    layer_idx=self.layer_idx,
+                active_ids, miss_ids = collect_cache_fill_no_cpu_expert_ids(
                     selected_experts=selected_experts,
-                    routing_weights=routing_weights,
+                    expert_cache=self.expert_cache,
+                    profile=profile,
+                )
+                profile["pre_transfer_active_count_sum"] = float(_flat_sel.numel())
+                profile["activated_expert_set_size_sum"] = float(len(active_ids))
+                fill_result = apply_verify_cache_fill_no_cpu_policy_ids(
+                    layer_idx=self.layer_idx,
+                    active_expert_ids=active_ids,
+                    miss_expert_ids=miss_ids,
                     expert_cache=self.expert_cache,
                     step_id=0,
+                    cache_strategy=self.cache_strategy,
                     profile=profile,
                 )
-            if self.spec_verify_miss_policy == "cache_fill_no_cpu":
-                plan = build_cache_fill_no_cpu_verify_plan_gpu(
-                    layer_idx=self.layer_idx,
-                    selected_experts=selected_experts,
-                    routing_weights=routing_weights,
-                    expert_cache=self.expert_cache,
-                    num_experts=self.num_experts,
-                    profile=profile,
-                )
+                if fill_result.cpu_expert_count > 0:
+                    plan = build_verify_plan_gpu(
+                        layer_idx=self.layer_idx,
+                        selected_experts=selected_experts,
+                        routing_weights=routing_weights,
+                        expert_cache=self.expert_cache,
+                        num_experts=self.num_experts,
+                    )
+                else:
+                    plan = build_cache_fill_no_cpu_verify_plan_gpu(
+                        layer_idx=self.layer_idx,
+                        selected_experts=selected_experts,
+                        routing_weights=routing_weights,
+                        expert_cache=self.expert_cache,
+                        num_experts=self.num_experts,
+                        profile=profile,
+                        check_remaining_misses=False,
+                    )
             else:
+                if self.spec_verify_miss_policy == "cache_fill":
+                    _flat_sel = selected_experts.reshape(-1)
+                    _total_active = float(_flat_sel.numel())
+                    if _total_active > 0:
+                        _flat_cpu = _flat_sel.detach().to(device=torch.device("cpu"), dtype=torch.int64)
+                        _unique_ids, _counts = torch.unique(_flat_cpu, sorted=True, return_counts=True)
+                        _miss_count = sum(
+                            int(_counts[_i].item())
+                            for _i, _eid in enumerate(_unique_ids.tolist())
+                            if not self.expert_cache.is_cached_cpu(int(_eid))
+                        )
+                        profile["pre_transfer_cache_miss_sum"] = float(_miss_count)
+                        profile["pre_transfer_active_count_sum"] = _total_active
+                    else:
+                        profile["pre_transfer_cache_miss_sum"] = 0.0
+                        profile["pre_transfer_active_count_sum"] = 0.0
+                    apply_verify_cache_fill_policy(
+                        layer_idx=self.layer_idx,
+                        selected_experts=selected_experts,
+                        routing_weights=routing_weights,
+                        expert_cache=self.expert_cache,
+                        step_id=0,
+                        profile=profile,
+                    )
                 plan = build_verify_plan_gpu(
                     layer_idx=self.layer_idx,
                     selected_experts=selected_experts,
@@ -580,11 +612,12 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         flat_selected = selected_experts.reshape(-1).to(torch.int64)
         profile["moe_profile_count"] = 1.0
         is_stream_capturing = bool(flat_selected.is_cuda and torch.cuda.is_current_stream_capturing())
-        if is_stream_capturing:
-            # torch.unique() may not be graph-capture-safe on current runtime.
-            profile["activated_expert_set_size_sum"] = 0.0
-        else:
-            profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
+        if "activated_expert_set_size_sum" not in profile:
+            if is_stream_capturing:
+                # torch.unique() may not be graph-capture-safe on current runtime.
+                profile["activated_expert_set_size_sum"] = 0.0
+            else:
+                profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
 
         out = heterogeneous_moe_forward(
             hidden_states=hidden_states,
@@ -968,6 +1001,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         cpu_gpu_parallel_execution_enabled: str = "auto",
         cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
         spec_verify_miss_policy: str = "cpu",
+        cache_strategy: str = "lru",
         gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
         kt_weight_path: str = "",
         kt_method: str = "BF16",
@@ -1005,6 +1039,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     cpu_gpu_parallel_execution_enabled=cpu_gpu_parallel_execution_enabled,
                     cpu_gpu_parallel_min_cpu_route_ratio=cpu_gpu_parallel_min_cpu_route_ratio,
                     spec_verify_miss_policy=spec_verify_miss_policy,
+                    cache_strategy=cache_strategy,
                     gpu_fallback_workspace=gpu_fallback_workspace,
                     kt_weight_path=kt_weight_path,
                     kt_method=kt_method,
