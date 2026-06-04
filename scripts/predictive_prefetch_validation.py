@@ -47,7 +47,7 @@ def max_draft_tokens_for_ratio(ratio: float) -> int:
         return 2
     if rounded <= 0.50:
         return 6
-    return 8
+    return 10
 
 
 def assess_text_quality(text: str) -> dict[str, Any]:
@@ -568,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
-    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cpu")
+    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cache_fill_no_cpu")
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
     p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=16384)

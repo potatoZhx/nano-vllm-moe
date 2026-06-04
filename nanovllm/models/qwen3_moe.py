@@ -532,14 +532,23 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     active_token_mask=active_token_mask if use_graph_cpu_plan else None,
                 )
         elif self.execution_mode == "verify":
+            # ── pre-transfer measurement (shared across all verify miss policies) ──
+            _flat_sel = selected_experts.reshape(-1)
+            _total_active = float(_flat_sel.numel())
+            if _total_active > 0:
+                _, _gpu_mask = self.expert_cache.remap_experts_to_slots(selected_experts)
+                profile["pre_transfer_cache_miss_sum"] = float((~_gpu_mask).sum().item())
+                profile["pre_transfer_active_count_sum"] = _total_active
+            else:
+                profile["pre_transfer_cache_miss_sum"] = 0.0
+                profile["pre_transfer_active_count_sum"] = 0.0
+
             if self.spec_verify_miss_policy == "cache_fill_no_cpu":
-                _flat_sel = selected_experts.reshape(-1)
                 active_ids, miss_ids = collect_cache_fill_no_cpu_expert_ids(
                     selected_experts=selected_experts,
                     expert_cache=self.expert_cache,
                     profile=profile,
                 )
-                profile["pre_transfer_active_count_sum"] = float(_flat_sel.numel())
                 profile["activated_expert_set_size_sum"] = float(len(active_ids))
                 fill_result = apply_verify_cache_fill_no_cpu_policy_ids(
                     layer_idx=self.layer_idx,
@@ -570,21 +579,6 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     )
             else:
                 if self.spec_verify_miss_policy == "cache_fill":
-                    _flat_sel = selected_experts.reshape(-1)
-                    _total_active = float(_flat_sel.numel())
-                    if _total_active > 0:
-                        _flat_cpu = _flat_sel.detach().to(device=torch.device("cpu"), dtype=torch.int64)
-                        _unique_ids, _counts = torch.unique(_flat_cpu, sorted=True, return_counts=True)
-                        _miss_count = sum(
-                            int(_counts[_i].item())
-                            for _i, _eid in enumerate(_unique_ids.tolist())
-                            if not self.expert_cache.is_cached_cpu(int(_eid))
-                        )
-                        profile["pre_transfer_cache_miss_sum"] = float(_miss_count)
-                        profile["pre_transfer_active_count_sum"] = _total_active
-                    else:
-                        profile["pre_transfer_cache_miss_sum"] = 0.0
-                        profile["pre_transfer_active_count_sum"] = 0.0
                     apply_verify_cache_fill_policy(
                         layer_idx=self.layer_idx,
                         selected_experts=selected_experts,

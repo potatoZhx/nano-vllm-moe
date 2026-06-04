@@ -279,11 +279,12 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
     )
     pre_transfer_miss = float(ep.get("model_pre_transfer_cache_miss", 0.0) or 0.0)
     pre_transfer_active = float(ep.get("model_pre_transfer_active_count", 0.0) or 0.0)
-    true_route_hit_rate = float(
-        max(0.0, min(1.0, 1.0 - (pre_transfer_miss / pre_transfer_active)))
-        if pre_transfer_active > 0
-        else 0.0
-    )
+    if pre_transfer_active > 0:
+        true_route_hit_rate = float(max(0.0, min(1.0, 1.0 - (pre_transfer_miss / pre_transfer_active))))
+    else:
+        # Fallback for old benchmarks without pre-transfer data:
+        # use post-transfer cpu_route_ratio (accurate for "cpu" mode, inflated for cache_fill modes)
+        true_route_hit_rate = float(max(0.0, min(1.0, 1.0 - cpu_route_ratio)))
     m3 = _m3_perfect_fraction(
         raw.get("draft_layer_events", []),
         draft_steps_per_step=list(ep.get("spec_draft_steps_per_step", []) or []),
