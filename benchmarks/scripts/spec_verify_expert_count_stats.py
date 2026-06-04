@@ -277,6 +277,13 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
     cpu_weight_mass_ratio = float(
         ep.get("model_cpu_weight_mass_ratio", ep.get("cpu_weight_mass_ratio", 0.0)) or 0.0
     )
+    pre_transfer_miss = float(ep.get("model_pre_transfer_cache_miss", 0.0) or 0.0)
+    pre_transfer_active = float(ep.get("model_pre_transfer_active_count", 0.0) or 0.0)
+    true_route_hit_rate = float(
+        max(0.0, min(1.0, 1.0 - (pre_transfer_miss / pre_transfer_active)))
+        if pre_transfer_active > 0
+        else 0.0
+    )
     m3 = _m3_perfect_fraction(
         raw.get("draft_layer_events", []),
         draft_steps_per_step=list(ep.get("spec_draft_steps_per_step", []) or []),
@@ -324,6 +331,10 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "weight_miss_rate": cpu_weight_mass_ratio,
             "activated_expert_set_size": float(ep.get("model_activated_expert_set_size", 0.0) or 0.0),
             "realized_cpu_expert_count": float(ep.get("model_realized_cpu_expert_count", 0.0) or 0.0),
+            "true_route_hit_rate": true_route_hit_rate,
+            "true_route_miss_rate": float(1.0 - true_route_hit_rate),
+            "avg_miss_per_layer": pre_transfer_miss,
+            "avg_active_per_layer": pre_transfer_active,
         },
         "prefetch": {
             "enabled": bool(raw.get("case", {}).get("prefetch_enabled", False)),
@@ -352,6 +363,16 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "evicted_expert_count": int(ep.get("model_verify_cache_fill_evicted_expert_count", 0) or 0),
             "skipped_pending_count": int(ep.get("model_verify_cache_fill_skipped_pending_count", 0) or 0),
             "transfer_ms_total": float(ep.get("model_verify_cache_fill_transfer_ms", 0.0)),
+            "no_cpu_remaining_miss_count": int(
+                ep.get("model_verify_cache_fill_no_cpu_remaining_miss_count", 0) or 0
+            ),
+            "no_cpu_remaining_miss_expert_count": int(
+                ep.get("model_verify_cache_fill_no_cpu_remaining_miss_expert_count", 0) or 0
+            ),
+            "no_cpu_remaining_miss_route_count": int(
+                ep.get("model_verify_cache_fill_no_cpu_remaining_miss_route_count", 0) or 0
+            ),
+            "no_cpu_fallback_count": int(ep.get("model_verify_cache_fill_no_cpu_fallback_count", 0) or 0),
         },
         "acceptance": _acceptance_stats(ep),
         "m3": m3,
@@ -900,7 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
     p.add_argument("--cpu-gpu-parallel-execution-enabled", default="auto")
     p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.0)
-    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill"], default="cpu")
+    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cpu")
     p.add_argument("--max-num-batched-tokens", type=int, default=512)
     p.add_argument("--max-num-seqs", type=int, default=1)
     p.add_argument("--max-model-len", type=int, default=512)

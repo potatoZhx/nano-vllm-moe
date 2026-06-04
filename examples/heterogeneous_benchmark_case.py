@@ -292,7 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--spec-enable-prefetch", type=str2bool, default=True)
     parser.add_argument("--spec-verify-miss-policy", type=str, default="cache_fill",
-                        choices=["cpu", "cache_fill"])
+                        choices=["cpu", "cache_fill", "cache_fill_no_cpu"])
     parser.add_argument("--cache-strategy", type=str, default="lru")
     parser.add_argument("--prefetch-strategy", type=str, default="history_window")
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)

@@ -835,11 +835,15 @@ class ModelRunner:
             out["cpu_weight_mass_ratio"] = float(self._profile.get("cpu_weight_mass_ratio_sum", 0.0) / profile_count)
             out["activated_expert_set_size"] = float(self._profile.get("activated_expert_set_size_sum", 0.0) / profile_count)
             out["realized_cpu_expert_count"] = float(self._profile.get("realized_cpu_expert_count_sum", 0.0) / profile_count)
+            out["pre_transfer_cache_miss"] = float(self._profile.get("pre_transfer_cache_miss_sum", 0.0) / profile_count)
+            out["pre_transfer_active_count"] = float(self._profile.get("pre_transfer_active_count_sum", 0.0) / profile_count)
         else:
             out["cpu_route_ratio"] = 0.0
             out["cpu_weight_mass_ratio"] = 0.0
             out["activated_expert_set_size"] = 0.0
             out["realized_cpu_expert_count"] = 0.0
+            out["pre_transfer_cache_miss"] = 0.0
+            out["pre_transfer_active_count"] = 0.0
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         if prefetch_runtime is not None:
             with self._prefetch_runtime_lock:

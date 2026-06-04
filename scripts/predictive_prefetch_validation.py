@@ -130,7 +130,10 @@ def _row_from_raw(case: dict[str, Any], raw: dict[str, Any], quality: dict[str, 
         "elapsed_sec": float(elapsed_sec),
         "generated_output_tokens": int(raw.get("generated_output_tokens", 0) or 0),
         "acceptance_rate": float(acceptance.get("acceptance_rate", 0.0) or 0.0),
-        "route_hit_rate": float(cache.get("route_hit_rate", 0.0) or 0.0),
+        "route_hit_rate": float(cache.get("true_route_hit_rate", cache.get("route_hit_rate", 0.0)) or 0.0),
+        "route_hit_rate_post_transfer": float(cache.get("route_hit_rate", 0.0) or 0.0),
+        "avg_miss_per_layer": float(cache.get("avg_miss_per_layer", 0.0) or 0.0),
+        "avg_active_per_layer": float(cache.get("avg_active_per_layer", 0.0) or 0.0),
         "weight_hit_rate": float(cache.get("weight_hit_rate", 0.0) or 0.0),
         "throughput_output_tok_s": float(summary.get("throughput_output_tok_s", 0.0) or 0.0),
         "decode_phase_output_tok_s": float(summary.get("decode_phase_output_tok_s", 0.0) or 0.0),
@@ -213,7 +216,7 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         "--acceptance-threshold",
         str(args.acceptance_threshold),
         "--spec-verify-miss-policy",
-        "cache_fill",
+        args.spec_verify_miss_policy,
         "--cache-strategy",
         "lru",
         "--cpu-expert-backend",
@@ -294,6 +297,8 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
     row = _row_from_raw(case, raw, quality, elapsed)
     print(
         f"  accept={row['acceptance_rate']:.4f} hit={row['route_hit_rate']:.4f} "
+        f"post_xfer_hit={row['route_hit_rate_post_transfer']:.4f} "
+        f"miss/layer={row['avg_miss_per_layer']:.2f} active/layer={row['avg_active_per_layer']:.2f} "
         f"tok/s={row['throughput_output_tok_s']:.3f} draft_ms={row['draft_forward_ms_avg']:.3f} "
         f"verify_ms={row['verify_forward_ms_avg']:.3f} graph={row['draft_graph_replay_count']} "
         f"perfect={row['perfect_fraction']:.4f} step0={row['step0_perfect_fraction']:.4f} "
@@ -322,6 +327,7 @@ def _delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "cache_ratio": float(row["cache_ratio"]),
                 "acceptance_delta": float(row["acceptance_rate"]) - float(legacy["acceptance_rate"]),
                 "route_hit_delta": float(row["route_hit_rate"]) - float(legacy["route_hit_rate"]),
+                "avg_miss_per_layer_delta": float(row["avg_miss_per_layer"]) - float(legacy["avg_miss_per_layer"]),
                 "throughput_delta": float(row["throughput_output_tok_s"]) - float(legacy["throughput_output_tok_s"]),
                 "draft_forward_ms_delta": float(row["draft_forward_ms_avg"]) - float(legacy["draft_forward_ms_avg"]),
                 "verify_forward_ms_delta": float(row["verify_forward_ms_avg"]) - float(legacy["verify_forward_ms_avg"]),
@@ -370,7 +376,7 @@ def write_markdown_report(
         "| Reroute policy | `entropy_cache_bias` |",
         "| Prefetch mode | `draft_segment_indexed` |",
         "| Expert cache strategy | `lru` seeded by offline profile |",
-        "| Verify miss policy | `cache_fill` |",
+        f"| Verify miss policy | `{metadata.get('spec_verify_miss_policy', '')}` |",
         "",
         "### 1.3 Common Settings",
         "",
@@ -387,6 +393,10 @@ def write_markdown_report(
         "",
         "Metric definitions:",
         "",
+        "- `true hit`: cache hit rate measured BEFORE `cache_fill` transfers miss experts into cache slots.",
+        "- `post-xfer hit`: cache hit rate measured AFTER transfers (legacy metric, artificially high).",
+        "- `miss/layer`: average number of miss routes per MoE layer forward (pre-transfer).",
+        "- `active/layer`: average number of active routes per MoE layer forward (= tokens * top_k).",
         "- `perfect_fraction`: fraction of draft forwards where every recorded MoE layer had zero CPU experts.",
         "- `step0_perfect_fraction`: same metric restricted to the first draft forward of each speculative step.",
         "- `prefetch submit/done/used`: benchmark `submit_count/completed_count/consumed_count`.",
@@ -412,8 +422,8 @@ def write_markdown_report(
         "",
         "## 3. Results",
         "",
-        "| kind | out | ratio | K | accept | route hit | weight hit | output tok/s | draft ms | verify ms | graph | prefetch submit/done/used | phase1 | verify-layer | perfect | step0 perfect | text |",
-        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|---:|---:|:---|",
+        "| kind | out | ratio | K | accept | true hit | post-xfer hit | miss/layer | active/layer | weight hit | output tok/s | draft ms | verify ms | graph | prefetch submit/done/used | phase1 | verify-layer | perfect | step0 perfect | text |",
+        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|---:|---:|:---|",
     ]
     for row in rows:
         lines.append(
@@ -424,6 +434,9 @@ def write_markdown_report(
             f"{row['max_draft_tokens']} | "
             f"{row['acceptance_rate']:.4f} | "
             f"{row['route_hit_rate']:.4f} | "
+            f"{row['route_hit_rate_post_transfer']:.4f} | "
+            f"{row['avg_miss_per_layer']:.2f} | "
+            f"{row['avg_active_per_layer']:.2f} | "
             f"{row['weight_hit_rate']:.4f} | "
             f"{row['throughput_output_tok_s']:.3f} | "
             f"{row['draft_forward_ms_avg']:.3f} | "
@@ -444,8 +457,8 @@ def write_markdown_report(
             "",
             "Positive throughput, acceptance, cache hit, and perfect-fraction deltas are improvements. Negative draft/verify ms deltas are improvements.",
             "",
-            "| out | ratio | accept delta | route-hit delta | tok/s delta | draft ms delta | verify ms delta | perfect delta | step0 perfect delta |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| out | ratio | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | perfect delta | step0 perfect delta |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in deltas:
@@ -455,6 +468,7 @@ def write_markdown_report(
             f"{row['cache_ratio']:.2f} | "
             f"{row['acceptance_delta']:+.4f} | "
             f"{row['route_hit_delta']:+.4f} | "
+            f"{row['avg_miss_per_layer_delta']:+.2f} | "
             f"{row['throughput_delta']:+.3f} | "
             f"{row['draft_forward_ms_delta']:+.3f} | "
             f"{row['verify_forward_ms_delta']:+.3f} | "
@@ -516,6 +530,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "output_lens": sorted({int(case["output_len"]) for case in cases}),
         "cpu_expert_backend": args.cpu_expert_backend,
         "cpu_expert_workspace_max_routes": int(args.cpu_expert_workspace_max_routes),
+        "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "max_model_len": int(args.max_model_len),
         "argv": sys.argv,
     }
@@ -553,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
+    p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cpu")
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
     p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=16384)

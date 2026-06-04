@@ -90,6 +90,8 @@ class LLMEngine:
             "cpu_weight_mass_ratio": "model_cpu_weight_mass_ratio",
             "activated_expert_set_size": "model_activated_expert_set_size",
             "realized_cpu_expert_count": "model_realized_cpu_expert_count",
+            "pre_transfer_cache_miss": "model_pre_transfer_cache_miss",
+            "pre_transfer_active_count": "model_pre_transfer_active_count",
             "prefetch_submit_count": "model_prefetch_submit_count",
             "prefetch_completed_count": "model_prefetch_completed_count",
             "prefetch_late_count": "model_prefetch_late_count",

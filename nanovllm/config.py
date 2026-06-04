@@ -170,7 +170,7 @@ class Config:
         assert self.draft_prefetch_min_per_boundary >= 0
         assert self.draft_prefetch_max_per_boundary >= self.draft_prefetch_min_per_boundary
         assert self.acceptance_strategy in {"greedy", "standard", "standard_sampling", "sampling", "spec_sampling"}
-        assert self.spec_verify_miss_policy in {"cpu", "cache_fill"}
+        assert self.spec_verify_miss_policy in {"cpu", "cache_fill", "cache_fill_no_cpu"}
         assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}
         assert self.cpu_expert_workspace_max_routes >= 1
         assert self.cpu_expert_packed_min_routes >= 1

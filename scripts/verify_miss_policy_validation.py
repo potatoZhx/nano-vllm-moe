@@ -33,9 +33,9 @@ PROMPT_TEXT = (
 
 
 MAX_DRAFT_BY_RATIO = {
-    0.25: 3,
+    0.25: 2,
     0.5: 5,
-    0.75: 7,
+    0.75: 8,
 }
 
 
@@ -115,6 +115,8 @@ def _row_from_raw(name: str, raw: dict[str, Any], quality: dict[str, Any]) -> di
         "verify_cache_fill_cpu_expert_count": verify_cache_fill.get("cpu_expert_count", 0),
         "verify_cache_fill_evicted_expert_count": verify_cache_fill.get("evicted_expert_count", 0),
         "verify_cache_fill_transfer_ms_total": verify_cache_fill.get("transfer_ms_total", 0.0),
+        "verify_cache_fill_no_cpu_remaining_miss_count": verify_cache_fill.get("no_cpu_remaining_miss_count", 0),
+        "verify_cache_fill_no_cpu_fallback_count": verify_cache_fill.get("no_cpu_fallback_count", 0),
         "elapsed_sec": raw.get("elapsed_sec", 0.0),
         "generated_output_tokens": raw.get("generated_output_tokens", 0),
         "outputs_digest": raw.get("outputs_digest", ""),
@@ -186,7 +188,7 @@ def run_case(
         "--acceptance-threshold",
         str(args.acceptance_threshold),
         "--cache-strategy",
-        "lru",
+        "lfu",
         "--spec-verify-miss-policy",
         policy,
         "--cpu-expert-backend",
@@ -272,8 +274,8 @@ def write_markdown(rows: list[dict[str, Any]], path: Path) -> None:
     lines = [
         "# Verify Miss Policy Validation",
         "",
-        "| policy | ratio | out | max draft | accept | cache hit | output tok/s | decode tok/s | draft ms | verify ms | graph replays | prefetch submit/done/used | verify-layer submit/done/used | cache-fill promoted/cpu/evicted | text |",
-        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|:---|:---|",
+        "| policy | ratio | out | max draft | accept | cache hit | output tok/s | decode tok/s | draft ms | verify ms | graph replays | prefetch submit/done/used | verify-layer submit/done/used | cache-fill promoted/cpu/evicted | no-cpu miss/fallback | text |",
+        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|:---|:---|:---|",
     ]
     for row in rows:
         lines.append(
@@ -292,6 +294,7 @@ def write_markdown(rows: list[dict[str, Any]], path: Path) -> None:
             f"{int(row['prefetch_submit_count'])}/{int(row['prefetch_completed_count'])}/{int(row['prefetch_consumed_count'])} | "
             f"{int(row['verify_layer_prefetch_submit_count'])}/{int(row['verify_layer_prefetch_done_count'])}/{int(row['verify_layer_prefetch_used_count'])} | "
             f"{int(row['verify_cache_fill_promoted_expert_count'])}/{int(row['verify_cache_fill_cpu_expert_count'])}/{int(row['verify_cache_fill_evicted_expert_count'])} | "
+            f"{int(row['verify_cache_fill_no_cpu_remaining_miss_count'])}/{int(row['verify_cache_fill_no_cpu_fallback_count'])} | "
             f"{'ok' if row['text_quality_ok'] else ','.join(row['text_quality_reasons'])} |"
         )
 
@@ -318,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors",
     )
     parser.add_argument("--output-dir", default="")
-    parser.add_argument("--policies", default="cpu,cache_fill")
+    parser.add_argument("--policies", default="cpu,cache_fill,cache_fill_no_cpu")
     parser.add_argument("--output-lens", default="128,512")
     parser.add_argument("--cache-ratios", default="0.25,0.5,0.75")
     parser.add_argument("--acceptance-strategy", default="standard_sampling")
@@ -388,7 +391,7 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
     case_index = 0
     for policy in policies:
-        if policy not in {"cpu", "cache_fill"}:
+        if policy not in {"cpu", "cache_fill", "cache_fill_no_cpu"}:
             raise ValueError(f"unsupported policy: {policy}")
         for out_len in output_lens:
             for ratio in ratios:

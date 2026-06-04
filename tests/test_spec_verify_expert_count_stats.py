@@ -76,6 +76,42 @@ class TestSpecVerifyExpertCountStats(unittest.TestCase):
 
         self.assertEqual(summary["cache"]["route_hit_rate"], 0.75)
 
+    def test_summary_reports_cache_fill_no_cpu_counters(self):
+        summary = self.mod._summarize_case(
+            {
+                "case": {"spec_verify_miss_policy": "cache_fill_no_cpu"},
+                "generated_output_tokens": 16,
+                "throughput_output_tok_s": 2.0,
+                "engine_profile": {
+                    "model_verify_cache_fill_no_cpu_remaining_miss_count": 3,
+                    "model_verify_cache_fill_no_cpu_remaining_miss_expert_count": 2,
+                    "model_verify_cache_fill_no_cpu_remaining_miss_route_count": 3,
+                    "model_verify_cache_fill_no_cpu_fallback_count": 1,
+                    "spec_step_traces": [],
+                },
+            },
+            [],
+        )
+
+        self.assertEqual(summary["verify_cache_fill"]["policy"], "cache_fill_no_cpu")
+        self.assertEqual(summary["verify_cache_fill"]["no_cpu_remaining_miss_count"], 3)
+        self.assertEqual(summary["verify_cache_fill"]["no_cpu_remaining_miss_expert_count"], 2)
+        self.assertEqual(summary["verify_cache_fill"]["no_cpu_remaining_miss_route_count"], 3)
+        self.assertEqual(summary["verify_cache_fill"]["no_cpu_fallback_count"], 1)
+
+    def test_parser_accepts_cache_fill_no_cpu_policy(self):
+        args = self.mod.build_parser().parse_args(
+            [
+                "--single-case",
+                "--output",
+                "/tmp/out.json",
+                "--spec-verify-miss-policy",
+                "cache_fill_no_cpu",
+            ]
+        )
+
+        self.assertEqual(args.spec_verify_miss_policy, "cache_fill_no_cpu")
+
     def test_m3_perfect_fraction_groups_draft_layers_and_step0(self):
         events = [
             {"layer_idx": 0, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},

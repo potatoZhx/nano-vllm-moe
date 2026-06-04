@@ -25,6 +25,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
     apply_verify_cache_fill_policy,
+    build_cache_fill_no_cpu_verify_plan_gpu,
     build_cached_draft_plan_gpu,
     build_draft_plan_gpu,
     build_prefill_plan_gpu,
@@ -526,7 +527,22 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     active_token_mask=active_token_mask if use_graph_cpu_plan else None,
                 )
         elif self.execution_mode == "verify":
-            if self.spec_verify_miss_policy == "cache_fill":
+            if self.spec_verify_miss_policy in {"cache_fill", "cache_fill_no_cpu"}:
+                _flat_sel = selected_experts.reshape(-1)
+                _total_active = float(_flat_sel.numel())
+                if _total_active > 0:
+                    _flat_cpu = _flat_sel.detach().to(device=torch.device("cpu"), dtype=torch.int64)
+                    _unique_ids, _counts = torch.unique(_flat_cpu, sorted=True, return_counts=True)
+                    _miss_count = sum(
+                        int(_counts[_i].item())
+                        for _i, _eid in enumerate(_unique_ids.tolist())
+                        if not self.expert_cache.is_cached_cpu(int(_eid))
+                    )
+                    profile["pre_transfer_cache_miss_sum"] = float(_miss_count)
+                    profile["pre_transfer_active_count_sum"] = _total_active
+                else:
+                    profile["pre_transfer_cache_miss_sum"] = 0.0
+                    profile["pre_transfer_active_count_sum"] = 0.0
                 apply_verify_cache_fill_policy(
                     layer_idx=self.layer_idx,
                     selected_experts=selected_experts,
@@ -535,13 +551,23 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     step_id=0,
                     profile=profile,
                 )
-            plan = build_verify_plan_gpu(
-                layer_idx=self.layer_idx,
-                selected_experts=selected_experts,
-                routing_weights=routing_weights,
-                expert_cache=self.expert_cache,
-                num_experts=self.num_experts,
-            )
+            if self.spec_verify_miss_policy == "cache_fill_no_cpu":
+                plan = build_cache_fill_no_cpu_verify_plan_gpu(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    expert_cache=self.expert_cache,
+                    num_experts=self.num_experts,
+                    profile=profile,
+                )
+            else:
+                plan = build_verify_plan_gpu(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    expert_cache=self.expert_cache,
+                    num_experts=self.num_experts,
+                )
         else:
             plan = None
         profile["plan_ms"] = (perf_counter() - t_plan0) * 1000.0
@@ -600,6 +626,11 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 profile["cpu_routes_sum"] = 0.0
                 profile["cpu_weight_mass_ratio_sum"] = 0.0
                 profile["realized_cpu_expert_count_sum"] = 0.0
+
+        if "pre_transfer_cache_miss_sum" not in profile:
+            profile["pre_transfer_cache_miss_sum"] = 0.0
+        if "pre_transfer_active_count_sum" not in profile:
+            profile["pre_transfer_active_count_sum"] = 0.0
 
         self._last_profile = profile
         return out

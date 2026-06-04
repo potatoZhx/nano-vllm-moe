@@ -431,6 +431,88 @@ def build_prefill_plan_gpu(
     )
 
 
+def build_cache_fill_no_cpu_verify_plan_gpu(
+    layer_idx: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    num_experts: int,
+    profile: dict[str, float] | None = None,
+) -> MoEExecutionPlan:
+    """Build a verify plan optimized for cache-fill cases that become all-GPU.
+
+    `cache_fill_no_cpu` expects the demand-load step to make every active route
+    resident before expert compute. When that invariant holds, this avoids the
+    generic prefill/verify CPU-route layout and returns a GPU-only plan. If the
+    invariant is violated, keep correctness by falling back to the generic plan
+    and record how many miss experts/routes remained after cache-fill.
+    """
+    flat_selected = _flatten_experts(selected_experts)
+    _ = routing_weights, num_experts
+    gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
+    remaining_miss_mask = gpu_slots.lt(0)
+    remaining_route_count = int(remaining_miss_mask.sum().item()) if flat_selected.numel() > 0 else 0
+    remaining_expert_count = 0
+    if remaining_route_count > 0:
+        remaining_expert_count = int(torch.unique(flat_selected[remaining_miss_mask]).numel())
+
+    if profile is not None:
+        profile["verify_cache_fill_no_cpu_remaining_miss_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_count", 0.0) + remaining_expert_count
+        )
+        profile["verify_cache_fill_no_cpu_remaining_miss_expert_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_expert_count", 0.0) + remaining_expert_count
+        )
+        profile["verify_cache_fill_no_cpu_remaining_miss_route_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_remaining_miss_route_count", 0.0) + remaining_route_count
+        )
+
+    if remaining_route_count > 0:
+        if profile is not None:
+            profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+                profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0) + 1.0
+            )
+        return build_prefill_plan_gpu(
+            layer_idx=layer_idx,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            expert_cache=expert_cache,
+            num_experts=num_experts,
+        )
+
+    if profile is not None:
+        profile["verify_cache_fill_no_cpu_fallback_count"] = float(
+            profile.get("verify_cache_fill_no_cpu_fallback_count", 0.0)
+        )
+
+    gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=flat_selected.device)
+    if gpu_route_indices.numel() > 0:
+        m_sizes, gpu_route_indices = _build_grouped_layout(
+            gpu_slots,
+            gpu_route_indices,
+            expert_cache.num_slots,
+        )
+    else:
+        m_sizes = None
+    gpu_route_mask = torch.ones_like(flat_selected, dtype=torch.bool)
+    cpu_route_mask = torch.zeros_like(flat_selected, dtype=torch.bool)
+    return MoEExecutionPlan(
+        layer_idx=layer_idx,
+        gpu_route_indices=gpu_route_indices,
+        gpu_m_sizes=m_sizes,
+        cpu_route_indices=None,
+        cpu_task_expert_ids=None,
+        cpu_task_offsets=None,
+        cpu_task_expert_ids_host=None,
+        cpu_task_offsets_host=None,
+        flat_selected_original=flat_selected,
+        flat_selected_effective=flat_selected,
+        substitution_lut=None,
+        gpu_route_mask=gpu_route_mask,
+        cpu_route_mask=cpu_route_mask,
+    )
+
+
 def build_draft_plan(
     layer_idx: int,
     selected_experts: torch.Tensor,

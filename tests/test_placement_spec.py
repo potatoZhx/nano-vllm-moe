@@ -5,6 +5,7 @@ import torch
 from nanovllm.expert.cache import LayerExpertCache
 from nanovllm.expert.placement import (
     apply_verify_cache_fill_policy,
+    build_cache_fill_no_cpu_verify_plan_gpu,
     build_draft_plan,
     build_prefill_plan,
     build_verify_plan,
@@ -156,6 +157,62 @@ class TestPlacementSpec(unittest.TestCase):
         self.assertTrue(cache.is_cached_cpu(5))
         self.assertFalse(cache.is_cached_cpu(2))
         self.assertEqual(result.skipped_pending_count, 1)
+
+    def test_cache_fill_no_cpu_plan_uses_gpu_only_after_all_misses_loaded(self):
+        cache = self._build_cache_with_slots(slots=4, cached=[0, 1])
+        selected = torch.tensor([[0, 2], [3, 2]], dtype=torch.int64)
+        routing_w = torch.ones(2, 2, dtype=torch.float32)
+        profile = {}
+
+        apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=11,
+            profile=profile,
+        )
+        plan = build_cache_fill_no_cpu_verify_plan_gpu(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            num_experts=8,
+            profile=profile,
+        )
+
+        self.assertIsNone(plan.cpu_route_indices)
+        self.assertIsNone(plan.cpu_task_expert_ids)
+        self.assertEqual(plan.gpu_route_indices.numel(), selected.numel())
+        self.assertEqual(profile["verify_cache_fill_no_cpu_remaining_miss_count"], 0.0)
+        self.assertEqual(profile["verify_cache_fill_no_cpu_fallback_count"], 0.0)
+
+    def test_cache_fill_no_cpu_plan_records_remaining_misses_and_falls_back(self):
+        cache = self._build_cache_with_slots(slots=3, cached=[0, 1])
+        selected = torch.tensor([[0, 1], [2, 2], [3, 4]], dtype=torch.int64)
+        routing_w = torch.ones(3, 2, dtype=torch.float32)
+        profile = {}
+
+        apply_verify_cache_fill_policy(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            step_id=12,
+            profile=profile,
+        )
+        plan = build_cache_fill_no_cpu_verify_plan_gpu(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=routing_w,
+            expert_cache=cache,
+            num_experts=8,
+            profile=profile,
+        )
+
+        self.assertEqual(profile["verify_cache_fill_no_cpu_remaining_miss_count"], 2.0)
+        self.assertEqual(profile["verify_cache_fill_no_cpu_fallback_count"], 1.0)
+        self.assertEqual(plan.cpu_task_expert_ids.tolist(), [3, 4])
 
     def test_prefill_plan_splits_gpu_cpu(self):
         cache = self._build_cache()

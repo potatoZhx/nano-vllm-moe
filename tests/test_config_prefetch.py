@@ -159,6 +159,14 @@ class TestConfigPrefetch(unittest.TestCase):
         )
         self.assertEqual(cfg.spec_verify_miss_policy, "cache_fill")
 
+    def test_verify_cache_fill_no_cpu_policy_can_be_set_explicitly(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            spec_verify_miss_policy="cache_fill_no_cpu",
+        )
+        self.assertEqual(cfg.spec_verify_miss_policy, "cache_fill_no_cpu")
+
     def test_invalid_verify_miss_policy_fails(self):
         with self.assertRaises(AssertionError):
             self._build_config(
