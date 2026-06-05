@@ -42,6 +42,8 @@ class PrefetchTicket:
     active_generation: int = -1
     active_slot_prev_expert: int = -1  # expert evicted by this prefetch (-1 if slot was empty)
     segment_id: int = -1
+    num_bytes: int = 0
+    transfer_enqueue_ms: float = 0.0
 
 
 def compute_priority(
@@ -439,9 +441,94 @@ class PrefetchRuntime:
         self._draft_segment_indexed_ready_by_segment = defaultdict(int)
         self._draft_segment_indexed_success_by_segment = defaultdict(int)
         self._draft_segment_indexed_consumed_by_segment = defaultdict(int)
+        self._prefetch_submit_count_by_source = defaultdict(int)
+        self._prefetch_completed_count_by_source = defaultdict(int)
+        self._prefetch_published_count_by_source = defaultdict(int)
+        self._prefetch_late_count_by_source = defaultdict(int)
+        self._prefetch_submitted_bytes_by_source = defaultdict(int)
+        self._prefetch_completed_bytes_by_source = defaultdict(int)
+        self._prefetch_published_bytes_by_source = defaultdict(int)
+        self._prefetch_late_bytes_by_source = defaultdict(int)
         self._draft_m3_layers_by_step: dict[int, dict[int, bool]] = {}
         self._draft_m3_step0_steps: set[int] = set()
         self._draft_m3_next_is_step0 = True
+
+    @staticmethod
+    def _expert_weight_bytes(weights: dict[str, torch.Tensor]) -> int:
+        return sum(
+            int(weights[name].numel()) * int(weights[name].element_size())
+            for name in ("gate_up", "down")
+        )
+
+    def _begin_prefetch_transfer(
+        self,
+        *,
+        cache: LayerExpertCache,
+        reservation: ActiveReservation | StagingReservation,
+        weights: dict[str, torch.Tensor],
+        source: str,
+        direct_active: bool,
+    ) -> tuple[object, float, float, int]:
+        submit_ts_ms = time.perf_counter() * 1000.0
+        enqueue_t0 = time.perf_counter()
+        if direct_active:
+            ready_event = cache.begin_async_put_to_active(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+        else:
+            ready_event = cache.begin_async_put_to_staging(
+                reservation=reservation,
+                gate_up_cpu=weights["gate_up"],
+                down_cpu=weights["down"],
+                stream=self.transfer_stream,
+            )
+        enqueue_ms = (time.perf_counter() - enqueue_t0) * 1000.0
+        num_bytes = self._expert_weight_bytes(weights)
+        self._profile["prefetch_transfer_enqueue_ms"] += enqueue_ms
+        self._profile[f"{source}_prefetch_transfer_enqueue_ms"] += enqueue_ms
+        return ready_event, submit_ts_ms, enqueue_ms, num_bytes
+
+    def _record_prefetch_submitted(self, ticket: PrefetchTicket) -> None:
+        source = str(ticket.source)
+        num_bytes = int(ticket.num_bytes)
+        self._profile["prefetch_submitted_bytes"] += num_bytes
+        self._profile[f"{source}_prefetch_submitted_bytes"] += num_bytes
+        self._prefetch_submit_count_by_source[source] += 1
+        self._prefetch_submitted_bytes_by_source[source] += num_bytes
+        self._profile["prefetch_max_inflight_observed"] = max(
+            float(self._profile.get("prefetch_max_inflight_observed", 0.0)),
+            float(len(self.inflight)),
+        )
+
+    def _record_prefetch_completed(self, ticket: PrefetchTicket) -> None:
+        source = str(ticket.source)
+        num_bytes = int(ticket.num_bytes)
+        latency_ms = max(0.0, time.perf_counter() * 1000.0 - float(ticket.submit_ts_ms))
+        self._profile["prefetch_completed_bytes"] += num_bytes
+        self._profile["prefetch_completion_latency_ms"] += latency_ms
+        self._profile[f"{source}_prefetch_completed_bytes"] += num_bytes
+        self._profile[f"{source}_prefetch_completion_latency_ms"] += latency_ms
+        self._prefetch_completed_count_by_source[source] += 1
+        self._prefetch_completed_bytes_by_source[source] += num_bytes
+
+    def _record_prefetch_published(self, ticket: PrefetchTicket) -> None:
+        source = str(ticket.source)
+        num_bytes = int(ticket.num_bytes)
+        self._profile["prefetch_published_bytes"] += num_bytes
+        self._profile[f"{source}_prefetch_published_bytes"] += num_bytes
+        self._prefetch_published_count_by_source[source] += 1
+        self._prefetch_published_bytes_by_source[source] += num_bytes
+
+    def _record_prefetch_late(self, ticket: PrefetchTicket) -> None:
+        source = str(ticket.source)
+        num_bytes = int(ticket.num_bytes)
+        self._profile["prefetch_late_bytes"] += num_bytes
+        self._profile[f"{source}_prefetch_late_bytes"] += num_bytes
+        self._prefetch_late_count_by_source[source] += 1
+        self._prefetch_late_bytes_by_source[source] += num_bytes
 
     def _initial_draft_direct_active_budget(self) -> int:
         return max(
@@ -696,24 +783,29 @@ class PrefetchRuntime:
                 cache.cancel_staging_reservation(reservation)
                 continue
 
-            ready_event = cache.begin_async_put_to_staging(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source=str(candidate.source),
+                direct_active=False,
             )
 
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source=candidate.source,
                 staging_slot_idx=reservation.staging_slot_idx,
                 staging_generation=reservation.generation,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             self._profile["prefetch_submit_count"] += 1
             self._profile["staging_prefetch_submit_count"] += 1
@@ -858,28 +950,33 @@ class PrefetchRuntime:
                 self._profile["draft_direct_active_prefetch_skipped_by_pending_count"] += 1
                 continue
 
-            ready_event = cache.begin_async_put_to_active(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source="draft_direct_active",
+                direct_active=True,
             )
 
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source="draft_direct_active",
                 staging_slot_idx=-1,
                 staging_generation=-1,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
                 direct_active=True,
                 active_slot_idx=reservation.active_slot_idx,
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             used_transfer_ms += transfer_ms
             self._profile["prefetch_submit_count"] += 1
@@ -999,31 +1096,36 @@ class PrefetchRuntime:
                 self._profile["draft_segment_indexed_prefetch_skipped_by_pending_count"] += 1
                 continue
 
+            reservation_t0 = time.perf_counter()
             reservation = cache.reserve_active_slot_for_prefetch_deferred(
                 layer_idx=layer_idx,
                 active_slot_idx=victim_slot,
                 expert_idx=expert_idx,
             )
+            self._profile["draft_segment_indexed_prefetch_reservation_ms"] += (
+                time.perf_counter() - reservation_t0
+            ) * 1000.0
             if reservation is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 self._profile["draft_segment_indexed_prefetch_skipped_by_pending_count"] += 1
                 continue
 
-            ready_event = cache.begin_async_put_to_active(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source="draft_segment_indexed",
+                direct_active=True,
             )
 
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source="draft_segment_indexed",
                 staging_slot_idx=-1,
                 staging_generation=-1,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
                 direct_active=True,
@@ -1031,7 +1133,11 @@ class PrefetchRuntime:
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
                 segment_id=segment_id,
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             used_transfer_ms += transfer_ms
             inflight_keys.add(key)
@@ -1248,28 +1354,33 @@ class PrefetchRuntime:
             if reservation is None:
                 continue
 
-            ready_event = cache.begin_async_put_to_active(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source="verify_layer_predict",
+                direct_active=True,
             )
 
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source="verify_layer_predict",
                 staging_slot_idx=-1,
                 staging_generation=-1,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
                 direct_active=True,
                 active_slot_idx=reservation.active_slot_idx,
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             used_budget_ms += transfer_ms
             self._profile["prefetch_submit_count"] += 1
@@ -1303,11 +1414,13 @@ class PrefetchRuntime:
             if not ok:
                 self.inflight.pop(key, None)
                 self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
                 continue
 
             ticket.ready = True
             ready.append(ticket)
             self._profile["prefetch_completed_count"] += 1
+            self._record_prefetch_completed(ticket)
         return ready
 
     def publish_ready(self, step_id: int, max_publish: int | None = None) -> int:
@@ -1348,6 +1461,8 @@ class PrefetchRuntime:
             )
             if published_item is None:
                 self.inflight.pop((ticket.layer_idx, ticket.expert_idx), None)
+                self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
                 continue
 
             self._finalize_publish(cache, published_item)
@@ -1357,6 +1472,7 @@ class PrefetchRuntime:
             published += 1
             self._profile["publish_count"] += 1
             self._profile["staging_prefetch_publish_count"] += 1
+            self._record_prefetch_published(ticket)
 
         publish_ms = (time.perf_counter() - t0) * 1000.0
         self._profile["publish_ms"] += publish_ms
@@ -1383,6 +1499,8 @@ class PrefetchRuntime:
             if not bool(ticket.ready_event.query()):
                 continue
             self._profile["direct_active_prefetch_ready_count"] += 1
+            self._profile["prefetch_completed_count"] += 1
+            self._record_prefetch_completed(ticket)
             if ticket.source == "draft_direct_active":
                 self._profile["draft_direct_active_prefetch_ready_count"] += 1
             elif ticket.source == "draft_segment_indexed":
@@ -1394,6 +1512,8 @@ class PrefetchRuntime:
             cache = self.layer_caches.get(ticket.layer_idx)
             if cache is None:
                 self.inflight.pop(key, None)
+                self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
                 continue
             reservation = ActiveReservation(
                 layer_idx=ticket.layer_idx,
@@ -1411,13 +1531,14 @@ class PrefetchRuntime:
                 if ticket.source == "draft_segment_indexed":
                     cache.cancel_deferred_active_prefetch(reservation)
                 self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
                 continue
             self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
             self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
             published += 1
-            self._profile["prefetch_completed_count"] += 1
             self._profile["publish_count"] += 1
             self._profile["direct_active_prefetch_publish_count"] += 1
+            self._record_prefetch_published(ticket)
             if ticket.source == "draft_direct_active":
                 self._profile["draft_direct_active_prefetch_publish_count"] += 1
             elif ticket.source == "draft_segment_indexed":
@@ -1574,6 +1695,21 @@ class PrefetchRuntime:
             "prefetch_submit_count": int(self._profile.get("prefetch_submit_count", 0.0)),
             "prefetch_completed_count": int(self._profile.get("prefetch_completed_count", 0.0)),
             "prefetch_late_count": int(self._profile.get("prefetch_late_count", 0.0)),
+            "prefetch_submitted_bytes": int(self._profile.get("prefetch_submitted_bytes", 0.0)),
+            "prefetch_completed_bytes": int(self._profile.get("prefetch_completed_bytes", 0.0)),
+            "prefetch_published_bytes": int(self._profile.get("prefetch_published_bytes", 0.0)),
+            "prefetch_late_bytes": int(self._profile.get("prefetch_late_bytes", 0.0)),
+            "prefetch_transfer_enqueue_ms": float(self._profile.get("prefetch_transfer_enqueue_ms", 0.0)),
+            "prefetch_completion_latency_ms": float(self._profile.get("prefetch_completion_latency_ms", 0.0)),
+            "prefetch_max_inflight_observed": int(self._profile.get("prefetch_max_inflight_observed", 0.0)),
+            "prefetch_submit_count_by_source": dict(self._prefetch_submit_count_by_source),
+            "prefetch_completed_count_by_source": dict(self._prefetch_completed_count_by_source),
+            "prefetch_published_count_by_source": dict(self._prefetch_published_count_by_source),
+            "prefetch_late_count_by_source": dict(self._prefetch_late_count_by_source),
+            "prefetch_submitted_bytes_by_source": dict(self._prefetch_submitted_bytes_by_source),
+            "prefetch_completed_bytes_by_source": dict(self._prefetch_completed_bytes_by_source),
+            "prefetch_published_bytes_by_source": dict(self._prefetch_published_bytes_by_source),
+            "prefetch_late_bytes_by_source": dict(self._prefetch_late_bytes_by_source),
             "prefetch_wait_ms": float(self._profile.get("prefetch_wait_ms", 0.0)),
             "prefetch_consumed_count": int(self._profile.get("prefetch_consumed_count", 0.0)),
             "prefetch_timeout_count": int(self._profile.get("prefetch_timeout_count", 0.0)),
@@ -1664,6 +1800,27 @@ class PrefetchRuntime:
             "draft_segment_indexed_prefetch_used_transfer_budget_ms": float(self._profile.get("draft_segment_indexed_prefetch_used_transfer_budget_ms", 0.0)),
             "draft_segment_indexed_rank_ms": float(self._profile.get("draft_segment_indexed_rank_ms", 0.0)),
             "draft_segment_indexed_victim_select_ms": float(self._profile.get("draft_segment_indexed_victim_select_ms", 0.0)),
+            "draft_segment_indexed_prefetch_reservation_ms": float(
+                self._profile.get("draft_segment_indexed_prefetch_reservation_ms", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_transfer_enqueue_ms": float(
+                self._profile.get("draft_segment_indexed_prefetch_transfer_enqueue_ms", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_completion_latency_ms": float(
+                self._profile.get("draft_segment_indexed_prefetch_completion_latency_ms", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_submitted_bytes": int(
+                self._profile.get("draft_segment_indexed_prefetch_submitted_bytes", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_completed_bytes": int(
+                self._profile.get("draft_segment_indexed_prefetch_completed_bytes", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_published_bytes": int(
+                self._profile.get("draft_segment_indexed_prefetch_published_bytes", 0.0)
+            ),
+            "draft_segment_indexed_prefetch_late_bytes": int(
+                self._profile.get("draft_segment_indexed_prefetch_late_bytes", 0.0)
+            ),
             "draft_segment_indexed_candidate_scan_count": int(self._profile.get("draft_segment_indexed_candidate_scan_count", 0.0)),
             "draft_segment_indexed_candidate_ranked_count": int(self._profile.get("draft_segment_indexed_candidate_ranked_count", 0.0)),
             "draft_segment_indexed_candidate_merge_count": int(self._profile.get("draft_segment_indexed_candidate_merge_count", 0.0)),
@@ -1709,6 +1866,14 @@ class PrefetchRuntime:
             self._draft_segment_indexed_ready_by_segment.clear()
             self._draft_segment_indexed_success_by_segment.clear()
             self._draft_segment_indexed_consumed_by_segment.clear()
+            self._prefetch_submit_count_by_source.clear()
+            self._prefetch_completed_count_by_source.clear()
+            self._prefetch_published_count_by_source.clear()
+            self._prefetch_late_count_by_source.clear()
+            self._prefetch_submitted_bytes_by_source.clear()
+            self._prefetch_completed_bytes_by_source.clear()
+            self._prefetch_published_bytes_by_source.clear()
+            self._prefetch_late_bytes_by_source.clear()
             self._draft_m3_layers_by_step.clear()
             self._draft_m3_step0_steps.clear()
             self._draft_m3_next_is_step0 = True
@@ -1942,20 +2107,21 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             if reservation is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
-            ready_event = cache.begin_async_put_to_active(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source="predictive_phase1",
+                direct_active=True,
             )
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source="predictive_phase1",
                 staging_slot_idx=-1,
                 staging_generation=-1,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
                 direct_active=True,
@@ -1963,7 +2129,11 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
                 segment_id=int(last_segment_id),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             self._profile["prefetch_submit_count"] += 1
             self._profile["direct_active_prefetch_submit_count"] += 1
@@ -2037,27 +2207,32 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             if reservation is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 continue
-            ready_event = cache.begin_async_put_to_active(
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes = self._begin_prefetch_transfer(
+                cache=cache,
                 reservation=reservation,
-                gate_up_cpu=weights["gate_up"],
-                down_cpu=weights["down"],
-                stream=self.transfer_stream,
+                weights=weights,
+                source="verify_layer_predict",
+                direct_active=True,
             )
-            self.inflight[key] = PrefetchTicket(
+            ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
                 source="verify_layer_predict",
                 staging_slot_idx=-1,
                 staging_generation=-1,
-                submit_ts_ms=time.perf_counter() * 1000.0,
+                submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
                 ready=False,
                 direct_active=True,
                 active_slot_idx=reservation.active_slot_idx,
                 active_generation=reservation.generation,
                 active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
             )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
             submitted += 1
             used_budget_ms += transfer_ms
             self._profile["prefetch_submit_count"] += 1

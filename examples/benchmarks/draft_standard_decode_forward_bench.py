@@ -37,6 +37,13 @@ def _per_call(profile: dict, total_key: str, count: int) -> float:
     return _safe_ratio(float(profile.get(total_key, 0.0)), float(count))
 
 
+def _source_sum(profile: dict, key: str, sources: tuple[str, ...]) -> float:
+    values = profile.get(key, {})
+    if not isinstance(values, dict):
+        return 0.0
+    return sum(float(values.get(source, 0.0)) for source in sources)
+
+
 def _median_nested(rows: list[dict], section: str, breakdown_key: str) -> float:
     values = [
         float(row[section]["profile_breakdown"].get(breakdown_key, 0.0))
@@ -231,6 +238,11 @@ def extract_standard_decode_metrics(case_result: dict) -> dict:
 def extract_draft_forward_metrics(case_result: dict) -> dict:
     profile = case_result.get("engine_profile") or {}
     draft_calls = int(profile.get("spec_run_draft_calls", 0))
+    draft_prefetch_sources = (
+        "draft_segment_indexed",
+        "draft_direct_active",
+        "predictive_phase1",
+    )
     draft_infer_ms_total = float(profile.get("spec_run_draft_infer_ms_total", 0.0))
     draft_tokens_total = float(profile.get("spec_draft_tokens_total", 0.0))
     forward_ms = _safe_ratio(draft_infer_ms_total, float(draft_calls))
@@ -286,6 +298,96 @@ def extract_draft_forward_metrics(case_result: dict) -> dict:
             "draft_segment_metadata_enqueue_ms": float(profile.get("model_draft_segment_metadata_enqueue_ms", 0.0)),
             "prefetch_submit_count": int(profile.get("model_prefetch_submit_count", 0)),
             "prefetch_completed_count": int(profile.get("model_prefetch_completed_count", 0)),
+            "prefetch_submitted_experts_per_forward": _per_call(
+                profile, "model_prefetch_submit_count", draft_calls
+            ),
+            "prefetch_completed_experts_per_forward": _per_call(
+                profile, "model_prefetch_completed_count", draft_calls
+            ),
+            "prefetch_published_experts_per_forward": _per_call(
+                profile, "model_publish_count", draft_calls
+            ),
+            "prefetch_consumed_experts_per_forward": _per_call(
+                profile, "model_prefetch_consumed_count", draft_calls
+            ),
+            "prefetch_submitted_bytes_per_forward": _per_call(
+                profile, "model_prefetch_submitted_bytes", draft_calls
+            ),
+            "prefetch_completed_bytes_per_forward": _per_call(
+                profile, "model_prefetch_completed_bytes", draft_calls
+            ),
+            "prefetch_published_bytes_per_forward": _per_call(
+                profile, "model_prefetch_published_bytes", draft_calls
+            ),
+            "prefetch_late_bytes_per_forward": _per_call(
+                profile, "model_prefetch_late_bytes", draft_calls
+            ),
+            "draft_prefetch_submitted_experts_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_submit_count_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_completed_experts_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_completed_count_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_published_experts_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_published_count_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_submitted_bytes_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_submitted_bytes_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_completed_bytes_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_completed_bytes_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_published_bytes_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_published_bytes_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "prefetch_max_inflight_observed": int(
+                profile.get("model_prefetch_max_inflight_observed", 0)
+            ),
+            "draft_segment_reservation_ms_per_forward": _per_call(
+                profile,
+                "model_draft_segment_indexed_prefetch_reservation_ms",
+                draft_calls,
+            ),
+            "draft_segment_transfer_enqueue_ms_per_forward": _per_call(
+                profile,
+                "model_draft_segment_indexed_prefetch_transfer_enqueue_ms",
+                draft_calls,
+            ),
+            "draft_segment_completion_latency_ms_per_forward": _per_call(
+                profile,
+                "model_draft_segment_indexed_prefetch_completion_latency_ms",
+                draft_calls,
+            ),
             "staging_prefetch_publish_ms": float(profile.get("model_staging_prefetch_publish_ms", 0.0)),
             "direct_active_prefetch_publish_ms": float(profile.get("model_direct_active_prefetch_publish_ms", 0.0)),
             "draft_direct_active_prefetch_submit_count": int(profile.get("model_draft_direct_active_prefetch_submit_count", 0)),

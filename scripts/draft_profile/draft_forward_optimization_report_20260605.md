@@ -668,3 +668,111 @@ Performance:
 Analysis:
 Decision:
 ```
+
+## 13. Fine-Grained Prefetch Instrumentation
+
+Timestamp: 2026-06-05 14:25-14:32 CST
+
+Objective:
+
+Split the large segment prefetch visible overhead into source-specific expert
+counts, transferred bytes, cache reservation time, CPU-side H2D enqueue time,
+and ticket completion latency. Normalize the resulting totals by
+`spec_run_draft_calls`.
+
+Changed files:
+
+```text
+nanovllm/expert/prefetcher.py
+examples/benchmarks/draft_standard_decode_forward_bench.py
+tests/test_prefetch_runtime.py
+tests/test_draft_standard_decode_forward_bench.py
+```
+
+Instrumentation added:
+
+1. Submitted, completed, published, and late bytes.
+2. Submitted, completed, published, and late counts grouped by source.
+3. Maximum observed number of in-flight expert transfers.
+4. Cache reservation CPU time.
+5. CPU time spent enqueueing expert H2D copies.
+6. Submit-to-event-ready completion latency.
+7. Draft-only aggregation over `draft_segment_indexed`,
+   `draft_direct_active`, and `predictive_phase1`; verify prefetch is excluded.
+
+TDD RED command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+  source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+  conda activate nano_moe
+  export CUDA_VISIBLE_DEVICES=2
+  cd /home/mumura/moe_spec/nano-vllm-moe
+  python -m unittest \
+    tests/test_prefetch_runtime.py \
+    tests/test_draft_standard_decode_forward_bench.py
+'
+```
+
+RED log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_metrics_red_20260605_142502.log
+```
+
+Expected RED failures:
+
+```text
+missing prefetch_submitted_bytes profile field
+missing benchmark prefetch_submitted_experts_per_forward field
+```
+
+Targeted GREEN log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_metrics_green_20260605_143113.log
+```
+
+Result:
+
+```text
+Ran 20 tests in 0.595s
+OK
+```
+
+Regression command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+  source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+  conda activate nano_moe
+  export CUDA_VISIBLE_DEVICES=2
+  cd /home/mumura/moe_spec/nano-vllm-moe
+  python -m unittest \
+    tests/test_config_prefetch.py \
+    tests/test_prefetch_runtime.py \
+    tests/test_expert_cache_staging.py \
+    tests/test_draft_standard_decode_forward_bench.py
+'
+```
+
+Regression log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_metrics_regression_20260605_143131.log
+```
+
+Result:
+
+```text
+Ran 43 tests in 0.616s
+OK
+```
+
+Analysis:
+
+The new counters preserve the existing submit/publish behavior while exposing
+the distinction between work submitted during draft and verify-side work that
+was previously mixed into totals. The next runs will determine whether the
+visible overhead is dominated by cache reservation, pageable-host copy enqueue,
+or waiting for transfer completion.
