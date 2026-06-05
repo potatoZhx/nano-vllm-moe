@@ -23,7 +23,11 @@ from nanovllm.scheduling.draft_reroute_profile import (
     load_draft_reroute_profile,
     seed_lfu_rank_guard_from_profile,
 )
-from nanovllm.expert.placement import apply_verify_cache_fill_policy
+from nanovllm.expert.placement import (
+    apply_verify_cache_fill_no_cpu_policy_ids,
+    apply_verify_cache_fill_policy,
+    collect_cache_fill_no_cpu_expert_ids,
+)
 from nanovllm.expert.prefetcher import PredictivePrefetchRuntime, PrefetchRuntime
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -2059,10 +2063,11 @@ class ModelRunner:
                             verify_graph_pool = graph.pool()
                         self.verify_prefix_graphs[(bs, layer_idx)] = graph
 
-                        layer.forward_verify_suffix_gpu_only(
-                            hidden_states[:bs], selected_experts_buf[:bs],
-                            routing_weights_buf[:bs], residual_buf[:bs],
-                        )
+                        # The captured prefix is value-independent; the suffix is
+                        # intentionally left eager so real verify can first
+                        # perform cache-fill for any selected experts that are
+                        # not resident in GPU slots. Running the GPU-only suffix
+                        # here would use dummy routing and can see -1 slots.
                     else:
                         hidden_states[:bs] = layer(hidden_states[:bs], positions[:bs])
                         torch.cuda.synchronize()
@@ -2100,6 +2105,10 @@ class ModelRunner:
         context = get_context()
         if context.cu_seqlens_q is not None and context.cu_seqlens_q.numel() > 2:
             return False
+        if context.block_tables is not None and self.verify_graph_vars:
+            gv_bt = self.verify_graph_vars.get("block_tables")
+            if gv_bt is not None and context.block_tables.shape[1] > gv_bt.shape[1]:
+                return False
         return any(b >= num_tokens for b in self.verify_graph_bs)
 
     def _select_verify_bucket(self, num_tokens: int) -> int:
@@ -2107,6 +2116,63 @@ class ModelRunner:
             if b >= num_tokens:
                 return b
         return self.verify_graph_bs[-1]
+
+    def _verify_graph_eager_gap(
+        self,
+        layer_idx: int,
+        layer,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+        runtime_meta_recorder,
+    ) -> bool:
+        """Run the non-captured verify cache-fill gap.
+
+        Returns True when the suffix must fall back to the normal MoE path because
+        some active experts could not be made resident in GPU slots.
+        """
+        mlp = layer.mlp
+        profile = getattr(mlp, "_last_profile", None)
+        if profile is None:
+            profile = {}
+            mlp._last_profile = profile
+
+        if runtime_meta_recorder is not None:
+            runtime_meta_recorder.record_layer(
+                layer_idx=mlp.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+            )
+
+        if mlp.spec_verify_miss_policy == "cache_fill_no_cpu":
+            active_ids, miss_ids = collect_cache_fill_no_cpu_expert_ids(
+                selected_experts=selected_experts,
+                expert_cache=mlp.expert_cache,
+                profile=profile,
+            )
+            profile["activated_expert_set_size_sum"] = float(len(active_ids))
+            fill_result = apply_verify_cache_fill_no_cpu_policy_ids(
+                layer_idx=mlp.layer_idx,
+                active_expert_ids=active_ids,
+                miss_expert_ids=miss_ids,
+                expert_cache=mlp.expert_cache,
+                step_id=0,
+                cache_strategy=mlp.cache_strategy,
+                profile=profile,
+            )
+            return fill_result.cpu_expert_count > 0
+
+        if mlp.spec_verify_miss_policy == "cache_fill":
+            fill_result = apply_verify_cache_fill_policy(
+                layer_idx=mlp.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                expert_cache=mlp.expert_cache,
+                step_id=0,
+                profile=profile,
+            )
+            return fill_result.cpu_expert_count > 0
+
+        return True
 
     def _run_verify_with_prefix_graph(
         self,
@@ -2156,6 +2222,8 @@ class ModelRunner:
             key = (bucket, layer_idx)
             if key in self.verify_prefix_graphs:
                 self.verify_prefix_graphs[key].replay()
+                if self.profile_enabled and self.rank == 0:
+                    self._profile["verify_prefix_graph_replay_count"] += 1
             else:
                 h, se, rw = layer.forward_verify_prefix(
                     hidden_states[:num_tokens], position_ids[:num_tokens], residual_buf[:num_tokens],
@@ -2163,32 +2231,19 @@ class ModelRunner:
                 selected_experts_buf[:num_tokens].copy_(se)
                 routing_weights_buf[:num_tokens].copy_(rw)
                 hidden_states[:num_tokens].copy_(h)
+                if self.profile_enabled and self.rank == 0:
+                    self._profile["verify_prefix_graph_fallback_count"] += 1
 
         def eager_gap_fn(layer_idx, layer, selected_experts_buf, routing_weights_buf):
-            mlp = layer.mlp
             sel = selected_experts_buf[:num_tokens]
             rw = routing_weights_buf[:num_tokens]
-
-            if runtime_meta_recorder is not None:
-                runtime_meta_recorder.record_layer(
-                    layer_idx=mlp.layer_idx,
-                    selected_experts=sel,
-                    routing_weights=rw,
-                )
-
-            if mlp.spec_verify_miss_policy in {"cache_fill", "cache_fill_no_cpu"}:
-                apply_verify_cache_fill_policy(
-                    layer_idx=mlp.layer_idx,
-                    selected_experts=sel,
-                    routing_weights=rw,
-                    expert_cache=mlp.expert_cache,
-                    step_id=0,
-                    profile=mlp._last_profile,
-                )
-                flat = sel.reshape(-1).to(torch.int64)
-                slots = mlp.expert_cache.expert_to_slot_lut.index_select(0, flat)
-                return bool(slots.lt(0).any().item())
-            return True
+            return self._verify_graph_eager_gap(
+                layer_idx,
+                layer,
+                sel,
+                rw,
+                runtime_meta_recorder,
+            )
 
         def suffix_fn(layer_idx, layer, hidden_states, selected_experts_buf,
                       routing_weights_buf, residual_buf, fallback):
@@ -2209,10 +2264,14 @@ class ModelRunner:
             key = (bucket, layer_idx)
             if key in self.verify_dense_graphs:
                 self.verify_dense_graphs[key].replay()
+                if self.profile_enabled and self.rank == 0:
+                    self._profile["verify_dense_graph_replay_count"] += 1
             else:
                 hidden_states[:num_tokens] = layer(
                     hidden_states[:num_tokens], position_ids[:num_tokens],
                 )
+                if self.profile_enabled and self.rank == 0:
+                    self._profile["verify_dense_graph_fallback_count"] += 1
             return hidden_states
 
         hidden = self.model.model.forward_verify_prefix_suffix(
@@ -2227,4 +2286,6 @@ class ModelRunner:
             dense_replay_fn=dense_replay_fn,
             apply_norm=True,
         )
+        if self.profile_enabled and self.rank == 0:
+            self._profile["verify_graph_call_count"] += 1
         return hidden[:num_tokens]

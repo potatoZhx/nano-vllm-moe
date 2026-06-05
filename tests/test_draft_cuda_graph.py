@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
 
 
 class TestDraftCudaGraphPolicy(unittest.TestCase):
@@ -110,6 +111,148 @@ class _FakeGraph:
         base = self.graph_vars["input_ids"].to(dtype=torch.float32).unsqueeze(-1)
         pos = self.graph_vars["positions"].to(dtype=torch.float32).unsqueeze(-1)
         self.graph_vars["outputs"][:bs].copy_(base + pos)
+
+
+class _FakeCaptureGraph:
+    def pool(self):
+        return object()
+
+
+class _FakeCudaGraphContext:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _VerifyGraphEmbed:
+    def __init__(self, hidden_size: int):
+        self.hidden_size = hidden_size
+
+    def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(input_ids.numel(), self.hidden_size, dtype=torch.float32)
+
+
+class _VerifyGraphMoeLayer:
+    def __init__(self, layer_idx: int, hidden_size: int, top_k: int):
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+        self.top_k = top_k
+        self.mlp = object.__new__(Qwen3MoeHeterogeneousSparseMoeBlock)
+        self.prefix_calls = 0
+        self.suffix_calls = 0
+
+    def forward_verify_prefix(
+        self,
+        hidden_states: torch.Tensor,
+        _positions: torch.Tensor,
+        residual_out: torch.Tensor,
+    ):
+        self.prefix_calls += 1
+        residual_out.copy_(hidden_states)
+        selected = torch.zeros(hidden_states.shape[0], self.top_k, dtype=torch.int64)
+        weights = torch.ones(hidden_states.shape[0], self.top_k, dtype=hidden_states.dtype)
+        return hidden_states + 1.0, selected, weights
+
+    def forward_verify_suffix_gpu_only(self, *_args, **_kwargs):
+        self.suffix_calls += 1
+        raise AssertionError("verify CUDA graph capture must not run GPU-only suffix")
+
+
+class _VerifyGraphInnerModel:
+    def __init__(self, layer):
+        self.embed_tokens = _VerifyGraphEmbed(hidden_size=layer.hidden_size)
+        self.layers = [layer]
+
+
+class _VerifyGraphModel:
+    def __init__(self, layer):
+        self.model = _VerifyGraphInnerModel(layer)
+        self.lm_head = SimpleNamespace(weight=torch.zeros(1, layer.hidden_size, dtype=torch.float32))
+
+
+class TestVerifyCudaGraphCapture(unittest.TestCase):
+    def test_capture_moe_prefix_graph_does_not_execute_gpu_only_suffix(self):
+        layer = _VerifyGraphMoeLayer(layer_idx=0, hidden_size=4, top_k=2)
+        mr = object.__new__(ModelRunner)
+        mr.model = _VerifyGraphModel(layer)
+        mr.config = SimpleNamespace(
+            verify_cuda_graph=True,
+            verify_cuda_graph_bucket_steps=[1],
+            max_num_seqs=1,
+            max_model_len=16,
+            hf_config=SimpleNamespace(hidden_size=4, num_experts_per_tok=2),
+        )
+        mr.block_size = 16
+
+        with patch("torch.cuda.CUDAGraph", _FakeCaptureGraph), \
+                patch("torch.cuda.graph", _FakeCudaGraphContext), \
+                patch("torch.cuda.synchronize", lambda: None):
+            ModelRunner.capture_verify_cudagraph(mr)
+
+        self.assertEqual(layer.prefix_calls, 2)
+        self.assertEqual(layer.suffix_calls, 0)
+        self.assertIn((1, 0), mr.verify_prefix_graphs)
+
+    def test_verify_graph_eager_gap_uses_cache_fill_no_cpu_fast_path(self):
+        mr = object.__new__(ModelRunner)
+        layer = SimpleNamespace(
+            mlp=SimpleNamespace(
+                layer_idx=3,
+                spec_verify_miss_policy="cache_fill_no_cpu",
+                expert_cache=object(),
+                cache_strategy="lru",
+                _last_profile={},
+            )
+        )
+        selected = torch.tensor([[1, 2]], dtype=torch.int64)
+        weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+
+        with patch(
+            "nanovllm.engine.model_runner.collect_cache_fill_no_cpu_expert_ids",
+            return_value=([1, 2], [2]),
+        ) as collect_ids, patch(
+            "nanovllm.engine.model_runner.apply_verify_cache_fill_no_cpu_policy_ids",
+            return_value=SimpleNamespace(cpu_expert_count=0),
+        ) as apply_ids, patch(
+            "nanovllm.engine.model_runner.apply_verify_cache_fill_policy",
+        ) as generic_fill:
+            fallback = ModelRunner._verify_graph_eager_gap(mr, 3, layer, selected, weights, None)
+
+        self.assertFalse(fallback)
+        collect_ids.assert_called_once()
+        apply_ids.assert_called_once()
+        generic_fill.assert_not_called()
+        self.assertEqual(layer.mlp._last_profile["activated_expert_set_size_sum"], 2.0)
+
+    def test_verify_graph_eager_gap_falls_back_when_no_cpu_fill_leaves_cpu_experts(self):
+        mr = object.__new__(ModelRunner)
+        layer = SimpleNamespace(
+            mlp=SimpleNamespace(
+                layer_idx=3,
+                spec_verify_miss_policy="cache_fill_no_cpu",
+                expert_cache=object(),
+                cache_strategy="lru",
+                _last_profile={},
+            )
+        )
+        selected = torch.tensor([[1, 2]], dtype=torch.int64)
+        weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+
+        with patch(
+            "nanovllm.engine.model_runner.collect_cache_fill_no_cpu_expert_ids",
+            return_value=([1, 2], [2]),
+        ), patch(
+            "nanovllm.engine.model_runner.apply_verify_cache_fill_no_cpu_policy_ids",
+            return_value=SimpleNamespace(cpu_expert_count=1),
+        ):
+            fallback = ModelRunner._verify_graph_eager_gap(mr, 3, layer, selected, weights, None)
+
+        self.assertTrue(fallback)
 
 
 def _build_runner_for_replay(max_bs: int = 8, hidden_size: int = 4, max_blocks: int = 4) -> ModelRunner:

@@ -104,7 +104,7 @@ def run_single_case(
             cpu_expert_execution_enabled=True,
             cpu_expert_pin_memory=True,
             cpu_expert_backend="fused",
-            cpu_expert_workspace_max_routes=8192,
+            cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
             cpu_expert_packed_min_routes=1,
             cpu_expert_parallel_mode="serial",
             cpu_expert_num_threads=4,
@@ -222,6 +222,7 @@ def main():
     parser.add_argument("--max-draft-tokens", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--dist-port", type=int, default=2333)
     parser.add_argument("--seed", type=int, default=42)

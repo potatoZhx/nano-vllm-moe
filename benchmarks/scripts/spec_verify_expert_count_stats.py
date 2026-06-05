@@ -39,6 +39,13 @@ def str2bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid bool value: {value}")
 
 
+def _parse_int_csv(values: str) -> list[int]:
+    out = [int(x.strip()) for x in values.split(",") if x.strip()]
+    if not out:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    return out
+
+
 def _make_prompts(num_seqs: int, input_len: int, seed: int) -> list[str]:
     rng = Random(seed)
     prompts: list[str] = []
@@ -324,6 +331,12 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "standard_replay_count": int(ep.get("model_standard_graph_replay_count", 0) or 0),
             "total_replay_count": int(ep.get("model_graph_replay_count", 0) or 0),
             "hit_rate": float(ep.get("model_graph_hit_rate", 0.0) or 0.0),
+            "verify_enabled": bool(raw.get("case", {}).get("verify_cuda_graph", False)),
+            "verify_call_count": int(ep.get("model_verify_graph_call_count", 0) or 0),
+            "verify_prefix_replay_count": int(ep.get("model_verify_prefix_graph_replay_count", 0) or 0),
+            "verify_prefix_fallback_count": int(ep.get("model_verify_prefix_graph_fallback_count", 0) or 0),
+            "verify_dense_replay_count": int(ep.get("model_verify_dense_graph_replay_count", 0) or 0),
+            "verify_dense_fallback_count": int(ep.get("model_verify_dense_graph_fallback_count", 0) or 0),
         },
         "cache": {
             "route_hit_rate": float(max(0.0, min(1.0, 1.0 - cpu_route_ratio))),
@@ -431,6 +444,8 @@ def run_single_case(args: argparse.Namespace) -> None:
         "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
         "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
+        "verify_cuda_graph": bool(args.verify_cuda_graph),
+        "verify_cuda_graph_bucket_steps": _parse_int_csv(args.verify_cuda_graph_bucket_steps),
     }
 
     llm = LLM(
@@ -491,6 +506,8 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_use_draft_live=args.prefetch_use_draft_live,
         draft_cuda_graph_enabled=args.draft_cuda_graph_enabled,
         draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
+        verify_cuda_graph=args.verify_cuda_graph,
+        verify_cuda_graph_bucket_steps=_parse_int_csv(args.verify_cuda_graph_bucket_steps),
     )
 
     custom_prompt = args.prompt_text
@@ -821,6 +838,10 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(args.draft_cuda_graph_enabled).lower(),
                     "--draft-cuda-graph-cpu-backend",
                     args.draft_cuda_graph_cpu_backend,
+                    "--verify-cuda-graph",
+                    str(args.verify_cuda_graph).lower(),
+                    "--verify-cuda-graph-bucket-steps",
+                    args.verify_cuda_graph_bucket_steps,
                     "--rank-guard-threshold",
                     str(args.rank_guard_threshold),
                     "--rank-guard-ema-alpha",
@@ -869,6 +890,8 @@ def run_suite(args: argparse.Namespace) -> None:
             "predictive_phase1_budget": int(args.predictive_phase1_budget),
             "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
             "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
+            "verify_cuda_graph": bool(args.verify_cuda_graph),
+            "verify_cuda_graph_bucket_steps": _parse_int_csv(args.verify_cuda_graph_bucket_steps),
             "acceptance_strategy": args.acceptance_strategy,
             "temperature": float(args.temperature),
             "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
@@ -958,6 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
     p.add_argument("--draft-cuda-graph-enabled", type=str2bool, default=True)
     p.add_argument("--draft-cuda-graph-cpu-backend", choices=["none", "fused", "fused_sync"], default="none")
+    p.add_argument("--verify-cuda-graph", type=str2bool, default=False)
+    p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
     p.add_argument("--dist-port", type=int, default=12345)
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)

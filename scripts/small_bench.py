@@ -10,6 +10,28 @@ import time
 from pathlib import Path
 from typing import Any
 
+"""
+TS=$(date +%Y%m%d_%H%M%S)
+LOG=/home/mumura/moe_spec/logs/verify_graph_small_${TS}.log
+srun --jobid=29621 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
+source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/mumura/moe_spec/nano-vllm-moe/
+python - <<'PY'
+import torch, nanovllm
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+print("cuda_device_count", torch.cuda.device_count())
+PY
+python scripts/small_bench.py \
+    --output-dir results/vg_sweep_small \
+    --runtime-kinds legacy \
+    --output-lens 512 \
+    --cache-ratios 0.4375,0.375,0.3125,0.25 \
+    --verify-cuda-graph-values true,false \
+    --max-model-len 8192 
+EOS
+"""
 
 PROMPT_TEXT = (
     "Expert caching for sparse mixture-of-experts inference is a practical systems problem. "
@@ -43,10 +65,19 @@ def _parse_csv(values: str, cast) -> list:
 
 def max_draft_tokens_for_ratio(ratio: float) -> int:
     rounded = round(float(ratio), 2)
-    if rounded <= 0.25:
-        return 2
-    if rounded <= 0.50:
-        return 6
+    # 配置表：[(比率阈值, 返回值), ...]
+    ratio_config = [
+        (0.25, 1),
+        (0.45, 4),
+        (0.50, 6),
+        (0.75, 8),
+        (float('inf'), 10)  # 默认值
+    ]
+    
+    for threshold, value in ratio_config:
+        if rounded <= threshold:
+            return value
+    
     return 10
 
 
@@ -77,7 +108,14 @@ def assess_text_quality(text: str) -> dict[str, Any]:
     return {"ok": not reasons, "reasons": reasons}
 
 
+def _vg_values(args: argparse.Namespace) -> list[bool]:
+    if args.verify_cuda_graph_values:
+        return _parse_csv(args.verify_cuda_graph_values, str2bool)
+    return [bool(args.verify_cuda_graph)]
+
+
 def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
+    vg_values = _vg_values(args)
     if args.lightweight:
         runtime_kinds = _parse_csv(args.runtime_kinds, str)
         return [
@@ -86,30 +124,35 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "output_len": int(args.lightweight_output_len),
                 "cache_ratio": float(args.lightweight_cache_ratio),
                 "max_draft_tokens": int(args.lightweight_max_draft_tokens),
+                "verify_cuda_graph": bool(vg),
             }
             for runtime_kind in runtime_kinds
+            for vg in vg_values
         ]
 
     cases: list[dict[str, Any]] = []
     for runtime_kind in _parse_csv(args.runtime_kinds, str):
         for output_len in _parse_csv(args.output_lens, int):
             for ratio in _parse_csv(args.cache_ratios, float):
-                cases.append(
-                    {
-                        "runtime_kind": runtime_kind,
-                        "output_len": int(output_len),
-                        "cache_ratio": float(ratio),
-                        "max_draft_tokens": max_draft_tokens_for_ratio(float(ratio)),
-                    }
-                )
+                for vg in vg_values:
+                    cases.append(
+                        {
+                            "runtime_kind": runtime_kind,
+                            "output_len": int(output_len),
+                            "cache_ratio": float(ratio),
+                            "max_draft_tokens": max_draft_tokens_for_ratio(float(ratio)),
+                            "verify_cuda_graph": bool(vg),
+                        }
+                    )
     return cases
 
 
 def _case_name(case: dict[str, Any]) -> str:
     ratio_pct = int(round(float(case["cache_ratio"]) * 100))
+    vg = "1" if case.get("verify_cuda_graph", True) else "0"
     return (
         f"{case['runtime_kind']}_ratio{ratio_pct}_"
-        f"l{int(case['output_len'])}_k{int(case['max_draft_tokens'])}"
+        f"l{int(case['output_len'])}_k{int(case['max_draft_tokens'])}_vg{vg}"
     )
 
 
@@ -254,7 +297,7 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         "--draft-cuda-graph-cpu-backend",
         "none",
         "--verify-cuda-graph",
-        str(args.verify_cuda_graph).lower(),
+        str(case.get("verify_cuda_graph", args.verify_cuda_graph)).lower(),
         "--verify-cuda-graph-bucket-steps",
         args.verify_cuda_graph_bucket_steps,
         "--prefetch-verify-wait-ms",
@@ -303,6 +346,7 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
     text = "\n".join(str(x) for x in raw.get("generated_text", []))
     quality = assess_text_quality(text)
     row = _row_from_raw(case, raw, quality, elapsed)
+    row["case_verify_cuda_graph"] = bool(case.get("verify_cuda_graph", args.verify_cuda_graph))
     print(
         f"  accept={row['acceptance_rate']:.4f} hit={row['route_hit_rate']:.4f} "
         f"post_xfer_hit={row['route_hit_rate_post_transfer']:.4f} "
@@ -348,6 +392,41 @@ def _delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _delta_rows_verify_graph(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare verify_cuda_graph=True vs False for each (output_len, cache_ratio, runtime_kind)."""
+    by_key: dict[tuple, dict[bool, dict[str, Any]]] = {}
+    for row in rows:
+        key = (int(row["output_len"]), round(float(row["cache_ratio"]), 4), str(row["runtime_kind"]))
+        vg = bool(row.get("case_verify_cuda_graph", True))
+        by_key.setdefault(key, {})[vg] = row
+
+    out: list[dict[str, Any]] = []
+    for key, pair in by_key.items():
+        row_on = pair.get(True)
+        row_off = pair.get(False)
+        if row_on is None or row_off is None:
+            continue
+        out.append(
+            {
+                "output_len": int(row_on["output_len"]),
+                "cache_ratio": float(row_on["cache_ratio"]),
+                "runtime_kind": str(row_on["runtime_kind"]),
+                "acceptance_delta": float(row_on["acceptance_rate"]) - float(row_off["acceptance_rate"]),
+                "route_hit_delta": float(row_on["route_hit_rate"]) - float(row_off["route_hit_rate"]),
+                "avg_miss_per_layer_delta": float(row_on["avg_miss_per_layer"]) - float(row_off["avg_miss_per_layer"]),
+                "throughput_delta": float(row_on["throughput_output_tok_s"]) - float(row_off["throughput_output_tok_s"]),
+                "draft_forward_ms_delta": float(row_on["draft_forward_ms_avg"]) - float(row_off["draft_forward_ms_avg"]),
+                "verify_forward_ms_delta": float(row_on["verify_forward_ms_avg"]) - float(row_off["verify_forward_ms_avg"]),
+                "graph_hit_rate_delta": float(row_on["graph_hit_rate"]) - float(row_off["graph_hit_rate"]),
+                "perfect_fraction_delta": float(row_on["perfect_fraction"]) - float(row_off["perfect_fraction"]),
+                "step0_perfect_fraction_delta": (
+                    float(row_on["step0_perfect_fraction"]) - float(row_off["step0_perfect_fraction"])
+                ),
+            }
+        )
+    return out
+
+
 def write_markdown_report(
     *,
     summary: dict[str, Any],
@@ -358,6 +437,7 @@ def write_markdown_report(
 ) -> None:
     rows = summary.get("rows", [])
     deltas = summary.get("deltas", [])
+    vg_deltas = summary.get("vg_deltas", [])
     metadata = summary.get("metadata", {})
     lines = [
         "# Predictive Prefetch Validation Report",
@@ -492,7 +572,36 @@ def write_markdown_report(
     lines.extend(
         [
             "",
-            "## 5. Text Quality",
+            "## 5. Verify CUDA Graph Delta (On vs Off)",
+            "",
+            "Positive throughput and acceptance deltas mean `verify-cuda-graph=true` improves the metric. "
+            "Negative draft/verify ms deltas mean the graph reduces forward latency.",
+            "",
+            "| kind | out | ratio | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | graph-hit delta | perfect delta | step0 perfect delta |",
+            "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in vg_deltas:
+        lines.append(
+            "| "
+            f"{row['runtime_kind']} | "
+            f"{row['output_len']} | "
+            f"{row['cache_ratio']:.2f} | "
+            f"{row['acceptance_delta']:+.4f} | "
+            f"{row['route_hit_delta']:+.4f} | "
+            f"{row['avg_miss_per_layer_delta']:+.2f} | "
+            f"{row['throughput_delta']:+.3f} | "
+            f"{row['draft_forward_ms_delta']:+.3f} | "
+            f"{row['verify_forward_ms_delta']:+.3f} | "
+            f"{row['graph_hit_rate_delta']:+.4f} | "
+            f"{row['perfect_fraction_delta']:+.4f} | "
+            f"{row['step0_perfect_fraction_delta']:+.4f} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 6. Text Quality",
             "",
         ]
     )
@@ -508,12 +617,12 @@ def write_markdown_report(
     lines.extend(
         [
             "",
-            "## 6. Conclusion",
+            "## 7. Conclusion",
             "",
         ]
     )
     if status == "completed" and rows:
-        lines.append("The benchmark completed; use the tables above for the legacy-vs-predictive comparison.")
+        lines.append("The benchmark completed; use the tables above for the legacy-vs-predictive and verify-graph comparisons.")
     else:
         lines.append("The full matrix is still running or pending; this document will be updated by the batch job when results are complete.")
 
@@ -545,6 +654,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cpu_expert_workspace_max_routes": int(args.cpu_expert_workspace_max_routes),
         "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "verify_cuda_graph": bool(args.verify_cuda_graph),
+        "verify_cuda_graph_values": args.verify_cuda_graph_values,
         "verify_cuda_graph_bucket_steps": _parse_csv(args.verify_cuda_graph_bucket_steps, int),
         "max_model_len": int(args.max_model_len),
         "argv": sys.argv,
@@ -553,6 +663,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "metadata": metadata,
         "rows": rows,
         "deltas": _delta_rows(rows),
+        "vg_deltas": _delta_rows_verify_graph(rows),
     }
     summary_json = output_dir / "summary.json"
     summary_md = output_dir / "summary.md"
@@ -577,6 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-kinds", default="legacy,predictive")
     p.add_argument("--output-lens", default="128,512")
     p.add_argument("--cache-ratios", default="0.25,0.50,0.75")
+    p.add_argument("--cache-ratio", dest="cache_ratios", default=argparse.SUPPRESS)
     p.add_argument("--lightweight", type=str2bool, default=False)
     p.add_argument("--lightweight-output-len", type=int, default=64)
     p.add_argument("--lightweight-cache-ratio", type=float, default=0.50)
@@ -587,7 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cache_fill_no_cpu")
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
-    p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=32768)
+    p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=327680)
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--max-model-len", type=int, default=2048)
@@ -601,6 +713,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
     p.add_argument("--predictive-phase1-budget", type=int, default=4)
     p.add_argument("--verify-cuda-graph", type=str2bool, default=True)
+    p.add_argument("--verify-cuda-graph-values", default="",
+                   help="CSV of true/false values to sweep for verify-cuda-graph. "
+                        "When empty, the global --verify-cuda-graph is used for all cases.")
     p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
     p.add_argument("--dist-port-base", type=int, default=29400)
     p.add_argument("--seed", type=int, default=0)
