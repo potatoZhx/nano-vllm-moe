@@ -2,7 +2,7 @@
 
 Date: 2026-06-05
 
-Status: design approved; baseline and implementation pending
+Status: baseline completed; instrumentation in progress
 
 ## 1. Objectives
 
@@ -380,7 +380,278 @@ revision, dirty files, and result summary for every benchmark group.
 
 ## 12. Experiment Log
 
-No benchmark has been run for this optimization series yet.
+### 12.1 Focused Test Baseline
+
+Timestamp: 2026-06-05 14:15 CST
+
+Objective: verify the existing prefetch, cache, config, and benchmark tests
+before production-code changes.
+
+Code revision:
+
+```text
+0a3b9181f2be019404470b1b31946f9a63750ffe
+branch: codex/draft-forward-prefetch-opt
+```
+
+Command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+export CUDA_VISIBLE_DEVICES=2
+cd /home/mumura/moe_spec/nano-vllm-moe
+python -m unittest \
+  tests/test_config_prefetch.py \
+  tests/test_prefetch_runtime.py \
+  tests/test_expert_cache_staging.py \
+  tests/test_draft_standard_decode_forward_bench.py
+'
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_tests_20260605_141552.log
+```
+
+Result:
+
+```text
+Ran 42 tests in 0.609s
+OK
+```
+
+Decision: use this as the correctness baseline.
+
+### 12.2 Cache Ratio 0.25 Baseline
+
+Timestamp: 2026-06-05 14:16 CST
+
+Objective: compare single-request standard decode and predictive
+segment-indexed draft forward with 32 GPU expert slots per layer.
+
+Command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+export CUDA_VISIBLE_DEVICES=2
+cd /home/mumura/moe_spec/nano-vllm-moe
+python examples/benchmarks/draft_standard_decode_forward_bench.py \
+  --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
+  --slots-per-layer 32 \
+  --num-seqs 1 \
+  --input-len 64 \
+  --output-len 64 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 1 \
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.85 \
+  --max-draft-tokens 1 \
+  --draft-top-c 0 \
+  --draft-reroute-policy entropy_cache_bias \
+  --draft-reroute-artifact results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors \
+  --draft-cuda-graph-bucket-steps 1 \
+  --enforce-eager false \
+  --temperature 0.0 \
+  --spec-enable-prefetch true \
+  --prefetch-runtime-mode draft_segment_indexed \
+  --prefetch-runtime-kind predictive \
+  --draft-prefetch-segment-size 12 \
+  --prefetch-step-budget 4 \
+  --prefetch-max-inflight 8 \
+  --prefetch-staging-slots-per-layer 0 \
+  --prefetch-verify-wait-ms 0 \
+  --engine-profile-cuda-sync true \
+  --repeats 1 \
+  --dist-port-base 30100 \
+  --raw-output-dir results/draft_profile_20260605/raw_ratio25 \
+  --output results/draft_profile_20260605/baseline_ratio25.json
+'
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_baseline_ratio25_20260605_141619.log
+```
+
+Raw result:
+
+```text
+results/draft_profile_20260605/baseline_ratio25.json
+results/draft_profile_20260605/raw_ratio25/repeat_00_standard.json
+results/draft_profile_20260605/raw_ratio25/repeat_00_spec.json
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 37
+draft segment graph replays: 148
+```
+
+Performance:
+
+| Metric | Value |
+|---|---:|
+| standard decode forward | 14.643 ms |
+| draft forward | 32.138 ms |
+| draft / standard | 2.195x |
+| draft graph replay | 21.340 ms/forward |
+| draft core run | 23.433 ms/forward |
+| draft prefetch-before | 7.990 ms/forward |
+| draft mode set | 0.306 ms/forward |
+| segment candidate ranking | 0.200 ms/forward |
+| segment victim selection | 0.160 ms/forward |
+| segment submit visible overhead | 9.153 ms/forward |
+| direct-active publication scan/commit | 5.755 ms/forward |
+| segment expert submit | 4.676 experts/forward |
+| segment expert ready | 4.676 experts/forward |
+| segment expert publish | 4.676 experts/forward |
+| segment expert consumption observations | 16.541/forward |
+| predictive phase-1 submit | 4.000 experts/forward |
+| verify-layer submit | 59.892 experts/draft-forward denominator |
+| segment candidates scanned | 55.16/forward |
+
+Analysis:
+
+1. The draft-forward gap is `17.495 ms`; `7.990 ms` is directly exposed
+   before draft replay.
+2. Full candidate ranking and victim selection together are only
+   `0.360 ms/forward`, so the previous candidate-sort hypothesis is not the
+   primary bottleneck for this single-request workload.
+3. Segment submit visible overhead is `9.153 ms/forward`. After subtracting
+   ranking and victim selection, most of the unaccounted time is in cache
+   checks, reservation, and expert H2D enqueue.
+4. CPU expert weights are currently not pinned. A CUDA `copy_(..., non_blocking=True)`
+   from pageable host memory can expose host-side staging/synchronization, so
+   multiple CUDA streams alone may not remove this overhead.
+5. Existing total prefetch counters mix draft segment, predictive phase-1, and
+   verify-layer traffic. Source-specific expert and byte counters are required
+   before evaluating transfer-stream concurrency.
+
+Decision: retain the baseline and prioritize fine-grained transfer enqueue and
+byte accounting before candidate ranking changes.
+
+### 12.3 Cache Ratio 0.50 Baseline
+
+Timestamp: 2026-06-05 14:19 CST
+
+Objective: repeat the comparison with 64 GPU expert slots per layer and the
+`small_bench.py` draft budget of six.
+
+Command: same as Section 12.2 with:
+
+```text
+--slots-per-layer 64
+--max-draft-tokens 6
+--dist-port-base 30120
+--raw-output-dir results/draft_profile_20260605/raw_ratio50
+--output results/draft_profile_20260605/baseline_ratio50.json
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_baseline_ratio50_20260605_141922.log
+```
+
+Raw result:
+
+```text
+results/draft_profile_20260605/baseline_ratio50.json
+results/draft_profile_20260605/raw_ratio50/repeat_00_standard.json
+results/draft_profile_20260605/raw_ratio50/repeat_00_spec.json
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 75
+```
+
+Performance:
+
+| Metric | Value |
+|---|---:|
+| standard decode forward | 14.725 ms |
+| draft forward | 25.688 ms |
+| draft / standard | 1.745x |
+| draft graph replay | 17.318 ms/forward |
+| draft core run | 21.453 ms/forward |
+| draft prefetch-before | 2.057 ms/forward |
+| draft mode set | 1.752 ms/forward |
+| segment candidate ranking | 0.318 ms/forward |
+| segment victim selection | 0.340 ms/forward |
+| segment submit visible overhead | 13.659 ms/forward |
+| segment direct-active drain | 0.575 ms/forward |
+| direct-active publication scan/commit | 1.463 ms/forward |
+| segment expert submit/ready/publish | 3.387 experts/forward |
+| segment expert consumption observations | 9.613/forward |
+| predictive phase-1 submit | 0.693 experts/forward |
+| verify-layer submit | 9.000 experts/draft-forward denominator |
+| segment candidates scanned | 41.19/forward |
+
+Analysis:
+
+1. Higher cache coverage reduces the draft gap to `10.963 ms`.
+2. Candidate ranking and victim selection remain below `0.7 ms/forward`
+   combined.
+3. Segment submit visible overhead remains large even though fewer experts are
+   submitted, which reinforces the need to split CPU enqueue latency from
+   actual asynchronous transfer completion.
+4. Draft mode-set time varies significantly between ratios and needs its own
+   repeated trace before it is treated as a stable optimization target.
+5. Ratio 0.25 and 0.50 use different draft-token budgets, so cross-ratio
+   differences describe the requested operating points, not a controlled
+   single-variable cache experiment.
+
+Decision: retain the baseline. Do not implement bounded candidate ranking until
+new timing confirms it becomes material after transfer enqueue is reduced.
+
+### 12.4 Baseline Root-Cause Summary
+
+The first root-cause hypothesis is:
+
+```text
+draft gap
+  = segmented draft graph replay overhead
+  + logits/sampler and Python run wrapper
+  + prefetch-before work
+  + pageable-host H2D enqueue/staging cost
+  + cache publication and mode transition
+```
+
+Evidence against candidate ranking as the immediate priority:
+
+```text
+ratio 0.25 ranking + victim: 0.360 ms/forward
+ratio 0.50 ranking + victim: 0.658 ms/forward
+```
+
+Evidence for instrumenting transfer submission:
+
+```text
+ratio 0.25 segment visible submit: 9.153 ms/forward
+ratio 0.50 segment visible submit: 13.659 ms/forward
+```
+
+Next experiment:
+
+1. Add source-specific submitted/completed/published byte counters.
+2. Add reservation and H2D enqueue CPU timings.
+3. Add actual ticket completion latency and per-forward metrics.
+4. Re-run ratio 0.25 and 0.50 before changing stream count.
+5. Test transfer stream counts 1, 2, and 4 only after the single-stream path is
+   fully accounted.
 
 Each entry will use this format:
 
