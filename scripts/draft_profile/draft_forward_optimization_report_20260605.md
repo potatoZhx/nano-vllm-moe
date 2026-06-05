@@ -1086,3 +1086,408 @@ OK
 The stream-count default remains one. Counts greater than one are retained only
 if the A100 pinned-host experiments improve completed bytes or experts per
 draft forward without correctness or draft-latency regression.
+
+## 17. Pinned Transfer Stream Matrix, Cache Ratio 0.50
+
+Timestamp: 2026-06-05 14:47-14:52 CST
+
+Common configuration:
+
+```text
+num_seqs=1
+slots_per_layer=64
+max_draft_tokens=6
+cpu_expert_pin_memory=true
+draft_prefetch_segment_size=12
+prefetch_step_budget=4
+prefetch_max_inflight=8
+```
+
+Logs:
+
+```text
+stream 1: /home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream1_20260605_144037.log
+stream 2: /home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream2_20260605_144707.log
+stream 4: /home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream4_20260605_145011.log
+```
+
+Raw reports:
+
+```text
+results/draft_profile_20260605/pinned_ratio50_stream1.json
+results/draft_profile_20260605/pinned_ratio50_stream2.json
+results/draft_profile_20260605/pinned_ratio50_stream4.json
+```
+
+All three runs:
+
+```text
+deterministic standard/spec digest match: true
+standard CUDA Graph replay: positive
+draft CUDA Graph replay: positive
+late transfer bytes: 0
+```
+
+Results:
+
+| Streams | Standard ms | Draft ms | Draft/standard | Draft graph ms | Experts/draft | MiB/draft | Enqueue ms/draft | Verify ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 14.486 | 21.347 | 1.474x | 16.736 | 7.549 | 67.94 | 1.505 | 230.617 |
+| 2 | 14.616 | 20.816 | 1.424x | 16.716 | 7.394 | 66.55 | 1.314 | 219.546 |
+| 4 | 14.661 | 21.321 | 1.454x | 16.733 | 6.843 | 61.59 | 1.358 | 218.247 |
+
+Stream distribution:
+
+```text
+2 streams: 415 / 414 tickets
+4 streams: 201 / 201 / 201 / 200 tickets
+```
+
+Analysis:
+
+1. Round-robin assignment is balanced.
+2. Two streams reduce draft latency by `0.531 ms` relative to the pinned
+   single-stream control and reduce enqueue by `0.191 ms/forward`.
+3. Four streams regress draft latency by `0.505 ms` relative to two streams and
+   transfer fewer experts per draft forward.
+4. Multiple streams do not increase transferred expert count under the current
+   candidate supply, `prefetch_step_budget=4`, and `prefetch_max_inflight=8`.
+5. The A100 H2D engine and PCIe bandwidth are shared; adding streams beyond two
+   cannot create additional physical copy bandwidth and adds scheduling/event
+   pressure.
+6. Expert/forward varies with the cache-dependent speculative trajectory, so
+   these single-process runs are directional rather than a low-noise statistical
+   estimate. The deterministic final token digest remains exact.
+
+Decision:
+
+- Retain the configurable pool.
+- Use `prefetch_transfer_stream_count=2` as the latency-oriented setting.
+- Keep the production default at `1` until repeated deployment-level data
+  confirms the approximately `0.5 ms` gain.
+- Do not use four streams.
+
+## 18. Optimized Cache Ratio 0.25 Validation
+
+Timestamp: 2026-06-05 14:53 CST
+
+Configuration:
+
+```text
+slots_per_layer=32
+max_draft_tokens=1
+num_seqs=1
+cpu_expert_pin_memory=true
+prefetch_transfer_stream_count=2
+draft_prefetch_segment_size=12
+prefetch_max_inflight=8
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_pinned_ratio25_stream2_20260605_145344.log
+```
+
+Raw report:
+
+```text
+results/draft_profile_20260605/pinned_ratio25_stream2.json
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 37
+late transfer bytes: 0
+stream ticket distribution: 934 / 934
+```
+
+Comparison against the instrumented pageable-host run:
+
+| Metric | Pageable, stream 1 | Pinned, stream 2 | Change |
+|---|---:|---:|---:|
+| standard decode forward | 15.064 ms | 14.707 ms | -2.4% |
+| draft forward | 34.710 ms | 22.726 ms | -34.5% |
+| draft / standard | 2.304x | 1.545x | improved |
+| draft graph replay | 21.626 ms | 17.821 ms | -17.6% |
+| draft prefetch-before | 7.095 ms | 2.424 ms | -65.8% |
+| segment submit-after | 18.644 ms | 4.859 ms | -73.9% |
+| segment H2D enqueue | 17.107 ms | 2.556 ms | -85.1% |
+| all draft-source H2D enqueue | not exported | 3.036 ms | n/a |
+| completed experts/draft | 7.378 | 12.973 | +75.8% |
+| completed MiB/draft | 66.4 MiB | 116.8 MiB | +75.8% |
+| verify forward | 595.455 ms | 242.974 ms | -59.2% |
+
+Analysis:
+
+1. The lower cache ratio creates more useful candidates, so removing pageable
+   staging exposes a much larger prefetch-throughput gain than ratio 0.50.
+2. Two streams stay balanced and complete every submitted ticket.
+3. The remaining draft gap is `8.019 ms`; `4.197 ms` of that is the draft graph
+   replay difference versus standard, with prefetch-before and segmented
+   boundary submission accounting for most of the remaining controllable work.
+4. This operating point now transfers approximately `116.8 MiB` during each
+   draft forward while keeping draft latency near `22.7 ms`.
+
+## 19. Segment Boundary Compression
+
+Timestamp: 2026-06-05 14:56 CST
+
+Objective:
+
+Reduce graph replay and metadata boundary count by changing the layer segment
+size from 12 to 24 while retaining pinned host memory and two transfer streams.
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream2_segment24_20260605_145658.log
+```
+
+Raw report:
+
+```text
+results/draft_profile_20260605/pinned_ratio50_stream2_segment24.json
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 75
+segment graph replays per draft: 2
+late transfer bytes: 0
+```
+
+Comparison:
+
+| Metric | Segment 12 | Segment 24 | Change |
+|---|---:|---:|---:|
+| draft forward | 20.816 ms | 20.697 ms | -0.119 ms |
+| draft / standard | 1.424x | 1.408x | improved |
+| draft graph replay | 16.716 ms | 16.711 ms | neutral |
+| metadata enqueue | 0.781 ms | 0.337 ms | -56.8% |
+| segment submit-after | 2.781 ms | 2.113 ms | -24.0% |
+| completed experts/draft | 7.394 | 5.213 | -29.5% |
+| completed MiB/draft | 66.55 MiB | 46.92 MiB | -29.5% |
+| verify forward | 219.546 ms | 219.629 ms | neutral |
+
+Analysis:
+
+1. CUDA Graph replay duration is dominated by model work, not graph launch
+   count; halving the segment count does not materially reduce replay time.
+2. Boundary metadata and submit overhead decrease, but most of that work was
+   hidden behind draft compute.
+3. The reduced number of prefetch windows materially lowers transfer volume.
+
+Decision: do not use segment size 24 for the throughput-oriented configuration.
+Keep segment size 12.
+
+## 20. Expanded Prefetch Supply
+
+Timestamp: 2026-06-05 15:00 CST
+
+Objective:
+
+Determine whether the two-stream path can transfer more experts when software
+budgets, rather than stream count, are increased.
+
+Changes from the ratio 0.50 two-stream latency configuration:
+
+```text
+prefetch_step_budget: 4 -> 8
+draft_prefetch_max_per_boundary: 4 -> 8
+prefetch_max_inflight: 8 -> 16
+draft_prefetch_visible_budget_ms: 3 -> 6
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream2_budget8_20260605_150006.log
+```
+
+Raw report:
+
+```text
+results/draft_profile_20260605/pinned_ratio50_stream2_budget8.json
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 66
+late transfer bytes: 0
+max observed in-flight: 16
+```
+
+Results:
+
+| Metric | Budget 4 | Budget 8 | Change |
+|---|---:|---:|---:|
+| draft forward | 20.816 ms | 21.830 ms | +1.014 ms |
+| draft / standard | 1.424x | 1.489x | regressed |
+| completed experts/draft | 7.394 | 11.667 | +57.8% |
+| completed MiB/draft | 66.55 MiB | 105.0 MiB | +57.8% |
+| H2D enqueue/draft | 1.314 ms | 2.110 ms | +0.796 ms |
+| segment submit-after | 2.781 ms | 4.334 ms | +1.553 ms |
+| verify forward | 219.546 ms | 199.785 ms | -9.0% |
+
+Analysis:
+
+1. Stream count was not the limiting factor for expert volume; software
+   submission and in-flight budgets were.
+2. The larger budget converts approximately `1 ms` of additional draft
+   latency into `38.45 MiB` more expert data per draft forward.
+3. More prefetched experts reduce verify forward by about `19.8 ms`, so this
+   may improve end-to-end speculative-step latency even though draft-only
+   latency increases.
+4. The choice is workload-policy dependent and should be explicit.
+
+Decision:
+
+- Latency-oriented profile: budget 4, in-flight 8, visible budget 3 ms.
+- Transfer/verify-oriented profile: budget 8, in-flight 16, visible budget
+  6 ms.
+- Do not silently change the global defaults.
+
+## 21. Final Root-Cause And Recommendation
+
+### 21.1 Root cause
+
+The dominant original draft prefetch overhead was not candidate ranking or
+cache reservation. It was expert H2D submission from pageable CPU tensors.
+
+At cache ratio 0.50:
+
+```text
+pageable draft-source enqueue: 9.362 ms/forward
+pinned draft-source enqueue:   1.314 ms/forward
+```
+
+At cache ratio 0.25, segment enqueue changed from:
+
+```text
+17.107 ms/forward -> 2.556 ms/forward
+```
+
+### 21.2 Recommended latency configuration
+
+```text
+cpu_expert_pin_memory=true
+prefetch_transfer_stream_count=2
+draft_prefetch_segment_size=12
+prefetch_step_budget=4
+draft_prefetch_max_per_boundary=4
+prefetch_max_inflight=8
+draft_prefetch_visible_budget_ms=3
+```
+
+Observed results:
+
+| Cache ratio | Standard decode | Optimized draft | Ratio | Experts/draft | MiB/draft |
+|---:|---:|---:|---:|---:|---:|
+| 0.25 | 14.707 ms | 22.726 ms | 1.545x | 12.973 | 116.76 |
+| 0.50 | 14.616 ms | 20.816 ms | 1.424x | 7.394 | 66.55 |
+
+### 21.3 Recommended transfer-oriented configuration
+
+For ratio 0.50 when verify latency or expert coverage matters more than
+draft-only latency:
+
+```text
+prefetch_step_budget=8
+draft_prefetch_max_per_boundary=8
+prefetch_max_inflight=16
+draft_prefetch_visible_budget_ms=6
+```
+
+Observed:
+
+```text
+11.667 experts/draft
+105.0 MiB/draft
+21.830 ms draft forward
+199.785 ms verify forward
+```
+
+### 21.4 Remaining draft versus standard gap
+
+For the ratio 0.50 latency configuration, the `6.20 ms` remaining gap includes:
+
+1. Draft graph replay versus standard graph replay: approximately `3.22 ms`.
+2. Draft mode transition: approximately `0.99 ms`.
+3. Prefetch-before drain, phase-1 submit, and metadata recorder arm:
+   approximately `1.33 ms`.
+4. Remaining routing, wrapper, publication, and worker interaction overhead.
+
+Segment size 24 proved that graph launch count itself is not the main replay
+gap. Closing the remaining difference requires architectural work such as a
+global/device-visible execution mode, less Python/GIL interaction around
+metadata processing, or a draft graph path with less heterogeneous cache and
+reroute overhead. Those changes have a larger correctness blast radius than
+the pinned transfer and stream-pool changes implemented here.
+
+## 22. Final Verification
+
+Timestamp: 2026-06-05 15:04 CST
+
+Branch:
+
+```text
+codex/draft-forward-prefetch-opt
+```
+
+Implementation commits:
+
+```text
+26c5a1f perf: instrument draft expert prefetch
+0c1b21f perf: expose pinned expert prefetch profiling
+a2a1c08 perf: add expert transfer stream pool
+```
+
+Command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+  source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+  conda activate nano_moe
+  export CUDA_VISIBLE_DEVICES=2
+  cd /home/mumura/moe_spec/nano-vllm-moe
+  python -m py_compile \
+    nanovllm/config.py \
+    nanovllm/expert/prefetcher.py \
+    examples/heterogeneous_benchmark_case.py \
+    examples/benchmarks/draft_standard_decode_forward_bench.py
+  python -m unittest \
+    tests/test_config_prefetch.py \
+    tests/test_predictive_prefetch_cli_args.py \
+    tests/test_prefetch_runtime.py \
+    tests/test_expert_cache_staging.py \
+    tests/test_draft_standard_decode_forward_bench.py
+'
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_final_verification_20260605_150453.log
+```
+
+Result:
+
+```text
+py_compile: OK
+Ran 48 tests in 2.775s
+OK
+git diff --check: OK
+```
+
+The pre-existing unrelated worktree changes listed earlier in this report were
+left untouched and are not included in the implementation commits.
