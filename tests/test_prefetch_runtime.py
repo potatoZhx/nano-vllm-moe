@@ -359,6 +359,17 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertGreaterEqual(prof["draft_segment_indexed_prefetch_transfer_enqueue_ms"], 0.0)
         self.assertGreaterEqual(prof["draft_segment_indexed_prefetch_completion_latency_ms"], 0.0)
 
+    def test_transfer_stream_pool_rotates_round_robin(self):
+        runtime, _cache = self._build_runtime()
+        runtime.config.prefetch_transfer_stream_count = 3
+        runtime._initialize_transfer_stream_pool()
+
+        indices = [runtime._acquire_transfer_stream()[0] for _ in range(5)]
+
+        self.assertEqual(indices, [0, 1, 2, 0, 1])
+        self.assertEqual(len(runtime.transfer_streams), 3)
+        self.assertIs(runtime.transfer_stream, runtime.transfer_streams[0])
+
     def test_draft_direct_active_budget_can_adapt_down(self):
         runtime, _cache = self._build_runtime()
         runtime.config.draft_prefetch_min_per_boundary = 0

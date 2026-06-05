@@ -166,6 +166,8 @@ def run_case(
             str(args.prefetch_step_budget),
             "--prefetch-max-inflight",
             str(args.prefetch_max_inflight),
+            "--prefetch-transfer-stream-count",
+            str(args.prefetch_transfer_stream_count),
             "--prefetch-staging-slots-per-layer",
             str(args.prefetch_staging_slots_per_layer),
             "--return-token-ids",
@@ -391,6 +393,15 @@ def extract_draft_forward_metrics(case_result: dict) -> dict:
             "prefetch_max_inflight_observed": int(
                 profile.get("model_prefetch_max_inflight_observed", 0)
             ),
+            "prefetch_transfer_stream_count": int(
+                profile.get("model_prefetch_transfer_stream_count", 1)
+            ),
+            "prefetch_submit_count_by_stream": dict(
+                profile.get("model_prefetch_submit_count_by_stream", {})
+            ),
+            "prefetch_submitted_bytes_by_stream": dict(
+                profile.get("model_prefetch_submitted_bytes_by_stream", {})
+            ),
             "draft_segment_reservation_ms_per_forward": _per_call(
                 profile,
                 "model_draft_segment_indexed_prefetch_reservation_ms",
@@ -596,6 +607,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-verify-wait-ms", type=float, default=1.0)
     parser.add_argument("--prefetch-step-budget", type=int, default=4)
     parser.add_argument("--prefetch-max-inflight", type=int, default=8)
+    parser.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--port-retry", type=int, default=8)
@@ -696,6 +708,7 @@ def main() -> None:
             "prefetch_verify_wait_ms": args.prefetch_verify_wait_ms,
             "prefetch_step_budget": args.prefetch_step_budget,
             "prefetch_max_inflight": args.prefetch_max_inflight,
+            "prefetch_transfer_stream_count": args.prefetch_transfer_stream_count,
             "prefetch_staging_slots_per_layer": args.prefetch_staging_slots_per_layer,
             "repeats": args.repeats,
             "port_retry": args.port_retry,

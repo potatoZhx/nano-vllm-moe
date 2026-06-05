@@ -36,6 +36,7 @@ class Config:
     prefetch_strategy: str = "history_window"
     prefetch_staging_slots_per_layer: int = 2
     prefetch_max_inflight: int = 8
+    prefetch_transfer_stream_count: int = 1
     prefetch_step_budget: int = 4
     cache_eviction_budget_per_step: int = 2
     prefetch_verify_wait_ms: float = 0.0
@@ -146,6 +147,7 @@ class Config:
         assert self.prefetch_strategy in {"noop", "history_window"}
         assert self.prefetch_staging_slots_per_layer >= 0
         assert self.prefetch_max_inflight >= 0
+        assert self.prefetch_transfer_stream_count >= 1
         assert self.prefetch_step_budget >= 0
         assert self.cache_eviction_budget_per_step >= 0
         assert self.prefetch_verify_wait_ms >= 0.0

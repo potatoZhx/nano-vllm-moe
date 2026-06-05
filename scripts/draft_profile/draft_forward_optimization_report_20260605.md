@@ -923,3 +923,166 @@ Decision:
    multiple streams.
 3. Test stream counts `1/2/4` only on a pinned-host path; otherwise the
    experiment measures pageable staging rather than CUDA copy concurrency.
+
+## 15. Pinned-Host Control
+
+### 15.1 Cache Ratio 0.50, One Transfer Stream
+
+Timestamp: 2026-06-05 14:40 CST
+
+Code revision:
+
+```text
+0c1b21f perf: expose pinned expert prefetch profiling
+```
+
+Command change relative to Section 14.2:
+
+```text
+--cpu-expert-pin-memory true
+--dist-port-base 30240
+--raw-output-dir results/draft_profile_20260605/raw_pinned_ratio50_stream1
+--output results/draft_profile_20260605/pinned_ratio50_stream1.json
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_pinned_ratio50_stream1_20260605_144037.log
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 71
+late transfer bytes: 0
+```
+
+Performance comparison:
+
+| Metric | Pageable, stream 1 | Pinned, stream 1 | Change |
+|---|---:|---:|---:|
+| standard decode forward | 14.695 ms | 14.486 ms | -1.4% |
+| draft forward | 22.732 ms | 21.347 ms | -6.1% |
+| draft / standard | 1.547x | 1.474x | improved |
+| draft graph replay | 16.972 ms | 16.736 ms | -1.4% |
+| draft prefetch-before | 1.915 ms | 1.511 ms | -21.1% |
+| segment submit-after | 9.864 ms | 3.095 ms | -68.6% |
+| all draft-source H2D enqueue | 9.362 ms | 1.505 ms | -83.9% |
+| segment H2D enqueue | 8.580 ms | 1.427 ms | -83.4% |
+| submitted/completed/published experts | 5.000 | 7.549 | +51.0% |
+| submitted/completed/published bytes | 45.0 MiB | 67.9 MiB | +51.0% |
+| verify forward | 382.236 ms | 230.617 ms | -39.7% |
+
+Pinned source detail:
+
+```text
+predictive_phase1:       48 experts, 0.078 ms enqueue/draft-forward
+draft_segment_indexed:  488 experts, 1.427 ms enqueue/draft-forward
+verify_layer_predict:   380 experts, excluded from draft-source aggregate
+```
+
+Analysis:
+
+1. Full expert pinning removes almost all pageable staging cost and makes H2D
+   submission genuinely asynchronous.
+2. Reduced enqueue time allows the adaptive segment path to submit and complete
+   more experts within the same run.
+3. Draft latency improves by less than the enqueue reduction because much of
+   the asynchronous worker time was already overlapped with graph replay, and
+   the optimized run intentionally transfers 51% more data.
+4. The remaining draft gap to standard decode is `6.861 ms`; draft graph replay
+   itself remains `3.383 ms` slower than standard graph replay, and wrapper,
+   mode-set, prefetch-before, and segment-boundary handling account for most of
+   the rest.
+5. The one-time model startup cost increases because the CPU expert pool is
+   pinned. It is not part of forward latency, but it is an operational tradeoff
+   and consumes pinned host memory.
+
+Decision: retain explicit pinned-memory support for the benchmark and use this
+run as the stream-pool control.
+
+## 16. Transfer Stream Pool Implementation
+
+Timestamp: 2026-06-05 14:44-14:46 CST
+
+Objective:
+
+Add an opt-in fixed transfer stream pool while preserving one event per expert
+ticket and deferred cache publication.
+
+Implementation:
+
+1. Add `Config.prefetch_transfer_stream_count`, default `1`, minimum `1`.
+2. Create all transfer streams once during `PrefetchRuntime` initialization.
+3. Assign tickets round-robin and keep both expert tensor copies on the same
+   stream.
+4. Keep `transfer_stream` as an alias for stream 0 for compatibility.
+5. Publish a cache mapping only after that ticket's event reports ready.
+6. Export submitted experts, bytes, enqueue time, and completion latency by
+   stream.
+7. Expose `--prefetch-transfer-stream-count` through both benchmark CLIs.
+
+RED log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_stream_pool_red_20260605_144431.log
+```
+
+Expected failures:
+
+```text
+Config field missing
+CLI arguments missing
+round-robin helper missing
+benchmark stream metrics missing
+```
+
+The first GREEN attempt found a backward-compatibility issue in tests and
+legacy callers that construct config-like `SimpleNamespace` objects:
+
+```text
+AttributeError: prefetch_transfer_stream_count
+```
+
+Compatibility fix:
+
+```python
+getattr(config, "prefetch_transfer_stream_count", 1)
+```
+
+Final test command:
+
+```bash
+srun --jobid=29629 --ntasks=1 bash -lc '
+  source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+  conda activate nano_moe
+  export CUDA_VISIBLE_DEVICES=2
+  cd /home/mumura/moe_spec/nano-vllm-moe
+  python -m unittest \
+    tests/test_config_prefetch.py \
+    tests/test_predictive_prefetch_cli_args.py \
+    tests/test_prefetch_runtime.py \
+    tests/test_expert_cache_staging.py \
+    tests/test_draft_standard_decode_forward_bench.py
+'
+```
+
+GREEN log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_stream_pool_green_retry_20260605_144613.log
+```
+
+Result:
+
+```text
+Ran 48 tests in 2.630s
+OK
+```
+
+The stream-count default remains one. Counts greater than one are retained only
+if the A100 pinned-host experiments improve completed bytes or experts per
+draft forward without correctness or draft-latency regression.

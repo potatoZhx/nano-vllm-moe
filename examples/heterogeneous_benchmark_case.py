@@ -135,6 +135,7 @@ def run_case(args: argparse.Namespace) -> dict:
         prefetch_strategy=args.prefetch_strategy,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
         prefetch_max_inflight=args.prefetch_max_inflight,
+        prefetch_transfer_stream_count=args.prefetch_transfer_stream_count,
         prefetch_step_budget=args.prefetch_step_budget,
         cache_eviction_budget_per_step=args.cache_eviction_budget_per_step,
         prefetch_verify_wait_ms=args.prefetch_verify_wait_ms,
@@ -219,6 +220,7 @@ def run_case(args: argparse.Namespace) -> dict:
         "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "prefetch_runtime_mode": args.prefetch_runtime_mode,
         "prefetch_runtime_kind": args.prefetch_runtime_kind,
+        "prefetch_transfer_stream_count": args.prefetch_transfer_stream_count,
         "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
         "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "prefetch_metadata_host_buffer_pool_size": int(args.prefetch_metadata_host_buffer_pool_size),
@@ -300,6 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-strategy", type=str, default="history_window")
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     parser.add_argument("--prefetch-max-inflight", type=int, default=8)
+    parser.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
     parser.add_argument("--prefetch-step-budget", type=int, default=4)
     parser.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     parser.add_argument("--prefetch-verify-wait-ms", type=float, default=1.0)
