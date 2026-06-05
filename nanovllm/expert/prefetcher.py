@@ -449,6 +449,8 @@ class PrefetchRuntime:
         self._prefetch_completed_bytes_by_source = defaultdict(int)
         self._prefetch_published_bytes_by_source = defaultdict(int)
         self._prefetch_late_bytes_by_source = defaultdict(int)
+        self._prefetch_transfer_enqueue_ms_by_source = defaultdict(float)
+        self._prefetch_completion_latency_ms_by_source = defaultdict(float)
         self._draft_m3_layers_by_step: dict[int, dict[int, bool]] = {}
         self._draft_m3_step0_steps: set[int] = set()
         self._draft_m3_next_is_step0 = True
@@ -489,6 +491,7 @@ class PrefetchRuntime:
         num_bytes = self._expert_weight_bytes(weights)
         self._profile["prefetch_transfer_enqueue_ms"] += enqueue_ms
         self._profile[f"{source}_prefetch_transfer_enqueue_ms"] += enqueue_ms
+        self._prefetch_transfer_enqueue_ms_by_source[source] += enqueue_ms
         return ready_event, submit_ts_ms, enqueue_ms, num_bytes
 
     def _record_prefetch_submitted(self, ticket: PrefetchTicket) -> None:
@@ -513,6 +516,7 @@ class PrefetchRuntime:
         self._profile[f"{source}_prefetch_completion_latency_ms"] += latency_ms
         self._prefetch_completed_count_by_source[source] += 1
         self._prefetch_completed_bytes_by_source[source] += num_bytes
+        self._prefetch_completion_latency_ms_by_source[source] += latency_ms
 
     def _record_prefetch_published(self, ticket: PrefetchTicket) -> None:
         source = str(ticket.source)
@@ -1710,6 +1714,12 @@ class PrefetchRuntime:
             "prefetch_completed_bytes_by_source": dict(self._prefetch_completed_bytes_by_source),
             "prefetch_published_bytes_by_source": dict(self._prefetch_published_bytes_by_source),
             "prefetch_late_bytes_by_source": dict(self._prefetch_late_bytes_by_source),
+            "prefetch_transfer_enqueue_ms_by_source": dict(
+                self._prefetch_transfer_enqueue_ms_by_source
+            ),
+            "prefetch_completion_latency_ms_by_source": dict(
+                self._prefetch_completion_latency_ms_by_source
+            ),
             "prefetch_wait_ms": float(self._profile.get("prefetch_wait_ms", 0.0)),
             "prefetch_consumed_count": int(self._profile.get("prefetch_consumed_count", 0.0)),
             "prefetch_timeout_count": int(self._profile.get("prefetch_timeout_count", 0.0)),
@@ -1874,6 +1884,8 @@ class PrefetchRuntime:
             self._prefetch_completed_bytes_by_source.clear()
             self._prefetch_published_bytes_by_source.clear()
             self._prefetch_late_bytes_by_source.clear()
+            self._prefetch_transfer_enqueue_ms_by_source.clear()
+            self._prefetch_completion_latency_ms_by_source.clear()
             self._draft_m3_layers_by_step.clear()
             self._draft_m3_step0_steps.clear()
             self._draft_m3_next_is_step0 = True

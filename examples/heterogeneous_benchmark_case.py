@@ -116,6 +116,7 @@ def run_case(args: argparse.Namespace) -> dict:
         draft_cuda_graph_bucket_steps=draft_cuda_graph_bucket_steps,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_backend=args.cpu_expert_backend,
+        cpu_expert_pin_memory=args.cpu_expert_pin_memory,
         draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
         cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
         cpu_expert_packed_min_routes=args.cpu_expert_packed_min_routes,
@@ -208,6 +209,7 @@ def run_case(args: argparse.Namespace) -> dict:
         "draft_reroute_artifact": args.draft_reroute_artifact,
         "draft_cuda_graph_bucket_steps": draft_cuda_graph_bucket_steps,
         "cpu_expert_backend": args.cpu_expert_backend,
+        "cpu_expert_pin_memory": args.cpu_expert_pin_memory,
         "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
         "num_seqs": args.num_seqs,
         "input_len": args.input_len,
@@ -274,6 +276,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-cuda-graph-bucket-steps", type=parse_int_list, default=None)
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-backend", type=str, default="torch")
+    parser.add_argument("--cpu-expert-pin-memory", type=str2bool, default=False)
     parser.add_argument("--draft-cuda-graph-cpu-backend", type=str, default="none",
                         choices=["none", "fused", "fused_sync"])
     parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=8192)

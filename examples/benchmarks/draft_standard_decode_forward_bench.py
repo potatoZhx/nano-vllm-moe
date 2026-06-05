@@ -120,6 +120,8 @@ def run_case(
             str(args.cpu_expert_execution_enabled).lower(),
             "--cpu-expert-backend",
             args.cpu_expert_backend,
+            "--cpu-expert-pin-memory",
+            str(args.cpu_expert_pin_memory).lower(),
             "--draft-cuda-graph-cpu-backend",
             args.draft_cuda_graph_cpu_backend,
             "--dist-port",
@@ -370,6 +372,22 @@ def extract_draft_forward_metrics(case_result: dict) -> dict:
                 ),
                 float(draft_calls),
             ),
+            "draft_prefetch_transfer_enqueue_ms_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_transfer_enqueue_ms_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
+            "draft_prefetch_completion_latency_ms_per_forward": _safe_ratio(
+                _source_sum(
+                    profile,
+                    "model_prefetch_completion_latency_ms_by_source",
+                    draft_prefetch_sources,
+                ),
+                float(draft_calls),
+            ),
             "prefetch_max_inflight_observed": int(
                 profile.get("model_prefetch_max_inflight_observed", 0)
             ),
@@ -552,6 +570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-cuda-graph-bucket-steps", type=str, default="")
     parser.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=False)
     parser.add_argument("--cpu-expert-backend", type=str, default="torch")
+    parser.add_argument("--cpu-expert-pin-memory", type=str2bool, default=False)
     parser.add_argument("--draft-cuda-graph-cpu-backend", type=str, default="none",
                         choices=["none", "fused", "fused_sync"])
     parser.add_argument("--dist-port-base", type=int, default=29100)
@@ -657,6 +676,7 @@ def main() -> None:
             "draft_reroute_policy": args.draft_reroute_policy,
             "draft_reroute_artifact": args.draft_reroute_artifact,
             "draft_cuda_graph_bucket_steps": args.draft_cuda_graph_bucket_steps,
+            "cpu_expert_pin_memory": args.cpu_expert_pin_memory,
             "seed": args.seed,
             "temperature": args.temperature,
             "enforce_eager": args.enforce_eager,

@@ -30,6 +30,8 @@ class TestPredictivePrefetchCliArgs(unittest.TestCase):
             "0.5",
             "--predictive-phase1-budget",
             "3",
+            "--cpu-expert-pin-memory",
+            "true",
             "--spec-verify-miss-policy",
             "cache_fill",
         ]
@@ -40,6 +42,7 @@ class TestPredictivePrefetchCliArgs(unittest.TestCase):
         self.assertEqual(args.prefetch_runtime_mode, "draft_segment_indexed")
         self.assertEqual(args.prefetch_verify_attention_ratio, 0.5)
         self.assertEqual(args.predictive_phase1_budget, 3)
+        self.assertTrue(args.cpu_expert_pin_memory)
         self.assertEqual(args.spec_verify_miss_policy, "cache_fill")
 
     def test_draft_forward_bench_parser_accepts_segment_indexed_predictive(self):
@@ -56,6 +59,8 @@ class TestPredictivePrefetchCliArgs(unittest.TestCase):
             "0.25",
             "--predictive-phase1-budget",
             "2",
+            "--cpu-expert-pin-memory",
+            "true",
         ]
         with patch.object(sys, "argv", argv):
             args = mod.parse_args()
@@ -64,6 +69,7 @@ class TestPredictivePrefetchCliArgs(unittest.TestCase):
         self.assertEqual(args.prefetch_runtime_mode, "draft_segment_indexed")
         self.assertEqual(args.prefetch_verify_attention_ratio, 0.25)
         self.assertEqual(args.predictive_phase1_budget, 2)
+        self.assertTrue(args.cpu_expert_pin_memory)
 
     def test_spec_verify_stats_parser_exposes_predictive_knobs(self):
         mod = _load_module("benchmarks/scripts/spec_verify_expert_count_stats.py")

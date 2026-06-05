@@ -352,6 +352,8 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertEqual(prof["prefetch_submitted_bytes_by_source"], {"draft_segment_indexed": expected_bytes})
         self.assertEqual(prof["prefetch_completed_bytes_by_source"], {"draft_segment_indexed": expected_bytes})
         self.assertEqual(prof["prefetch_published_bytes_by_source"], {"draft_segment_indexed": expected_bytes})
+        self.assertIn("draft_segment_indexed", prof["prefetch_transfer_enqueue_ms_by_source"])
+        self.assertIn("draft_segment_indexed", prof["prefetch_completion_latency_ms_by_source"])
         self.assertGreaterEqual(prof["prefetch_max_inflight_observed"], 1)
         self.assertGreaterEqual(prof["draft_segment_indexed_prefetch_reservation_ms"], 0.0)
         self.assertGreaterEqual(prof["draft_segment_indexed_prefetch_transfer_enqueue_ms"], 0.0)

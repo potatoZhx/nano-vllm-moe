@@ -776,3 +776,150 @@ the distinction between work submitted during draft and verify-side work that
 was previously mixed into totals. The next runs will determine whether the
 visible overhead is dominated by cache reservation, pageable-host copy enqueue,
 or waiting for transfer completion.
+
+## 14. Instrumented Pageable-Host Results
+
+### 14.1 Cache Ratio 0.25
+
+Timestamp: 2026-06-05 14:32 CST
+
+Code revision:
+
+```text
+26c5a1f perf: instrument draft expert prefetch
+```
+
+The command is identical to Section 12.2 except for:
+
+```text
+--dist-port-base 30200
+--raw-output-dir results/draft_profile_20260605/raw_instrumented_ratio25
+--output results/draft_profile_20260605/instrumented_ratio25.json
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_instrumented_ratio25_20260605_143236.log
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 37
+late transfer bytes: 0
+```
+
+Performance:
+
+| Metric | Value |
+|---|---:|
+| standard decode forward | 15.064 ms |
+| draft forward | 34.710 ms |
+| draft / standard | 2.304x |
+| draft graph replay | 21.626 ms/forward |
+| draft prefetch-before | 7.095 ms/forward |
+| segment submit-after | 18.644 ms/forward |
+| segment reservation | 0.034 ms/forward |
+| segment H2D enqueue | 17.107 ms/forward |
+| segment completion latency sum | 57.480 ms/forward |
+| all draft-source submitted/completed/published | 7.378 experts/forward |
+| all draft-source submitted/completed/published bytes | 69.631 MB/forward |
+| segment submitted experts | 3.378 experts/forward |
+| predictive phase-1 submitted experts | 4.000 experts/forward |
+| max observed in-flight transfers | 8 |
+
+The completion-latency value is the sum of individual ticket latencies divided
+by draft calls, not a wall-clock critical-path duration. For segment tickets,
+the mean submit-to-ready latency is approximately:
+
+```text
+57.480 / 3.378 = 17.02 ms/expert
+```
+
+Analysis:
+
+1. Active-slot reservation is negligible.
+2. Segment H2D enqueue alone is `49.3%` of measured draft-forward wall time.
+3. Each expert is `9 MiB`; the draft path submits about `66.4 MiB/forward`.
+4. The source expert tensors are pageable because
+   `cpu_expert_pin_memory=False` in this benchmark path.
+5. CUDA `non_blocking=True` does not make pageable-host copies fully
+   asynchronous; runtime staging is exposed in the enqueue call.
+6. Adding streams before fixing host memory registration cannot remove this
+   CPU-side enqueue cost.
+
+### 14.2 Cache Ratio 0.50
+
+Timestamp: 2026-06-05 14:36 CST
+
+The command is identical to Section 12.3 except for:
+
+```text
+--dist-port-base 30220
+--raw-output-dir results/draft_profile_20260605/raw_instrumented_ratio50
+--output results/draft_profile_20260605/instrumented_ratio50.json
+```
+
+Log:
+
+```text
+/home/mumura/moe_spec/logs/draft_profile_instrumented_ratio50_20260605_143615.log
+```
+
+Correctness:
+
+```text
+deterministic digest match: true
+standard graph replays: 63
+draft graph replays: 66
+late transfer bytes: 0
+```
+
+Performance:
+
+| Metric | Value |
+|---|---:|
+| standard decode forward | 14.695 ms |
+| draft forward | 22.732 ms |
+| draft / standard | 1.547x |
+| draft graph replay | 16.972 ms/forward |
+| draft prefetch-before | 1.915 ms/forward |
+| segment submit-after | 9.864 ms/forward |
+| all draft-source H2D enqueue | 9.362 ms/forward |
+| segment H2D enqueue | 8.580 ms/forward |
+| predictive phase-1 H2D enqueue | 0.781 ms/forward |
+| segment reservation | 0.029 ms/forward |
+| all draft-source completion latency sum | 66.971 ms/forward |
+| all draft-source submitted/completed/published | 5.000 experts/forward |
+| all draft-source submitted/completed/published bytes | 47.186 MB/forward |
+| segment submitted experts | 4.333 experts/forward |
+| predictive phase-1 submitted experts | 0.667 experts/forward |
+| max observed in-flight transfers | 8 |
+| candidate rank + victim selection | 0.823 ms/forward |
+
+The mean submit-to-ready latency across draft-source tickets is:
+
+```text
+66.971 / 5.000 = 13.39 ms/expert
+```
+
+Analysis:
+
+1. Draft-source enqueue consumes `41.2%` of draft-forward wall time.
+2. The measured gap to standard decode is `8.036 ms`, while enqueue is
+   `9.362 ms`; part of enqueue is overlapped, but it is still the dominant
+   controllable overhead.
+3. Candidate ranking and victim selection remain secondary.
+4. Both ratios complete and publish every submitted expert, so the immediate
+   throughput limit is submission cost rather than ticket cancellation.
+
+Decision:
+
+1. Do not implement bounded candidate ranking at this point.
+2. Expose `cpu_expert_pin_memory` in this benchmark and test it before adding
+   multiple streams.
+3. Test stream counts `1/2/4` only on a pinned-host path; otherwise the
+   experiment measures pageable staging rather than CUDA copy concurrency.

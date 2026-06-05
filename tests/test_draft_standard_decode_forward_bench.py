@@ -106,6 +106,16 @@ class TestDraftStandardDecodeForwardBench(unittest.TestCase):
                     "predictive_phase1": 512,
                     "verify_layer_predict": 512,
                 },
+                "model_prefetch_transfer_enqueue_ms_by_source": {
+                    "draft_segment_indexed": 8.0,
+                    "predictive_phase1": 4.0,
+                    "verify_layer_predict": 20.0,
+                },
+                "model_prefetch_completion_latency_ms_by_source": {
+                    "draft_segment_indexed": 20.0,
+                    "predictive_phase1": 8.0,
+                    "verify_layer_predict": 40.0,
+                },
                 "model_prefetch_max_inflight_observed": 7,
                 "model_draft_segment_indexed_prefetch_reservation_ms": 2.0,
                 "model_draft_segment_indexed_prefetch_transfer_enqueue_ms": 8.0,
@@ -130,6 +140,8 @@ class TestDraftStandardDecodeForwardBench(unittest.TestCase):
         self.assertEqual(breakdown["draft_prefetch_submitted_bytes_per_forward"], 768.0)
         self.assertEqual(breakdown["draft_prefetch_completed_bytes_per_forward"], 640.0)
         self.assertEqual(breakdown["draft_prefetch_published_bytes_per_forward"], 512.0)
+        self.assertEqual(breakdown["draft_prefetch_transfer_enqueue_ms_per_forward"], 3.0)
+        self.assertEqual(breakdown["draft_prefetch_completion_latency_ms_per_forward"], 7.0)
         self.assertEqual(breakdown["prefetch_max_inflight_observed"], 7)
         self.assertEqual(breakdown["draft_segment_reservation_ms_per_forward"], 0.5)
         self.assertEqual(breakdown["draft_segment_transfer_enqueue_ms_per_forward"], 2.0)
