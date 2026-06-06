@@ -184,6 +184,18 @@ class TestConfigPrefetch(unittest.TestCase):
                 spec_verify_miss_policy="gpu",
             )
 
+    def test_kt_direct_cpu_backend_is_opt_in(self):
+        cfg = self._build_config(
+            enable_heterogeneous=True,
+            inference_mode="spec",
+            cpu_expert_backend="kt_direct",
+            kt_direct_backend="avx2_bf16",
+            kt_capture_bs=[1, 2, 4],
+        )
+        self.assertEqual(cfg.cpu_expert_backend, "kt_direct")
+        self.assertEqual(cfg.kt_direct_backend, "avx2_bf16")
+        self.assertEqual(cfg.kt_capture_bs, [1, 2, 4])
+
     def test_invalid_prefetch_decay_fails(self):
         with self.assertRaises(AssertionError):
             self._build_config(

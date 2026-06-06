@@ -193,6 +193,9 @@ class ModelRunner:
                 kt_num_threads=getattr(config, "kt_num_threads", 0),
                 kt_threadpool_count=getattr(config, "kt_threadpool_count", 1),
                 kt_chunked_prefill_size=getattr(config, "kt_chunked_prefill_size", 4096),
+                kt_direct_backend=getattr(config, "kt_direct_backend", "auto"),
+                kt_numa_nodes=getattr(config, "kt_numa_nodes", None) or None,
+                kt_capture_bs=getattr(config, "kt_capture_bs", None),
                 draft_reroute_policy=getattr(config, "draft_reroute_policy", "round_robin"),
                 draft_reroute_profile=draft_reroute_profile,
             )
@@ -2136,6 +2139,28 @@ class ModelRunner:
             profile = {}
             mlp._last_profile = profile
 
+        # ── pre-transfer cache stats (mirrors eager MoE forward path) ──
+        # When verify_cuda_graph is enabled, the normal MoE forward() is
+        # bypassed by prefix graph replay + eager gap + GPU-only suffix.
+        # Record pre-transfer miss/active counts here so that cache hit
+        # rate and miss-per-layer metrics are comparable to the eager path.
+        flat_sel = selected_experts.reshape(-1)
+        total_active = float(flat_sel.numel())
+        if total_active > 0:
+            _, gpu_mask = mlp.expert_cache.remap_experts_to_slots(selected_experts)
+            profile["pre_transfer_cache_miss_sum"] = float((~gpu_mask).sum().item())
+            profile["pre_transfer_active_count_sum"] = total_active
+        else:
+            profile["pre_transfer_cache_miss_sum"] = 0.0
+            profile["pre_transfer_active_count_sum"] = 0.0
+        profile["moe_profile_count"] = 1.0
+        # GPU-only suffix path has zero CPU routes; defaults are overwritten
+        # when the eager fallback path calls MoE forward().
+        for key in ("cpu_route_ratio_sum", "cpu_routes_sum",
+                     "cpu_weight_mass_ratio_sum", "realized_cpu_expert_count_sum"):
+            if key not in profile:
+                profile[key] = 0.0
+
         if runtime_meta_recorder is not None:
             runtime_meta_recorder.record_layer(
                 layer_idx=mlp.layer_idx,
@@ -2184,6 +2209,11 @@ class ModelRunner:
 
         num_tokens = input_ids.numel()
         bucket = self._select_verify_bucket(num_tokens)
+        _vg_debug = os.environ.get("NANOVLLM_VG_DEBUG", "")
+        if _vg_debug:
+            print(f"[VG_DEBUG] step_id={getattr(self, '_current_verify_prefetch_step_id', -1)} "
+                  f"num_tokens={num_tokens} bucket={bucket} input_ids={input_ids.tolist()}",
+                  flush=True)
         gv = self.verify_graph_vars
         context = get_context()
 

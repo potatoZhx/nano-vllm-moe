@@ -20,6 +20,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.fuse_moe import MergedColumnParallelFusedMoeLinear, RowParallelFusedMoeLinear, get_expert_counts_and_idx
 from nanovllm.layers.fuse_moe.functional import fused_moe_linear
 from nanovllm.layers.fuse_moe.cpu_backend import FusedTorchCpuMoeBackend, TorchPackedCpuMoeBackend
+from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCpuMoeBackend
 from nanovllm.layers.fuse_moe.kt_backend import KtKernelCpuMoeBackend
 from nanovllm.layers.fuse_moe.heterogeneous import (
     heterogeneous_moe_forward,
@@ -325,7 +326,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.draft_cuda_graph_cpu_backend = "none"
         self.draft_cpu_graph_mode = False
         self.cpu_expert_packed_min_routes = 32
-        self.cpu_backend: TorchPackedCpuMoeBackend | None = None
+        self.cpu_backend: object | None = None
         self.cpu_gpu_parallel_execution_enabled = "auto"
         self.cpu_gpu_parallel_min_cpu_route_ratio = 0.0
         self.spec_verify_miss_policy = "cpu"
@@ -358,6 +359,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         kt_num_threads: int = 0,
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
+        kt_direct_backend: str = "auto",
+        kt_numa_nodes: list[int] | None = None,
+        kt_capture_bs: list[int] | None = None,
         draft_reroute_policy: str = ROUND_ROBIN,
         draft_reroute_cond_sim: torch.Tensor | None = None,
         draft_reroute_skip_err: torch.Tensor | None = None,
@@ -406,6 +410,26 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 kt_num_threads=kt_num_threads,
                 kt_threadpool_count=kt_threadpool_count,
                 kt_chunked_prefill_size=kt_chunked_prefill_size,
+            )
+        elif cpu_expert_backend == "kt_direct":
+            hidden_size = expert_cache.gate_up_buffer.shape[2]
+            moe_int_size = expert_cache.gate_up_buffer.shape[1] // 2
+            self.cpu_backend = KtDirectCpuMoeBackend(
+                layer_idx=self.layer_idx,
+                cpu_expert_pool=cpu_expert_pool,
+                max_routes=cpu_expert_workspace_max_routes,
+                moe_intermediate_size=moe_int_size,
+                hidden_size=hidden_size,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.num_selected,
+                gpu_expert_mask=expert_cache.get_cached_expert_mask(),
+                kt_num_threads=kt_num_threads,
+                kt_threadpool_count=kt_threadpool_count,
+                kt_chunked_prefill_size=kt_chunked_prefill_size,
+                kt_direct_backend=kt_direct_backend,
+                kt_numa_nodes=kt_numa_nodes,
+                kt_capture_bs=kt_capture_bs,
+                strict_dtype=cpu_expert_strict_dtype,
             )
         elif cpu_expert_backend == "torch":
             self.cpu_backend = None
@@ -1002,6 +1026,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         kt_num_threads: int = 0,
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
+        kt_direct_backend: str = "auto",
+        kt_numa_nodes: list[int] | None = None,
+        kt_capture_bs: list[int] | None = None,
         draft_reroute_policy: str = ROUND_ROBIN,
         draft_reroute_profile: DraftRerouteProfile | None = None,
     ):
@@ -1040,6 +1067,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                     kt_num_threads=kt_num_threads,
                     kt_threadpool_count=kt_threadpool_count,
                     kt_chunked_prefill_size=kt_chunked_prefill_size,
+                    kt_direct_backend=kt_direct_backend,
+                    kt_numa_nodes=kt_numa_nodes,
+                    kt_capture_bs=kt_capture_bs,
                     draft_reroute_policy=draft_reroute_policy,
                     draft_reroute_cond_sim=cond_sim,
                     draft_reroute_skip_err=skip_err,

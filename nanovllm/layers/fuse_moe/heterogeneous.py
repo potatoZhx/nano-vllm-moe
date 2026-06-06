@@ -59,7 +59,7 @@ def heterogeneous_moe_forward(
     cpu_gpu_parallel_execution_enabled: str = "auto",
     cpu_gpu_parallel_min_cpu_route_ratio: float = 0.0,
     cpu_gpu_parallel_stream: torch.cuda.Stream | None = None,
-    cpu_backend: TorchPackedCpuMoeBackend | None = None,
+    cpu_backend: object | None = None,
     cpu_backend_min_routes: int = 32,
     gpu_fallback_workspace: GpuFallbackWorkspace | None = None,
     profile: dict | None = None,
@@ -78,10 +78,30 @@ def heterogeneous_moe_forward(
     has_cpu_work = cpu_indices is not None and cpu_indices.numel() > 0
     cpu_route_ratio = (float(cpu_indices.numel()) / float(flat_selected.numel())) if has_cpu_work else 0.0
     cpu_routes = int(cpu_indices.numel()) if has_cpu_work else 0
+    if os.environ.get("NANOVLLM_VG_DEBUG", ""):
+        layer = getattr(expert_cache, "layer_idx", plan.layer_idx) if expert_cache is not None else plan.layer_idx
+        print(f"[VG_DEBUG] heterogeneous_moe layer_idx={layer} "
+              f"num_tokens={hidden_states.shape[0]} top_k={top_k} "
+              f"total_routes={flat_selected.numel()} cpu_routes={cpu_routes} "
+              f"gpu_routes={plan.gpu_route_indices.numel()}",
+              flush=True)
     if has_cpu_work and bool(getattr(plan, "cpu_graph_enabled", False)):
         active_cpu_backend = cpu_backend
     else:
-        active_cpu_backend = cpu_backend if has_cpu_work and int(cpu_indices.numel()) >= int(cpu_backend_min_routes) else None
+        effective_backend_min_routes = int(
+            getattr(cpu_backend, "min_routes", cpu_backend_min_routes)
+        )
+        active_cpu_backend = (
+            cpu_backend
+            if has_cpu_work and int(cpu_indices.numel()) >= effective_backend_min_routes
+            else None
+        )
+    backend_large_batch_gpu_fallback = False
+    supports_batch_size = getattr(active_cpu_backend, "supports_batch_size", None)
+    if callable(supports_batch_size) and not supports_batch_size(int(hidden_states.shape[0])):
+        # Decode-focused backends can decline large warmup/prefill batches.
+        active_cpu_backend = None
+        backend_large_batch_gpu_fallback = True
     graph_cpu_enabled = (
         bool(getattr(plan, "cpu_graph_enabled", False))
         and hidden_states.is_cuda
@@ -140,6 +160,7 @@ def heterogeneous_moe_forward(
             and has_cpu_work
             and hidden_states.is_cuda
             and cpu_expert_execution_enabled
+            and not backend_large_batch_gpu_fallback
         )
     elif parallel_mode == "on":
         can_overlap_cpu_gpu = (
@@ -147,6 +168,7 @@ def heterogeneous_moe_forward(
             and has_cpu_work
             and hidden_states.is_cuda
             and cpu_expert_execution_enabled
+            and not backend_large_batch_gpu_fallback
             and cpu_route_ratio >= float(cpu_gpu_parallel_min_cpu_route_ratio)
         )
     else:
@@ -362,6 +384,8 @@ def heterogeneous_moe_forward(
                 num_threads=cpu_expert_num_threads,
                 cpu_task_expert_ids_host=plan.cpu_task_expert_ids_host,
                 cpu_task_offsets_host=plan.cpu_task_offsets_host,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
             )
             cpu_route_indices_save = cpu_indices
             cpu_outputs_save = cpu_result.outputs_cpu
@@ -369,7 +393,7 @@ def heterogeneous_moe_forward(
             compute_ms = cpu_result.compute_ms
             _prof_add(profile, "cpu_prepare_ms", prep_ms / 1000.0)
             _prof_add(profile, "cpu_compute_ms", compute_ms / 1000.0)
-        elif cpu_expert_execution_enabled:
+        elif cpu_expert_execution_enabled and not backend_large_batch_gpu_fallback:
             token_indices_chunks, cpu_outputs_chunks, prep_ms, compute_ms = _compute_real_cpu_expert_outputs(
                 hidden_states=hidden_states,
                 flat_weights=flat_weights,

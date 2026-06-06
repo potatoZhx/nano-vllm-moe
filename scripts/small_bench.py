@@ -12,8 +12,8 @@ from typing import Any
 
 """
 TS=$(date +%Y%m%d_%H%M%S)
-LOG=/home/mumura/moe_spec/logs/verify_graph_small_${TS}.log
-srun --jobid=29621 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
+LOG=/home/mumura/moe_spec/logs/tmp_${TS}.log
+srun --jobid=29929 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
 source /opt/Software/Anaconda3/etc/profile.d/conda.sh
 conda activate nano_moe
 cd /home/mumura/moe_spec/nano-vllm-moe/
@@ -24,11 +24,12 @@ print("cuda_available", torch.cuda.is_available())
 print("cuda_device_count", torch.cuda.device_count())
 PY
 python scripts/small_bench.py \
-    --output-dir results/vg_sweep_small \
+    --output-dir results/tmp \
     --runtime-kinds legacy \
-    --output-lens 512 \
-    --cache-ratios 0.4375,0.375,0.3125,0.25 \
+    --output-lens 256 \
+    --cache-ratios 0.25,0.75 \
     --verify-cuda-graph-values true,false \
+    --max-draft-tokens-values 2 \
     --max-model-len 8192 
 EOS
 """
@@ -67,7 +68,8 @@ def max_draft_tokens_for_ratio(ratio: float) -> int:
     rounded = round(float(ratio), 2)
     # 配置表：[(比率阈值, 返回值), ...]
     ratio_config = [
-        (0.25, 1),
+        (0.2375, 1),
+        (0.25, 2),
         (0.45, 4),
         (0.50, 6),
         (0.75, 8),
@@ -116,6 +118,7 @@ def _vg_values(args: argparse.Namespace) -> list[bool]:
 
 def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     vg_values = _vg_values(args)
+    cache_strategies = _parse_csv(args.cache_strategies, str)
     if args.lightweight:
         runtime_kinds = _parse_csv(args.runtime_kinds, str)
         return [
@@ -125,34 +128,42 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "cache_ratio": float(args.lightweight_cache_ratio),
                 "max_draft_tokens": int(args.lightweight_max_draft_tokens),
                 "verify_cuda_graph": bool(vg),
+                "cache_strategy": strategy,
             }
             for runtime_kind in runtime_kinds
             for vg in vg_values
+            for strategy in cache_strategies
         ]
 
     cases: list[dict[str, Any]] = []
+    mdt_values = _parse_csv(args.max_draft_tokens_values, int) if args.max_draft_tokens_values else []
     for runtime_kind in _parse_csv(args.runtime_kinds, str):
         for output_len in _parse_csv(args.output_lens, int):
             for ratio in _parse_csv(args.cache_ratios, float):
-                for vg in vg_values:
-                    cases.append(
-                        {
-                            "runtime_kind": runtime_kind,
-                            "output_len": int(output_len),
-                            "cache_ratio": float(ratio),
-                            "max_draft_tokens": max_draft_tokens_for_ratio(float(ratio)),
-                            "verify_cuda_graph": bool(vg),
-                        }
-                    )
+                mdts = mdt_values if mdt_values else [max_draft_tokens_for_ratio(float(ratio))]
+                for mdt in mdts:
+                    for vg in vg_values:
+                        for strategy in cache_strategies:
+                            cases.append(
+                                {
+                                    "runtime_kind": runtime_kind,
+                                    "output_len": int(output_len),
+                                    "cache_ratio": float(ratio),
+                                    "max_draft_tokens": int(mdt),
+                                    "verify_cuda_graph": bool(vg),
+                                    "cache_strategy": str(strategy),
+                                }
+                            )
     return cases
 
 
 def _case_name(case: dict[str, Any]) -> str:
     ratio_pct = int(round(float(case["cache_ratio"]) * 100))
     vg = "1" if case.get("verify_cuda_graph", True) else "0"
+    strategy = case.get("cache_strategy", "lru")
     return (
         f"{case['runtime_kind']}_ratio{ratio_pct}_"
-        f"l{int(case['output_len'])}_k{int(case['max_draft_tokens'])}_vg{vg}"
+        f"l{int(case['output_len'])}_k{int(case['max_draft_tokens'])}_vg{vg}_{strategy}"
     )
 
 
@@ -169,6 +180,7 @@ def _row_from_raw(case: dict[str, Any], raw: dict[str, Any], quality: dict[str, 
         "runtime_kind": case["runtime_kind"],
         "output_len": int(case["output_len"]),
         "cache_ratio": float(case["cache_ratio"]),
+        "cache_strategy": str(case.get("cache_strategy", "lru")),
         "max_draft_tokens": int(case["max_draft_tokens"]),
         "elapsed_sec": float(elapsed_sec),
         "generated_output_tokens": int(raw.get("generated_output_tokens", 0) or 0),
@@ -265,7 +277,7 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         "--spec-verify-miss-policy",
         args.spec_verify_miss_policy,
         "--cache-strategy",
-        "lru",
+        str(case.get("cache_strategy", "lru")),
         "--cpu-expert-backend",
         args.cpu_expert_backend,
         "--cpu-expert-pin-memory",
@@ -278,6 +290,18 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         "serial",
         "--cpu-expert-num-threads",
         str(args.cpu_expert_num_threads),
+        "--kt-num-threads",
+        str(args.kt_num_threads),
+        "--kt-threadpool-count",
+        str(args.kt_threadpool_count),
+        "--kt-chunked-prefill-size",
+        str(args.kt_chunked_prefill_size),
+        "--kt-direct-backend",
+        args.kt_direct_backend,
+        "--kt-numa-nodes",
+        args.kt_numa_nodes,
+        "--kt-capture-bs",
+        args.kt_capture_bs,
         "--cpu-gpu-parallel-execution-enabled",
         "auto",
         "--cpu-gpu-parallel-min-cpu-route-ratio",
@@ -362,14 +386,15 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
 
 def _delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_key = {
-        (int(row["output_len"]), round(float(row["cache_ratio"]), 4), str(row["runtime_kind"])): row
+        (int(row["output_len"]), round(float(row["cache_ratio"]), 4), str(row["runtime_kind"]), str(row.get("cache_strategy", "lru"))): row
         for row in rows
     }
     out: list[dict[str, Any]] = []
     for row in rows:
         if row["runtime_kind"] != "predictive":
             continue
-        key = (int(row["output_len"]), round(float(row["cache_ratio"]), 4), "legacy")
+        strategy = str(row.get("cache_strategy", "lru"))
+        key = (int(row["output_len"]), round(float(row["cache_ratio"]), 4), "legacy", strategy)
         legacy = by_key.get(key)
         if legacy is None:
             continue
@@ -377,6 +402,7 @@ def _delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "output_len": int(row["output_len"]),
                 "cache_ratio": float(row["cache_ratio"]),
+                "cache_strategy": str(row.get("cache_strategy", "lru")),
                 "acceptance_delta": float(row["acceptance_rate"]) - float(legacy["acceptance_rate"]),
                 "route_hit_delta": float(row["route_hit_rate"]) - float(legacy["route_hit_rate"]),
                 "avg_miss_per_layer_delta": float(row["avg_miss_per_layer"]) - float(legacy["avg_miss_per_layer"]),
@@ -393,10 +419,10 @@ def _delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _delta_rows_verify_graph(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Compare verify_cuda_graph=True vs False for each (output_len, cache_ratio, runtime_kind)."""
+    """Compare verify_cuda_graph=True vs False for each (output_len, cache_ratio, runtime_kind, cache_strategy)."""
     by_key: dict[tuple, dict[bool, dict[str, Any]]] = {}
     for row in rows:
-        key = (int(row["output_len"]), round(float(row["cache_ratio"]), 4), str(row["runtime_kind"]))
+        key = (int(row["output_len"]), round(float(row["cache_ratio"]), 4), str(row["runtime_kind"]), str(row.get("cache_strategy", "lru")))
         vg = bool(row.get("case_verify_cuda_graph", True))
         by_key.setdefault(key, {})[vg] = row
 
@@ -411,6 +437,7 @@ def _delta_rows_verify_graph(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "output_len": int(row_on["output_len"]),
                 "cache_ratio": float(row_on["cache_ratio"]),
                 "runtime_kind": str(row_on["runtime_kind"]),
+                "cache_strategy": str(row_on.get("cache_strategy", "lru")),
                 "acceptance_delta": float(row_on["acceptance_rate"]) - float(row_off["acceptance_rate"]),
                 "route_hit_delta": float(row_on["route_hit_rate"]) - float(row_off["route_hit_rate"]),
                 "avg_miss_per_layer_delta": float(row_on["avg_miss_per_layer"]) - float(row_off["avg_miss_per_layer"]),
@@ -458,12 +485,13 @@ def write_markdown_report(
         "| Dimension | Values |",
         "|---|---|",
         f"| Runtime kinds | `{', '.join(metadata.get('runtime_kinds', []))}` |",
+        f"| Cache strategies | `{', '.join(metadata.get('cache_strategies', []))}` |",
         f"| Cache ratios | `{', '.join(str(x) for x in metadata.get('cache_ratios', []))}` |",
         f"| Output lengths | `{', '.join(str(x) for x in metadata.get('output_lens', []))}` |",
-        "| max_draft_tokens | ratio 0.25 -> 2, ratio 0.50 -> 6, ratio 0.75 -> 10 |",
+        f"| max_draft_tokens | {metadata.get('max_draft_tokens_desc', 'derived from cache_ratio via max_draft_tokens_for_ratio()')} |",
         "| Reroute policy | `entropy_cache_bias` |",
         "| Prefetch mode | `draft_segment_indexed` |",
-        "| Expert cache strategy | `lru` seeded by offline profile |",
+        f"| Expert cache strategy | `{', '.join(metadata.get('cache_strategies', ['lru']))}` |",
         f"| Verify miss policy | `{metadata.get('spec_verify_miss_policy', '')}` |",
         f"| Verify CUDA graph | `{metadata.get('verify_cuda_graph', False)}` |",
         f"| Verify graph buckets | `{', '.join(str(x) for x in metadata.get('verify_cuda_graph_bucket_steps', []))}` |",
@@ -480,6 +508,11 @@ def write_markdown_report(
         f"verify graph: {metadata.get('verify_cuda_graph', False)}",
         f"CPU backend:  {metadata.get('cpu_expert_backend', '')}",
         f"workspace:    cpu_expert_workspace_max_routes={metadata.get('cpu_expert_workspace_max_routes', '')}",
+        f"kt direct:    backend={metadata.get('kt_direct_backend', '')}, "
+        f"threads={metadata.get('kt_num_threads', '')}, "
+        f"pools={metadata.get('kt_threadpool_count', '')}, "
+        f"numa={metadata.get('kt_numa_nodes', '')}, "
+        f"capture_bs={metadata.get('kt_capture_bs', '')}",
         "```",
         "",
         "Metric definitions:",
@@ -513,8 +546,8 @@ def write_markdown_report(
         "",
         "## 3. Results",
         "",
-        "| kind | out | ratio | K | accept | true hit | post-xfer hit | miss/layer | active/layer | weight hit | output tok/s | draft ms | verify ms | verify graph | verify replay/fallback | draft graph | prefetch submit/done/used | phase1 | verify-layer | perfect | step0 perfect | text |",
-        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|---:|:---|---:|---:|---:|---:|:---|",
+        "| kind | out | ratio | strategy | K | accept | true hit | post-xfer hit | miss/layer | active/layer | weight hit | output tok/s | draft ms | verify ms | verify graph | verify replay/fallback | draft graph | prefetch submit/done/used | phase1 | verify-layer | perfect | step0 perfect | text |",
+        "|:---|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|---:|:---|---:|---:|---:|---:|:---|",
     ]
     for row in rows:
         lines.append(
@@ -522,6 +555,7 @@ def write_markdown_report(
             f"{row['runtime_kind']} | "
             f"{row['output_len']} | "
             f"{row['cache_ratio']:.2f} | "
+            f"{row.get('cache_strategy', 'lru')} | "
             f"{row['max_draft_tokens']} | "
             f"{row['acceptance_rate']:.4f} | "
             f"{row['route_hit_rate']:.4f} | "
@@ -550,8 +584,8 @@ def write_markdown_report(
             "",
             "Positive throughput, acceptance, cache hit, and perfect-fraction deltas are improvements. Negative draft/verify ms deltas are improvements.",
             "",
-            "| out | ratio | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | perfect delta | step0 perfect delta |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| out | ratio | strategy | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | perfect delta | step0 perfect delta |",
+            "|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in deltas:
@@ -559,6 +593,7 @@ def write_markdown_report(
             "| "
             f"{row['output_len']} | "
             f"{row['cache_ratio']:.2f} | "
+            f"{row.get('cache_strategy', 'lru')} | "
             f"{row['acceptance_delta']:+.4f} | "
             f"{row['route_hit_delta']:+.4f} | "
             f"{row['avg_miss_per_layer_delta']:+.2f} | "
@@ -577,8 +612,8 @@ def write_markdown_report(
             "Positive throughput and acceptance deltas mean `verify-cuda-graph=true` improves the metric. "
             "Negative draft/verify ms deltas mean the graph reduces forward latency.",
             "",
-            "| kind | out | ratio | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | graph-hit delta | perfect delta | step0 perfect delta |",
-            "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| kind | out | ratio | strategy | accept delta | true-hit delta | miss/layer delta | tok/s delta | draft ms delta | verify ms delta | graph-hit delta | perfect delta | step0 perfect delta |",
+            "|:---|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in vg_deltas:
@@ -587,6 +622,7 @@ def write_markdown_report(
             f"{row['runtime_kind']} | "
             f"{row['output_len']} | "
             f"{row['cache_ratio']:.2f} | "
+            f"{row.get('cache_strategy', 'lru')} | "
             f"{row['acceptance_delta']:+.4f} | "
             f"{row['route_hit_delta']:+.4f} | "
             f"{row['avg_miss_per_layer_delta']:+.2f} | "
@@ -648,14 +684,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "profile_artifact": args.profile_artifact,
         "output_dir": str(output_dir),
         "runtime_kinds": _parse_csv(args.runtime_kinds, str),
-        "cache_ratios": [float(case["cache_ratio"]) for case in cases],
+        "cache_strategies": _parse_csv(args.cache_strategies, str),
+        "cache_ratios": sorted({float(c["cache_ratio"]) for c in cases}),
         "output_lens": sorted({int(case["output_len"]) for case in cases}),
         "cpu_expert_backend": args.cpu_expert_backend,
         "cpu_expert_workspace_max_routes": int(args.cpu_expert_workspace_max_routes),
+        "kt_num_threads": int(args.kt_num_threads),
+        "kt_threadpool_count": int(args.kt_threadpool_count),
+        "kt_chunked_prefill_size": int(args.kt_chunked_prefill_size),
+        "kt_direct_backend": args.kt_direct_backend,
+        "kt_numa_nodes": args.kt_numa_nodes,
+        "kt_capture_bs": args.kt_capture_bs,
         "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "verify_cuda_graph": bool(args.verify_cuda_graph),
         "verify_cuda_graph_values": args.verify_cuda_graph_values,
         "verify_cuda_graph_bucket_steps": _parse_csv(args.verify_cuda_graph_bucket_steps, int),
+        "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int) if args.max_draft_tokens_values else [],
+        "max_draft_tokens_desc": (
+            f"explicit sweep: {args.max_draft_tokens_values}"
+            if args.max_draft_tokens_values
+            else "derived from cache_ratio via max_draft_tokens_for_ratio()"
+        ),
         "max_model_len": int(args.max_model_len),
         "argv": sys.argv,
     }
@@ -688,11 +737,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-kinds", default="legacy,predictive")
     p.add_argument("--output-lens", default="128,512")
     p.add_argument("--cache-ratios", default="0.25,0.50,0.75")
+    p.add_argument("--cache-strategies", default="lru",
+                   help="CSV of expert cache strategies to sweep (e.g. lru,lfu,fifo).")
     p.add_argument("--cache-ratio", dest="cache_ratios", default=argparse.SUPPRESS)
     p.add_argument("--lightweight", type=str2bool, default=False)
     p.add_argument("--lightweight-output-len", type=int, default=64)
     p.add_argument("--lightweight-cache-ratio", type=float, default=0.50)
     p.add_argument("--lightweight-max-draft-tokens", type=int, default=6)
+    p.add_argument("--max-draft-tokens-values", default="",
+                   help="CSV of max_draft_tokens values to sweep. "
+                        "When non-empty, each value is tested independently instead of "
+                        "deriving max_draft_tokens from cache_ratio via max_draft_tokens_for_ratio().")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
@@ -701,6 +756,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
     p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=327680)
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    p.add_argument("--kt-num-threads", type=int, default=0)
+    p.add_argument("--kt-threadpool-count", type=int, default=1)
+    p.add_argument("--kt-chunked-prefill-size", type=int, default=4096)
+    p.add_argument(
+        "--kt-direct-backend",
+        choices=["auto", "amx_bf16", "avx2_bf16"],
+        default="auto",
+    )
+    p.add_argument("--kt-numa-nodes", default="")
+    p.add_argument("--kt-capture-bs", default="1,2,4,8,16,32")
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)

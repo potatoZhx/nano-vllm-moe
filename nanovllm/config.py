@@ -89,6 +89,9 @@ class Config:
     kt_num_threads: int = 0                # kt-kernel CPU threads (0=auto)
     kt_threadpool_count: int = 1           # kt-kernel NUMA sub-pools
     kt_chunked_prefill_size: int = 4096    # kt-kernel prefill chunk size
+    kt_direct_backend: str = "auto"         # auto | amx_bf16 | avx2_bf16
+    kt_numa_nodes: list[int] = field(default_factory=list)
+    kt_capture_bs: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
     gpu_plan_builder_enabled: bool = False
     gpu_plan_builder_fallback: bool = True
     draft_cuda_graph_enabled: bool = True
@@ -175,13 +178,20 @@ class Config:
         assert self.draft_prefetch_max_per_boundary >= self.draft_prefetch_min_per_boundary
         assert self.acceptance_strategy in {"greedy", "standard", "standard_sampling", "sampling", "spec_sampling"}
         assert self.spec_verify_miss_policy in {"cpu", "cache_fill", "cache_fill_no_cpu"}
-        assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel"}
+        assert self.cpu_expert_backend in {"torch", "torch_packed", "fused", "kt_kernel", "kt_direct"}
         assert self.cpu_expert_workspace_max_routes >= 1
         assert self.cpu_expert_packed_min_routes >= 1
         assert self.cpu_expert_num_threads >= 1
         assert self.cpu_expert_parallel_mode in {"serial", "expert_parallel", "auto"}
         assert self.cpu_gpu_parallel_execution_enabled in {"off", "on", "auto"}
         assert 0.0 <= self.cpu_gpu_parallel_min_cpu_route_ratio <= 1.0
+        assert self.kt_num_threads >= 0
+        assert self.kt_threadpool_count >= 1
+        assert self.kt_chunked_prefill_size >= 1
+        assert self.kt_direct_backend in {"auto", "amx_bf16", "avx2_bf16"}
+        assert not self.kt_numa_nodes or len(self.kt_numa_nodes) == self.kt_threadpool_count
+        assert self.kt_capture_bs
+        assert all(batch_size >= 1 for batch_size in self.kt_capture_bs)
         assert self.perf_profile_level in {"basic", "detailed"}
         assert self.draft_cuda_graph_max_bs >= 1
         assert len(self.draft_cuda_graph_bucket_steps) > 0

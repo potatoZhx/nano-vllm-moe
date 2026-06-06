@@ -27,6 +27,150 @@ python bench_qwen3_30b_a3b_cpu_experts.py \
     --threads 16 \
     --qlen 1 128 \
     --output result.jsonl
+
+srun --jobid=29929 --ntasks=1 bash -lc '
+source /opt/Software/Anaconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/mumura/moe_spec/nano-vllm-moe/scripts
+python bench_qwen3_30b_a3b_cpu_experts.py --threads 8
+'
+
+
+results:
+Core 4 inside NUMA node 0 not found
+Core 5 inside NUMA node 0 not found
+Core 6 inside NUMA node 0 not found
+Core 7 inside NUMA node 0 not found
+
+============================================================
+  KTransformers CPU Expert 推理基准
+  模型: Qwen3-30B-A3B
+============================================================
+
+系统信息:
+  platform            : Linux-6.8.0-111-generic-x86_64-with-glibc2.39
+  cpu_count           : 128
+  cpu_model           : Intel(R) Xeon(R) Platinum 8358P CPU @ 2.60GHz
+  mem_gb              : 1007.5
+  amx_bf16            : False
+  amx_int8            : False
+  avx512              : True
+
+[WARNING] 当前 CPU 不支持 amx-bf16 指令集。
+          AMXBF16/AMXInt8 backend 可能回退到 AVX-512 或报错。
+
+[AVX2BF16] 正在初始化 4 层随机权重 ...
+[AVX2BF16] Warm-up (200 次迭代) ...
+Warm-up: 100%|██████████| 200/200 [00:00<00:00, 570.96it/s]
+[AVX2BF16] 测试 (2000 次迭代) ...
+Bench: 100%|██████████| 2000/2000 [00:03<00:00, 613.85it/s]
+Core 4 inside NUMA node 0 not found
+Core 5 inside NUMA node 0 not found
+Core 6 inside NUMA node 0 not found
+Core 7 inside NUMA node 0 not found
+
+============================================================
+  [AVX2BF16]  Decode (qlen=1)
+============================================================
+  专家数 / topK        : 128 / 8
+  hidden_size          : 2048
+  intermediate_size    : 768
+  线程 / NUMA子池      : 8 / 1
+  平均延迟             : 1625.0 µs
+  P50 / P95 延迟       : 1625.2 / 1639.2 µs
+  最低延迟             : 1564.2 µs
+  内存带宽             : 46.34 GB/s
+  算力利用             : 0.0463 TFLOPS
+  生成吞吐             : 613.7 tokens/s
+
+[AVX2BF16] 正在初始化 4 层随机权重 ...
+[AVX2BF16] Warm-up (200 次迭代) ...
+Warm-up: 100%|██████████| 200/200 [00:23<00:00,  8.51it/s]
+[AVX2BF16] 测试 (2000 次迭代) ...
+Bench: 100%|██████████| 2000/2000 [03:47<00:00,  8.77it/s]
+
+============================================================
+  [AVX2BF16]  Prefill (qlen=128)
+============================================================
+  专家数 / topK        : 128 / 8
+  hidden_size          : 2048
+  intermediate_size    : 768
+  线程 / NUMA子池      : 8 / 1
+  平均延迟             : 113673.9 µs
+  P50 / P95 延迟       : 117046.7 / 117518.0 µs
+  最低延迟             : 2250.9 µs
+  内存带宽             : 84.80 GB/s
+  算力利用             : 0.0848 TFLOPS
+  生成吞吐             : 1123.2 tokens/s
+
+======================================================================
+  汇总对比
+======================================================================
+  Backend        qlen    Avg(µs)   BW(GB/s)   TFLOPS    tok/s
+  --------------------------------------------------------------
+  AVX2BF16          1     1625.0      46.34   0.0463    613.7
+  AVX2BF16        128   113673.9      84.80   0.0848   1123.2
+CPUInfer[0x566ef7b63390]: Hello
+WorkerPool[0x566ef7bd4e00] 1 subpools, [numa:threads][0:8] 
+===========In NumaPool============
+In Numa Worker Pool at NUMA 0, 8 threads
+TP MOE layer 0, pool: 0x566ef7bd4e00, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bd4e00, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bd4e00, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bd4e00, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+CPUInfer[0x566ef7b63390]: Goodbye
+CPUInfer[0x566ef7bdcf90]: Hello
+WorkerPool[0x566ef7bff930] 1 subpools, [numa:threads][0:8] 
+===========In NumaPool============
+In Numa Worker Pool at NUMA 0, 8 threads
+TP MOE layer 0, pool: 0x566ef7bff930, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bff930, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bff930, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+TP MOE layer 0, pool: 0x566ef7bff930, expert num: 128, num_experts_per_tok: 8
+Created AVX2_BF16_MOE_TP 0 at numa 0
+CPUInfer[0x566ef7bdcf90]: Goodbye
+
+解读：
+**平均延迟 = 一个 token 经过一个 MoE 层的完整 CPU 算子耗时。**
+
+具体来说，每次计时包含：
+
+```
+1 token × 8 个激活专家，每个专家依次执行：
+  ① gate_proj:  [1×2048] @ [2048×768]  → [1×768]   (AVX2 BF16 GEMM)
+  ② up_proj:    [1×2048] @ [2048×768]  → [1×768]   (与 gate 融合调度)
+  ③ SiLU(gate) × up                   → [1×768]   (逐元素激活)
+  ④ down_proj:  [1×768]  @ [768×2048]  → [1×2048]  (AVX2 BF16 GEMM)
+
+最后：8 个专家输出加权求和              → [1×2048]  (FMA 规约)
+```
+
+所以 **1625 µs 是单层 MoE 的延迟**，不是整个模型。
+
+---
+
+**推算整模型的解码延迟（Qwen3-30B-A3B 共 48 层）：**
+
+| 部分 | 估算 |
+|---|---|
+| 48 层 MoE CPU 耗时 | 48 × 1625 µs ≈ **78 ms** |
+| Attention + LayerNorm 等（GPU） | 另计，通常 <10 ms/token |
+| 整体每 token 延迟 | ≈ 78–90 ms → **约 11–13 tokens/s** |
+
+---
+
+**613 tokens/s 怎么理解**
+
+报告里的 `tokens/s = qlen × iters / total_time`，是**纯算子吞吐**（不含调度开销均摊、attention、embedding 等），且只测了**一层**。真实整模型速度会被 48 倍摊薄，以及 GPU/CPU 之间的数据搬运进一步影响。
+
+如果想拿到更接近真实的每层延迟参考，当前 1625 µs 就是有效数字。
 """
 
 import argparse

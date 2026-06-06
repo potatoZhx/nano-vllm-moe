@@ -93,6 +93,11 @@ def _install_verify_layer_probe(sync_layer_timing: bool) -> None:
         mode = getattr(self, "execution_mode", "normal")
         is_verify = mode == "verify"
         is_draft = mode == "draft"
+        token_count = int(hidden_states.shape[0])
+        if (is_verify or is_draft) and token_count > 16:
+            print(f"[PATCHED_DEBUG] mode={mode} layer={getattr(self, 'layer_idx', -1)} "
+                  f"tokens={token_count} top_k={getattr(self, 'num_selected', 0)}",
+                  flush=True)
         if is_verify and SYNC_LAYER_TIMING and torch.cuda.is_available():
             torch.cuda.synchronize()
         t0 = perf_counter()
@@ -433,6 +438,12 @@ def run_single_case(args: argparse.Namespace) -> None:
         "draft_reroute_policy": args.draft_reroute_policy,
         "draft_reroute_artifact": args.draft_reroute_artifact,
         "cpu_expert_backend": args.cpu_expert_backend,
+        "kt_direct_backend": args.kt_direct_backend,
+        "kt_num_threads": int(args.kt_num_threads),
+        "kt_threadpool_count": int(args.kt_threadpool_count),
+        "kt_chunked_prefill_size": int(args.kt_chunked_prefill_size),
+        "kt_numa_nodes": args.kt_numa_nodes,
+        "kt_capture_bs": args.kt_capture_bs,
         "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
         "spec_verify_miss_policy": args.spec_verify_miss_policy,
         "cache_strategy": args.cache_strategy,
@@ -473,6 +484,12 @@ def run_single_case(args: argparse.Namespace) -> None:
         cpu_expert_packed_min_routes=args.cpu_expert_packed_min_routes,
         cpu_expert_parallel_mode=args.cpu_expert_parallel_mode,
         cpu_expert_num_threads=args.cpu_expert_num_threads,
+        kt_num_threads=args.kt_num_threads,
+        kt_threadpool_count=args.kt_threadpool_count,
+        kt_chunked_prefill_size=args.kt_chunked_prefill_size,
+        kt_direct_backend=args.kt_direct_backend,
+        kt_numa_nodes=_parse_int_csv(args.kt_numa_nodes) if args.kt_numa_nodes else [],
+        kt_capture_bs=_parse_int_csv(args.kt_capture_bs),
         cpu_gpu_parallel_execution_enabled=args.cpu_gpu_parallel_execution_enabled,
         cpu_gpu_parallel_min_cpu_route_ratio=args.cpu_gpu_parallel_min_cpu_route_ratio,
         spec_verify_miss_policy=args.spec_verify_miss_policy,
@@ -714,7 +731,7 @@ def run_suite(args: argparse.Namespace) -> None:
     backend_values = [x.strip() for x in args.cpu_expert_backends.split(",") if x.strip()]
     if not backend_values:
         backend_values = [args.cpu_expert_backend]
-    invalid_backends = sorted(set(backend_values) - {"torch", "torch_packed", "fused", "kt_kernel"})
+    invalid_backends = sorted(set(backend_values) - {"torch", "torch_packed", "fused", "kt_kernel", "kt_direct"})
     if invalid_backends:
         raise ValueError(f"Invalid CPU expert backend(s): {invalid_backends}")
     script_path = Path(__file__).resolve()
@@ -778,6 +795,18 @@ def run_suite(args: argparse.Namespace) -> None:
                     args.cpu_expert_parallel_mode,
                     "--cpu-expert-num-threads",
                     str(args.cpu_expert_num_threads),
+                    "--kt-num-threads",
+                    str(args.kt_num_threads),
+                    "--kt-threadpool-count",
+                    str(args.kt_threadpool_count),
+                    "--kt-chunked-prefill-size",
+                    str(args.kt_chunked_prefill_size),
+                    "--kt-direct-backend",
+                    args.kt_direct_backend,
+                    "--kt-numa-nodes",
+                    args.kt_numa_nodes,
+                    "--kt-capture-bs",
+                    args.kt_capture_bs,
                     "--cpu-gpu-parallel-execution-enabled",
                     args.cpu_gpu_parallel_execution_enabled,
                     "--cpu-gpu-parallel-min-cpu-route-ratio",
@@ -943,6 +972,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-expert-packed-min-routes", type=int, default=1)
     p.add_argument("--cpu-expert-parallel-mode", default="serial")
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
+    p.add_argument("--kt-num-threads", type=int, default=0)
+    p.add_argument("--kt-threadpool-count", type=int, default=1)
+    p.add_argument("--kt-chunked-prefill-size", type=int, default=4096)
+    p.add_argument(
+        "--kt-direct-backend",
+        choices=["auto", "amx_bf16", "avx2_bf16"],
+        default="auto",
+    )
+    p.add_argument("--kt-numa-nodes", default="")
+    p.add_argument("--kt-capture-bs", default="1,2,4,8,16,32")
     p.add_argument("--cpu-gpu-parallel-execution-enabled", default="auto")
     p.add_argument("--cpu-gpu-parallel-min-cpu-route-ratio", type=float, default=0.0)
     p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cpu")
