@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -1318,21 +1319,46 @@ class PrefetchRuntime:
         target_layer_idx: int,
         available_ms: float,
     ) -> int:
+        # Debug instrumentation (activated by NANOVLLM_DEBUG_PREFETCH_SUBMIT=1)
+        _dbg_enabled = int(os.environ.get("NANOVLLM_DEBUG_PREFETCH_SUBMIT", "0")) > 0
+        _dbg = None
+        if _dbg_enabled:
+            _dbg = getattr(self, "_vls_dbg", None)
+            if _dbg is None:
+                self._vls_dbg = {
+                    "call": 0, "disabled": 0, "budget_zero": 0, "avail_zero": 0,
+                    "no_cache": 0, "inflight_full": 0, "no_candidates": 0,
+                    "max_submit": 0, "slot_none": 0, "reserve_fail": 0,
+                    "submitted": 0, "budget_stop": 0, "cached_cpu": 0,
+                    "in_flight_skip": 0, "no_weights": 0,
+                    "ranked_total": 0, "ranked_after_filter": 0,
+                    "global_q_size": 0, "avail_ms_sum": 0.0,
+                }
+                _dbg = self._vls_dbg
+            _dbg["call"] += 1
+            _dbg["global_q_size"] = len(self.global_queue.entries)
+            _dbg["avail_ms_sum"] += float(available_ms)
+
         if not bool(getattr(self.config, "prefetch_verify_layer_enabled", True)):
+            if _dbg_enabled: _dbg["disabled"] += 1
             return 0
         if int(self.config.prefetch_step_budget) <= 0:
+            if _dbg_enabled: _dbg["budget_zero"] += 1
             return 0
         if available_ms <= 0.0:
+            if _dbg_enabled: _dbg["avail_zero"] += 1
             return 0
 
         layer_idx = int(target_layer_idx)
         cache = self.layer_caches.get(layer_idx)
         if cache is None:
+            if _dbg_enabled: _dbg["no_cache"] += 1
             return 0
 
         self.publish_direct_active_ready(step_id=step_id)
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
         if inflight_budget <= 0:
+            if _dbg_enabled: _dbg["inflight_full"] += 1
             return 0
 
         inflight_keys = set(self.inflight.keys())
@@ -1341,8 +1367,11 @@ class PrefetchRuntime:
             layer_caches=self.layer_caches,
             inflight_keys=inflight_keys,
         )
+        if _dbg_enabled: _dbg["ranked_total"] += len(ranked)
         ranked = [c for c in self.prefetch_strategy.rank(ranked, step_id=step_id) if int(c.layer_idx) == layer_idx]
+        if _dbg_enabled: _dbg["ranked_after_filter"] += len(ranked)
         if not ranked:
+            if _dbg_enabled: _dbg["no_candidates"] += 1
             return 0
 
         max_submit = min(
@@ -1350,6 +1379,7 @@ class PrefetchRuntime:
             max(0, int(getattr(self.config, "prefetch_verify_layer_max_budget", self.config.prefetch_step_budget))),
             inflight_budget,
         )
+        if _dbg_enabled: _dbg["max_submit"] += max_submit
         submitted = 0
         used_budget_ms = 0.0
 
@@ -1359,12 +1389,15 @@ class PrefetchRuntime:
             expert_idx = int(candidate.expert_idx)
             key = (layer_idx, expert_idx)
             if cache.is_cached_cpu(expert_idx):
+                if _dbg_enabled: _dbg["cached_cpu"] += 1
                 continue
             if key in self.inflight:
+                if _dbg_enabled: _dbg["in_flight_skip"] += 1
                 continue
 
             weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
             if not weights or "gate_up" not in weights or "down" not in weights:
+                if _dbg_enabled: _dbg["no_weights"] += 1
                 continue
 
             transfer_ms = self._estimated_expert_transfer_ms(weights)
@@ -1372,6 +1405,7 @@ class PrefetchRuntime:
                 continue
             if used_budget_ms + transfer_ms > available_ms:
                 self._profile["verify_layer_prefetch_budget_stop_count"] += 1
+                if _dbg_enabled: _dbg["budget_stop"] += 1
                 break
 
             victim_slot = self._select_publish_slot(
@@ -1381,6 +1415,7 @@ class PrefetchRuntime:
                 step_id=step_id,
             )
             if victim_slot is None:
+                if _dbg_enabled: _dbg["slot_none"] += 1
                 continue
 
             reservation = cache.reserve_active_slot_for_prefetch(
@@ -1389,6 +1424,7 @@ class PrefetchRuntime:
                 expert_idx=expert_idx,
             )
             if reservation is None:
+                if _dbg_enabled: _dbg["reserve_fail"] += 1
                 continue
 
             ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
@@ -1421,6 +1457,7 @@ class PrefetchRuntime:
             self._record_prefetch_submitted(ticket)
             submitted += 1
             used_budget_ms += transfer_ms
+            if _dbg_enabled: _dbg["submitted"] += 1
             self._profile["prefetch_submit_count"] += 1
             self._profile["direct_active_prefetch_submit_count"] += 1
             self._profile["verify_layer_prefetch_submit_count"] += 1
@@ -1822,6 +1859,26 @@ class PrefetchRuntime:
             "verify_layer_prefetch_est_transfer_ms": float(self._profile.get("verify_layer_prefetch_est_transfer_ms", 0.0)),
             "verify_layer_prefetch_available_ms": float(self._profile.get("verify_layer_prefetch_available_ms", 0.0)),
             "verify_layer_prefetch_used_budget_ms": float(self._profile.get("verify_layer_prefetch_used_budget_ms", 0.0)),
+            # Debug counters for submit_verify_layer_prefetch early-return reasons
+            "_vls_dbg_call": int(self._vls_dbg.get("call", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_disabled": int(self._vls_dbg.get("disabled", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_budget_zero": int(self._vls_dbg.get("budget_zero", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_avail_zero": int(self._vls_dbg.get("avail_zero", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_no_cache": int(self._vls_dbg.get("no_cache", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_inflight_full": int(self._vls_dbg.get("inflight_full", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_no_candidates": int(self._vls_dbg.get("no_candidates", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_ranked_total_sum": int(self._vls_dbg.get("ranked_total", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_ranked_after_filter_sum": int(self._vls_dbg.get("ranked_after_filter", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_max_submit_sum": int(self._vls_dbg.get("max_submit", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_submitted": int(self._vls_dbg.get("submitted", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_budget_stop": int(self._vls_dbg.get("budget_stop", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_cached_cpu": int(self._vls_dbg.get("cached_cpu", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_in_flight_skip": int(self._vls_dbg.get("in_flight_skip", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_no_weights": int(self._vls_dbg.get("no_weights", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_slot_none": int(self._vls_dbg.get("slot_none", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_reserve_fail": int(self._vls_dbg.get("reserve_fail", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_global_q_size": int(self._vls_dbg.get("global_q_size", 0)) if hasattr(self, "_vls_dbg") else 0,
+            "_vls_dbg_avail_ms_sum": float(self._vls_dbg.get("avail_ms_sum", 0.0)) if hasattr(self, "_vls_dbg") else 0.0,
             "draft_direct_active_prefetch_submit_count": int(self._profile.get("draft_direct_active_prefetch_submit_count", 0.0)),
             "draft_direct_active_prefetch_ready_count": int(self._profile.get("draft_direct_active_prefetch_ready_count", 0.0)),
             "draft_direct_active_prefetch_publish_count": int(self._profile.get("draft_direct_active_prefetch_publish_count", 0.0)),

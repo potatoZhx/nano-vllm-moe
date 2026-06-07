@@ -12,8 +12,8 @@ from typing import Any
 
 """
 TS=$(date +%Y%m%d_%H%M%S)
-LOG=/home/mumura/moe_spec/logs/tmp_${TS}.log
-srun --jobid=29929 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
+LOG=/home/mumura/moe_spec/logs/tmp_vpre_${TS}.log
+srun --jobid=30169 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
 source /opt/Software/Anaconda3/etc/profile.d/conda.sh
 conda activate nano_moe
 cd /home/mumura/moe_spec/nano-vllm-moe/
@@ -24,13 +24,18 @@ print("cuda_available", torch.cuda.is_available())
 print("cuda_device_count", torch.cuda.device_count())
 PY
 python scripts/small_bench.py \
-    --output-dir results/tmp \
-    --runtime-kinds legacy \
+    --output-dir results/tmp_vpre \
+    --runtime-kinds legacy,predictive \
     --output-lens 256 \
     --cache-ratios 0.25,0.75 \
-    --verify-cuda-graph-values true,false \
-    --max-draft-tokens-values 2 \
-    --max-model-len 8192 
+    --verify-cuda-graph-values true \
+    --cache-strategies lru,lfu \
+    --max-draft-tokens-values 8 \
+    --max-model-len 8192 \
+    --prefetch-verify-attention-ratio 1.0 \
+    --prefetch-step-budget 8 \
+    --prefetch-verify-layer-max-budget 8 \
+    --prefetch-max-inflight 16
 EOS
 """
 
@@ -328,6 +333,8 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         str(args.prefetch_verify_wait_ms),
         "--prefetch-step-budget",
         str(args.prefetch_step_budget),
+        "--prefetch-verify-layer-max-budget",
+        str(args.prefetch_verify_layer_max_budget),
         "--prefetch-max-inflight",
         str(args.prefetch_max_inflight),
         "--prefetch-staging-slots-per-layer",
@@ -771,6 +778,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--prefetch-verify-wait-ms", type=float, default=0.0)
     p.add_argument("--prefetch-step-budget", type=int, default=4)
+    p.add_argument("--prefetch-verify-layer-max-budget", type=int, default=2)
     p.add_argument("--prefetch-max-inflight", type=int, default=8)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)

@@ -2148,8 +2148,27 @@ class ModelRunner:
         total_active = float(flat_sel.numel())
         if total_active > 0:
             _, gpu_mask = mlp.expert_cache.remap_experts_to_slots(selected_experts)
-            profile["pre_transfer_cache_miss_sum"] = float((~gpu_mask).sum().item())
+            miss_count = int((~gpu_mask).sum().item())
+            profile["pre_transfer_cache_miss_sum"] = float(miss_count)
             profile["pre_transfer_active_count_sum"] = total_active
+            # Debug: check if prefetcher published experts are hits (NANOVLLM_DEBUG_PREFETCH_SUBMIT=1)
+            if int(os.environ.get("NANOVLLM_DEBUG_PREFETCH_SUBMIT", "0")) > 0:
+                pf_runtime = getattr(self, "prefetch_runtime", None)
+                if pf_runtime is not None and hasattr(pf_runtime, "_recent_published"):
+                    published_hit = 0
+                    published_miss = 0
+                    flat_mask = gpu_mask.reshape(-1)
+                    for idx in range(flat_sel.numel()):
+                        eid = int(flat_sel[idx].item())
+                        key = (int(mlp.layer_idx), eid)
+                        if key in pf_runtime._recent_published:
+                            if bool(flat_mask[idx].item()):
+                                published_hit += 1
+                            else:
+                                published_miss += 1
+                    if published_hit + published_miss > 0:
+                        self._profile["_dbg_published_hit"] = int(self._profile.get("_dbg_published_hit", 0)) + published_hit
+                        self._profile["_dbg_published_miss"] = int(self._profile.get("_dbg_published_miss", 0)) + published_miss
         else:
             profile["pre_transfer_cache_miss_sum"] = 0.0
             profile["pre_transfer_active_count_sum"] = 0.0
