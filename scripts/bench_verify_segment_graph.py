@@ -9,21 +9,16 @@ Compares verify performance across three modes:
 Metrics include per-segment prefetch submit/publish counts, miss routes vs
 unique miss experts, and cache hit rate changes.
 
-Usage example (slurm):
 
-    TS=$(date +%Y%m%d_%H%M%S)
-    LOG=/home/mumura/moe_spec/logs/bench_verify_segment_${TS}.log
-    srun --jobid=30169 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
-    source /opt/Software/Anaconda3/etc/profile.d/conda.sh
     conda activate nano_moe
-    cd /home/mumura/moe_spec/nano-vllm-moe/
-    python scripts/bench_verify_segment_graph.py \\
-        --gpu-memory-utilization 0.99 \\
-        --output-dir results/verify_segment_bench \\
-        --cache-ratios 0.25,0.3125 \\
-        --output-lens 128 \\
-        --max-draft-tokens-values 3 \\
-        --segment-sizes 12,24
+
+    python scripts/bench_verify_segment_graph.py \
+        --gpu-memory-utilization 0.99 \
+        --output-dir results/verify_segment_bench \
+        --cache-ratios 0.3125 \
+        --output-lens 64 \
+        --max-draft-tokens-values 3 \
+        --segment-sizes 12
     EOS
 """
 from __future__ import annotations
@@ -74,6 +69,17 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     for output_len in _parse_csv(args.output_lens, int):
         for ratio in _parse_csv(args.cache_ratios, float):
             for mdt in mdt_values:
+                # Mode 3: kt_hybrid segmented (one case per segment_size)
+                for seg_size in segment_sizes:
+                    cases.append({
+                        "output_len": int(output_len),
+                        "cache_ratio": float(ratio),
+                        "max_draft_tokens": int(mdt),
+                        "verify_cuda_graph": True,
+                        "segment_size": int(seg_size),
+                        "cache_strategy": args.cache_strategy,
+                        "mode": f"kt_hybrid_seg{seg_size}",
+                    })
                 # Mode 1: eager (no graph)
                 cases.append({
                     "output_len": int(output_len),
@@ -94,17 +100,7 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "cache_strategy": args.cache_strategy,
                     "mode": "kt_hybrid_mono",
                 })
-                # Mode 3: kt_hybrid segmented (one case per segment_size)
-                for seg_size in segment_sizes:
-                    cases.append({
-                        "output_len": int(output_len),
-                        "cache_ratio": float(ratio),
-                        "max_draft_tokens": int(mdt),
-                        "verify_cuda_graph": True,
-                        "segment_size": int(seg_size),
-                        "cache_strategy": args.cache_strategy,
-                        "mode": f"kt_hybrid_seg{seg_size}",
-                    })
+
     return cases
 
 
@@ -154,6 +150,21 @@ def _row_from_raw(case: dict[str, Any], raw: dict[str, Any], elapsed_sec: float)
         # verify segment prefetch stats
         "verify_segment_prefetch_submit_count": int(
             prefetch.get("verify_segment_prefetch_submit_count", 0) or 0
+        ),
+        "verify_segment_prefetch_call_count": int(
+            prefetch.get("verify_segment_prefetch_call_count", 0) or 0
+        ),
+        "verify_segment_prefetch_candidate_ranked_count": int(
+            prefetch.get("verify_segment_prefetch_candidate_ranked_count", 0) or 0
+        ),
+        "verify_segment_prefetch_no_candidate_count": int(
+            prefetch.get("verify_segment_prefetch_no_candidate_count", 0) or 0
+        ),
+        "verify_segment_prefetch_skipped_by_budget_count": int(
+            prefetch.get("verify_segment_prefetch_skipped_by_budget_count", 0) or 0
+        ),
+        "verify_segment_prefetch_skipped_by_pending_count": int(
+            prefetch.get("verify_segment_prefetch_skipped_by_pending_count", 0) or 0
         ),
         "verify_segment_prefetch_submit_per_verify": float(
             (prefetch.get("verify_segment_prefetch_submit_count", 0) or 0)
@@ -236,7 +247,6 @@ def run_case(
         "--draft-cuda-graph-cpu-backend", "none",
         "--verify-cuda-graph", str(case["verify_cuda_graph"]).lower(),
         "--verify-cuda-graph-bucket-steps", args.verify_cuda_graph_bucket_steps,
-        "--verify-prefetch-segment-size", str(case["segment_size"]),
         "--prefetch-step-budget", str(args.prefetch_step_budget),
         "--prefetch-verify-layer-max-budget", str(args.prefetch_verify_layer_max_budget),
         "--prefetch-max-inflight", str(args.prefetch_max_inflight),
@@ -249,6 +259,13 @@ def run_case(
         "--seed", str(args.seed),
         "--sync-layer-timing", str(args.sync_layer_timing).lower(),
     ]
+    if case["verify_cuda_graph"]:
+        cmd.extend([
+            "--verify-prefetch-segment-size", str(case["segment_size"]),
+            "--verify-prefetch-visible-budget-ms", str(args.verify_prefetch_visible_budget_ms),
+            "--verify-prefetch-min-per-boundary", str(args.verify_prefetch_min_per_boundary),
+            "--verify-prefetch-max-per-boundary", str(args.verify_prefetch_max_per_boundary),
+        ])
 
     print(f"[{case_index + 1}] running {name}", flush=True)
     t0 = time.time()
@@ -277,6 +294,8 @@ def run_case(
         f"tok/s={row['throughput_output_tok_s']:.3f} verify_ms={row['verify_forward_ms_avg']:.3f} "
         f"seg_prefetch_submit={row['verify_segment_prefetch_submit_count']} "
         f"seg_prefetch/verify={row['verify_segment_prefetch_submit_per_verify']:.1f} "
+        f"seg_candidates={row['verify_segment_prefetch_candidate_ranked_count']} "
+        f"seg_no_candidate={row['verify_segment_prefetch_no_candidate_count']} "
         f"seg_replay={row['verify_kt_hybrid_segment_replay_count']}",
         flush=True,
     )
@@ -470,12 +489,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
-    p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
-    p.add_argument("--prefetch-runtime-kind", default="legacy")
+    p.add_argument("--verify-cuda-graph-bucket-steps", default="3,5,8,12")
+    p.add_argument("--prefetch-runtime-kind", default="predictive")
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=1.0)
-    p.add_argument("--prefetch-step-budget", type=int, default=8)
+    p.add_argument("--prefetch-step-budget", type=int, default=16)
     p.add_argument("--prefetch-verify-layer-max-budget", type=int, default=8)
     p.add_argument("--prefetch-max-inflight", type=int, default=16)
+    p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
+    p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
+    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     p.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)

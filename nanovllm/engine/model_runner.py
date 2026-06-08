@@ -1673,9 +1673,17 @@ class ModelRunner:
                 if self._can_use_verify_cudagraph(int(input_ids.numel())):
                     if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
                         if self._verify_segment_graph_enabled():
-                            hidden_states = self._run_verify_with_kt_hybrid_segment_graph(input_ids, positions)
+                            hidden_states = self._run_verify_with_kt_hybrid_segment_graph(
+                                input_ids,
+                                positions,
+                                step_id=step_id,
+                            )
                         else:
-                            hidden_states = self._run_verify_with_kt_hybrid_graph(input_ids, positions)
+                            hidden_states = self._run_verify_with_kt_hybrid_graph(
+                                input_ids,
+                                positions,
+                                step_id=step_id,
+                            )
                     else:
                         hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
                     logits = F.linear(hidden_states, self.model.lm_head.weight)
@@ -2628,6 +2636,8 @@ class ModelRunner:
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        step_id: int,
     ) -> torch.Tensor:
         """Execute verify forward using full-model CUDA graph with hybrid GPU + kt_direct."""
         num_tokens = input_ids.numel()
@@ -2666,7 +2676,7 @@ class ModelRunner:
         if runtime_meta_recorder is not None:
             runtime_meta_recorder.arm(
                 mode="verify_kt_hybrid",
-                step_id=getattr(self, "_current_verify_prefetch_step_id", 0),
+                step_id=int(step_id),
                 token_capacity=max_bucket,
                 logical_token_count=num_tokens,
             )
@@ -2761,6 +2771,8 @@ class ModelRunner:
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        step_id: int,
     ) -> torch.Tensor:
         """Execute verify forward using per-segment CUDA graphs with inter-segment prefetching."""
         num_tokens = input_ids.numel()
@@ -2799,7 +2811,7 @@ class ModelRunner:
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         max_bucket = max(self.verify_graph_bs)
-        step_id = int(getattr(self, "_current_verify_prefetch_step_id", 0))
+        step_id = int(step_id)
         if runtime_meta_recorder is not None:
             runtime_meta_recorder.arm(
                 mode="verify_kt_hybrid",
@@ -2814,31 +2826,34 @@ class ModelRunner:
         ):
             if prefetch_runtime is not None:
                 with self._prefetch_runtime_lock:
+                    on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
+                    if on_verify_layer_start is not None:
+                        for layer_idx in range(int(layer_start), int(layer_end)):
+                            on_verify_layer_start(layer_idx)
                     prefetch_runtime.publish_direct_active_ready(step_id=step_id)
 
             graph.replay()
 
-            if step_id >= 0:
-                is_last = seg_idx == num_segments - 1
-                self._enqueue_verify_segment_metadata(
-                    step_id=step_id,
-                    token_capacity=max_bucket,
-                    layer_start_idx=int(layer_start),
-                    layer_end_idx=int(layer_end),
-                    is_last_segment=is_last,
-                )
-                if prefetch_runtime is not None:
-                    next_seg = (seg_idx + 1) % num_segments
-                    next_start = boundaries[next_seg][0]
-                    next_end = boundaries[next_seg][1]
-                    with self._prefetch_runtime_lock:
-                        prefetch_runtime.submit_verify_segment_prefetch(
-                            step_id=step_id,
-                            target_layer_start=int(next_start),
-                            target_layer_end=int(next_end),
-                            visible_budget_ms=float(getattr(
-                                self.config, "verify_prefetch_visible_budget_ms", 3.0)),
-                        )
+            is_last = seg_idx == num_segments - 1
+            self._enqueue_verify_segment_metadata(
+                step_id=step_id,
+                token_capacity=max_bucket,
+                layer_start_idx=int(layer_start),
+                layer_end_idx=int(layer_end),
+                is_last_segment=is_last,
+            )
+            if prefetch_runtime is not None:
+                next_seg = (seg_idx + 1) % num_segments
+                next_start = boundaries[next_seg][0]
+                next_end = boundaries[next_seg][1]
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.submit_verify_segment_prefetch(
+                        step_id=step_id,
+                        target_layer_start=int(next_start),
+                        target_layer_end=int(next_end),
+                        visible_budget_ms=float(getattr(
+                            self.config, "verify_prefetch_visible_budget_ms", 12.0)),
+                    )
 
         if runtime_meta_recorder is not None:
             key = runtime_meta_recorder.active_key

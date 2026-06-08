@@ -28,7 +28,7 @@ Circular prefetch: segment N targets segment 0's layers, warming cache for the n
 
 | File | Change |
 |---|---|
-| `nanovllm/config.py` | Added `verify_prefetch_segment_size` (default 12), `verify_prefetch_visible_budget_ms` (3.0), `verify_prefetch_min/max_per_boundary` (0/4); validation in `__post_init__` |
+| `nanovllm/config.py` | Added `verify_prefetch_segment_size` (default 12), `verify_prefetch_visible_budget_ms` (12.0), `verify_prefetch_min/max_per_boundary` (0/16); validation in `__post_init__` |
 | `nanovllm/models/qwen3_moe.py` | Added `forward_verify_kt_hybrid_segment()` on `Qwen3MoeModel` (layer range iteration) and `Qwen3MoeForCausalLM` (embed + dispatch) |
 | `nanovllm/engine/model_runner.py` | Added `_verify_segment_boundaries()`, `_verify_segment_graph_enabled()`, `_capture_verify_cudagraph_kt_hybrid_segments()`, `_run_verify_with_kt_hybrid_segment_graph()`, `_enqueue_verify_segment_metadata()`; modified `_can_use_verify_cudagraph()`, `run_verify()` dispatch, post-verify metadata gating |
 | `nanovllm/expert/prefetcher.py` | Added `verify_segment_index` on `PrefetchRuntime`; added `submit_verify_segment_prefetch()` with bandwidth-budgeted submission; updated `observe_verify()` on both `PrefetchRuntime` and `PredictivePrefetchRuntime` to feed the verify segment index |
@@ -46,6 +46,8 @@ Circular prefetch: segment N targets segment 0's layers, warming cache for the n
    - `submit_verify_segment_prefetch()` — submit prefetch for NEXT segment (circular via `(seg_idx+1) % N`)
 
 4. **Prefetch submission** (`submit_verify_segment_prefetch`): Merges candidates from `draft_segment_index` (primary, draft-prepared), `verify_segment_index` (secondary), and `long_term_segment_index` (fallback). Budget-limited by `verify_prefetch_visible_budget_ms` and `_estimated_expert_transfer_ms()`.
+
+   The benchmark uses `prefetch_step_budget=16`, allowing about 15 transfers per boundary at the measured ~0.79 ms/expert estimate, or roughly 60 transfers across four verify segments.
 
 5. **Compatibility**: When `verify_prefetch_segment_size >= num_layers` → single segment → `_verify_segment_graph_enabled()` returns False → monolithic graph path unchanged.
 

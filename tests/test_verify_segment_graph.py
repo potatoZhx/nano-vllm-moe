@@ -67,9 +67,9 @@ class TestVerifySegmentConfig(unittest.TestCase):
     def _make_config(self, **overrides):
         defaults = dict(
             verify_prefetch_segment_size=12,
-            verify_prefetch_visible_budget_ms=3.0,
+            verify_prefetch_visible_budget_ms=12.0,
             verify_prefetch_min_per_boundary=0,
-            verify_prefetch_max_per_boundary=4,
+            verify_prefetch_max_per_boundary=16,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -77,9 +77,9 @@ class TestVerifySegmentConfig(unittest.TestCase):
     def test_default_values(self):
         cfg = self._make_config()
         self.assertEqual(cfg.verify_prefetch_segment_size, 12)
-        self.assertEqual(cfg.verify_prefetch_visible_budget_ms, 3.0)
+        self.assertEqual(cfg.verify_prefetch_visible_budget_ms, 12.0)
         self.assertEqual(cfg.verify_prefetch_min_per_boundary, 0)
-        self.assertEqual(cfg.verify_prefetch_max_per_boundary, 4)
+        self.assertEqual(cfg.verify_prefetch_max_per_boundary, 16)
 
     def test_segment_size_must_be_positive(self):
         cfg = self._make_config(verify_prefetch_segment_size=0)
@@ -243,6 +243,7 @@ class TestModelForwardSegment(unittest.TestCase):
     def test_causal_lm_first_segment_embeds(self):
         from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
         model = MagicMock(spec=Qwen3MoeForCausalLM)
+        model.model = MagicMock()
         embedded = torch.randn(4, 256)
         model.model.embed_tokens = MagicMock(return_value=embedded)
         model.model.forward_verify_kt_hybrid_segment = MagicMock(return_value=torch.zeros(4, 256))
@@ -259,6 +260,8 @@ class TestModelForwardSegment(unittest.TestCase):
     def test_causal_lm_subsequent_segment_skips_embed(self):
         from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
         model = MagicMock(spec=Qwen3MoeForCausalLM)
+        model.model = MagicMock()
+        model.model.embed_tokens = MagicMock()
         model.model.forward_verify_kt_hybrid_segment = MagicMock(return_value=torch.zeros(4, 256))
 
         hidden = torch.randn(4, 256)
@@ -462,7 +465,87 @@ class TestEnqueueVerifySegmentMetadata(unittest.TestCase):
 
 
 # ===================================================================
-# 7. Post-verify metadata offload gating
+# 7. Segmented replay boundary scheduling
+# ===================================================================
+
+class TestVerifySegmentReplay(unittest.TestCase):
+    def test_replay_uses_explicit_step_id_and_schedules_each_boundary(self):
+        from nanovllm.engine.model_runner import ModelRunner
+        from nanovllm.utils.context import reset_context, set_context
+
+        mr = object.__new__(ModelRunner)
+        mr.config = SimpleNamespace(verify_prefetch_visible_budget_ms=3.0)
+        mr.verify_graph_bs = [4]
+        mr.verify_kt_hybrid_segment_graphs = {
+            4: [MagicMock(), MagicMock()],
+        }
+        mr.verify_kt_hybrid_segment_boundaries = {
+            4: [(0, 2), (2, 4)],
+        }
+        mr.verify_graph_vars = {
+            "input_ids": torch.zeros(4, dtype=torch.int64),
+            "positions": torch.zeros(4, dtype=torch.int64),
+            "cu_seqlens_q": torch.zeros(2, dtype=torch.int32),
+            "cu_seqlens_k": torch.zeros(2, dtype=torch.int32),
+            "slot_mapping": torch.full((4,), -1, dtype=torch.int32),
+            "block_tables": torch.zeros(1, 2, dtype=torch.int32),
+            "hidden_states": torch.zeros(4, 8),
+        }
+        mr._select_verify_bucket = MagicMock(return_value=4)
+        mr.runtime_meta_recorder = None
+        mr._enqueue_verify_segment_metadata = MagicMock()
+        mr._prefetch_runtime_lock = MagicMock()
+        mr.profile_enabled = False
+        mr.rank = 0
+
+        runtime = SimpleNamespace(
+            publish_direct_active_ready=MagicMock(),
+            submit_verify_segment_prefetch=MagicMock(),
+            on_verify_layer_start=MagicMock(),
+        )
+        mr.prefetch_runtime = runtime
+
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen_q=2,
+            max_seqlen_k=8,
+            slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
+            block_tables=torch.zeros(1, 2, dtype=torch.int32),
+        )
+        try:
+            ModelRunner._run_verify_with_kt_hybrid_segment_graph(
+                mr,
+                torch.tensor([1, 2], dtype=torch.int64),
+                torch.tensor([0, 1], dtype=torch.int64),
+                step_id=7,
+            )
+        finally:
+            reset_context()
+
+        self.assertEqual(mr._enqueue_verify_segment_metadata.call_count, 2)
+        for call in mr._enqueue_verify_segment_metadata.call_args_list:
+            self.assertEqual(call.kwargs["step_id"], 7)
+        self.assertEqual(runtime.submit_verify_segment_prefetch.call_count, 2)
+        self.assertEqual(
+            [
+                (
+                    call.kwargs["target_layer_start"],
+                    call.kwargs["target_layer_end"],
+                )
+                for call in runtime.submit_verify_segment_prefetch.call_args_list
+            ],
+            [(2, 4), (0, 2)],
+        )
+        self.assertEqual(
+            [call.args[0] for call in runtime.on_verify_layer_start.call_args_list],
+            [0, 1, 2, 3],
+        )
+
+
+# ===================================================================
+# 8. Post-verify metadata offload gating
 # ===================================================================
 
 class TestPostVerifyMetadataGating(unittest.TestCase):
@@ -492,7 +575,7 @@ class TestPostVerifyMetadataGating(unittest.TestCase):
 
 
 # ===================================================================
-# 8. Runtime meta host buffer pool sizing
+# 9. Runtime meta host buffer pool sizing
 # ===================================================================
 
 class TestRuntimeMetaPoolSizing(unittest.TestCase):
@@ -536,7 +619,7 @@ class TestRuntimeMetaPoolSizing(unittest.TestCase):
 
 
 # ===================================================================
-# 9. Expert status recording across segments
+# 10. Expert status recording across segments
 # ===================================================================
 
 class TestExpertStatusAcrossSegments(unittest.TestCase):
@@ -607,15 +690,15 @@ class TestExpertStatusAcrossSegments(unittest.TestCase):
 
 
 # ===================================================================
-# 10. submit_verify_segment_prefetch integration
+# 11. submit_verify_segment_prefetch integration
 # ===================================================================
 
 class TestSubmitVerifySegmentPrefetch(unittest.TestCase):
     """Test submit_verify_segment_prefetch returns 0 when no candidates."""
 
-    def test_returns_zero_without_candidates(self):
-        from nanovllm.expert.prefetcher import PrefetchRuntime, SegmentCandidateIndex
-        config = SimpleNamespace(
+    @staticmethod
+    def _config(**overrides):
+        defaults = dict(
             prefetch_step_budget=8,
             prefetch_max_inflight=16,
             verify_prefetch_min_per_boundary=0,
@@ -623,13 +706,21 @@ class TestSubmitVerifySegmentPrefetch(unittest.TestCase):
             verify_prefetch_visible_budget_ms=3.0,
             verify_prefetch_segment_size=12,
             prefetch_history_ttl_steps=10,
-            prefetch_history_activation_count_weight=1.0,
-            prefetch_history_score_weight=1.0,
-            prefetch_history_age_penalty=0.1,
+            prefetch_source_weight_prefill=1.0,
+            prefetch_source_weight_verify=1.2,
+            prefetch_source_weight_draft=1.5,
+            prefetch_activation_count_weight=0.1,
+            prefetch_age_penalty=0.02,
             draft_prefetch_frontier_granularity="segment",
             draft_prefetch_segment_size=12,
             prefetch_verify_layer_transfer_bandwidth_gbps=12.0,
         )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_returns_zero_without_candidates(self):
+        from nanovllm.expert.prefetcher import PrefetchRuntime, SegmentCandidateIndex
+        config = self._config()
         rt = object.__new__(PrefetchRuntime)
         rt.config = config
         rt.layer_caches = {}
@@ -659,24 +750,113 @@ class TestSubmitVerifySegmentPrefetch(unittest.TestCase):
             visible_budget_ms=3.0,
         )
         self.assertEqual(submitted, 0)
+        self.assertEqual(rt._profile["verify_segment_prefetch_call_count"], 1)
+        self.assertEqual(rt._profile["verify_segment_prefetch_no_candidate_count"], 1)
 
     def test_returns_zero_budget_exhausted(self):
-        from nanovllm.expert.prefetcher import PrefetchRuntime, SegmentCandidateIndex
-        config = SimpleNamespace(
-            prefetch_step_budget=0,
-            prefetch_max_inflight=16,
-            verify_prefetch_min_per_boundary=0,
-            verify_prefetch_max_per_boundary=4,
-            verify_prefetch_visible_budget_ms=3.0,
-            verify_prefetch_segment_size=12,
-        )
+        from nanovllm.expert.prefetcher import PrefetchRuntime
+        config = self._config(prefetch_step_budget=0)
         rt = object.__new__(PrefetchRuntime)
         rt.config = config
         rt.inflight = {}
+        rt._profile = defaultdict(float)
         submitted = PrefetchRuntime.submit_verify_segment_prefetch(
             rt, step_id=0, target_layer_start=0, target_layer_end=12,
         )
         self.assertEqual(submitted, 0)
+        self.assertEqual(rt._profile["verify_segment_prefetch_skipped_by_budget_count"], 1)
+
+    def test_layer_range_query_handles_different_segment_sizes(self):
+        from nanovllm.expert.prefetcher import PrefetchCandidate, SegmentCandidateIndex
+
+        config = self._config(draft_prefetch_segment_size=24)
+        index = SegmentCandidateIndex(config)
+        cache = MagicMock()
+        cache.is_cached_cpu.return_value = False
+        cache.is_pending_cpu.return_value = False
+        layer_caches = {5: cache, 18: cache}
+        for layer_idx in (5, 18):
+            candidate = PrefetchCandidate(
+                layer_idx=layer_idx,
+                expert_idx=3,
+                source="draft_live",
+                score_sum=1.0,
+                activation_count=1,
+                first_seen_step=1,
+                last_seen_step=1,
+                priority=0.0,
+            )
+            index.entries_by_segment[index._segment_id(layer_idx)][(layer_idx, 3)] = candidate
+
+        candidates = index.candidates_for_layer_range(
+            layer_start=12,
+            layer_end=24,
+            step_id=1,
+            layer_caches=layer_caches,
+            inflight_keys=set(),
+        )
+
+        self.assertEqual([(c.layer_idx, c.expert_idx) for c in candidates], [(18, 3)])
+
+    def test_submits_candidate_from_draft_index_with_different_segment_size(self):
+        from nanovllm.expert.prefetcher import (
+            PrefetchCandidate,
+            PrefetchRuntime,
+            SegmentCandidateIndex,
+        )
+
+        config = self._config(draft_prefetch_segment_size=24)
+        rt = object.__new__(PrefetchRuntime)
+        rt.config = config
+        cache = MagicMock()
+        cache.is_cached_cpu.return_value = False
+        cache.is_pending_cpu.return_value = False
+        cache.reserve_active_slot_for_prefetch_deferred.return_value = SimpleNamespace(
+            active_slot_idx=0,
+            generation=1,
+            prev_expert=0,
+        )
+        rt.layer_caches = {18: cache}
+        weights = {
+            "gate_up": torch.zeros(4, 4),
+            "down": torch.zeros(4, 2),
+        }
+        rt.cpu_expert_pool = {18: {3: weights}}
+        rt.inflight = {}
+        rt._profile = defaultdict(float)
+        rt.draft_segment_index = SegmentCandidateIndex(config)
+        rt.verify_segment_index = SegmentCandidateIndex(config)
+        rt.verify_segment_index.segment_size = 12
+        rt.long_term_segment_index = SegmentCandidateIndex(config)
+        candidate = PrefetchCandidate(
+            layer_idx=18,
+            expert_idx=3,
+            source="draft_live",
+            score_sum=1.0,
+            activation_count=1,
+            first_seen_step=1,
+            last_seen_step=1,
+            priority=0.0,
+        )
+        rt.draft_segment_index.entries_by_segment[0][(18, 3)] = candidate
+        rt._select_publish_slot_cpu = MagicMock(return_value=0)
+        rt._begin_prefetch_transfer = MagicMock(
+            return_value=(MagicMock(), 100.0, 0.1, 64, 0)
+        )
+        rt._record_prefetch_submitted = MagicMock()
+        rt._record_source_submit = MagicMock()
+
+        submitted = PrefetchRuntime.submit_verify_segment_prefetch(
+            rt,
+            step_id=1,
+            target_layer_start=12,
+            target_layer_end=24,
+            visible_budget_ms=3.0,
+        )
+
+        self.assertEqual(submitted, 1)
+        self.assertEqual(rt._profile["verify_segment_prefetch_submit_count"], 1)
+        self.assertIn((18, 3), rt.inflight)
 
 
 if __name__ == "__main__":

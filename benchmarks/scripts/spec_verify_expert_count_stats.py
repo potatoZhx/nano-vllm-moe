@@ -337,12 +337,23 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "total_replay_count": int(ep.get("model_graph_replay_count", 0) or 0),
             "hit_rate": float(ep.get("model_graph_hit_rate", 0.0) or 0.0),
             "verify_enabled": bool(raw.get("case", {}).get("verify_cuda_graph", False)),
-            "verify_call_count": int(ep.get("model_verify_graph_call_count", 0) or 0),
+            "verify_call_count": int(
+                ep.get("model_run_verify_count", ep.get("model_verify_graph_call_count", 0)) or 0
+            ),
             "verify_prefix_replay_count": int(ep.get("model_verify_prefix_graph_replay_count", 0) or 0),
             "verify_prefix_fallback_count": int(ep.get("model_verify_prefix_graph_fallback_count", 0) or 0),
             "verify_dense_replay_count": int(ep.get("model_verify_dense_graph_replay_count", 0) or 0),
             "verify_dense_fallback_count": int(ep.get("model_verify_dense_graph_fallback_count", 0) or 0),
             "verify_kt_hybrid_replay_count": int(ep.get("model_verify_kt_hybrid_graph_replay_count", 0) or 0),
+            "verify_kt_hybrid_segment_graph_replay_count": int(
+                ep.get("model_verify_kt_hybrid_segment_graph_replay_count", 0) or 0
+            ),
+            "verify_segment_metadata_enqueue_count": int(
+                ep.get("model_verify_segment_metadata_enqueue_count", 0) or 0
+            ),
+            "verify_segment_metadata_enqueue_ms": float(
+                ep.get("model_verify_segment_metadata_enqueue_ms", 0.0) or 0.0
+            ),
         },
         "cache": {
             "route_hit_rate": float(max(0.0, min(1.0, 1.0 - cpu_route_ratio))),
@@ -375,6 +386,27 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "verify_layer_ready_count": int(ep.get("model_verify_layer_prefetch_ready_count", 0) or 0),
             "verify_layer_publish_count": int(ep.get("model_verify_layer_prefetch_publish_count", 0) or 0),
             "verify_layer_consumed_count": int(ep.get("model_verify_layer_prefetch_consumed_count", 0) or 0),
+            "verify_segment_prefetch_submit_count": int(
+                ep.get("model_verify_segment_prefetch_submit_count", 0) or 0
+            ),
+            "verify_segment_prefetch_call_count": int(
+                ep.get("model_verify_segment_prefetch_call_count", 0) or 0
+            ),
+            "verify_segment_prefetch_candidate_ranked_count": int(
+                ep.get("model_verify_segment_prefetch_candidate_ranked_count", 0) or 0
+            ),
+            "verify_segment_prefetch_no_candidate_count": int(
+                ep.get("model_verify_segment_prefetch_no_candidate_count", 0) or 0
+            ),
+            "verify_segment_prefetch_skipped_by_budget_count": int(
+                ep.get("model_verify_segment_prefetch_skipped_by_budget_count", 0) or 0
+            ),
+            "verify_segment_prefetch_skipped_by_pending_count": int(
+                ep.get("model_verify_segment_prefetch_skipped_by_pending_count", 0) or 0
+            ),
+            "verify_segment_prefetch_visible_overhead_ms": float(
+                ep.get("model_verify_segment_prefetch_visible_overhead_ms", 0.0) or 0.0
+            ),
         },
         "verify_cache_fill": {
             "policy": raw.get("case", {}).get("spec_verify_miss_policy", "cpu"),
@@ -527,6 +559,10 @@ def run_single_case(args: argparse.Namespace) -> None:
         draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
         verify_cuda_graph=args.verify_cuda_graph,
         verify_cuda_graph_bucket_steps=_parse_int_csv(args.verify_cuda_graph_bucket_steps),
+        verify_prefetch_segment_size=args.verify_prefetch_segment_size,
+        verify_prefetch_visible_budget_ms=args.verify_prefetch_visible_budget_ms,
+        verify_prefetch_min_per_boundary=args.verify_prefetch_min_per_boundary,
+        verify_prefetch_max_per_boundary=args.verify_prefetch_max_per_boundary,
     )
 
     custom_prompt = args.prompt_text
@@ -1025,6 +1061,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-cuda-graph-cpu-backend", choices=["none", "fused", "fused_sync"], default="none")
     p.add_argument("--verify-cuda-graph", type=str2bool, default=False)
     p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
+    p.add_argument("--verify-prefetch-segment-size", type=int, default=12)
+    p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
+    p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
+    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
     p.add_argument("--dist-port", type=int, default=12345)
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)

@@ -103,9 +103,9 @@ class Config:
     verify_cuda_graph_bucket_steps: list[int] = field(default_factory=lambda: [4, 8, 12, 16])
     verify_cuda_graph_kt_hybrid: bool = False
     verify_prefetch_segment_size: int = 12
-    verify_prefetch_visible_budget_ms: float = 3.0
+    verify_prefetch_visible_budget_ms: float = 12.0
     verify_prefetch_min_per_boundary: int = 0
-    verify_prefetch_max_per_boundary: int = 4
+    verify_prefetch_max_per_boundary: int = 16
     perf_profile_level: str = "basic"
 
     def __post_init__(self):

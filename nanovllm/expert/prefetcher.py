@@ -406,6 +406,37 @@ class SegmentCandidateIndex:
             segment_entries.pop(key, None)
         return out
 
+    def candidates_for_layer_range(
+        self,
+        *,
+        layer_start: int,
+        layer_end: int,
+        step_id: int,
+        layer_caches: dict[int, LayerExpertCache],
+        inflight_keys: set[tuple[int, int]],
+    ) -> list[PrefetchCandidate]:
+        start = max(0, int(layer_start))
+        end = max(start, int(layer_end))
+        if start >= end:
+            return []
+
+        first_segment = self._segment_id(start)
+        last_segment = self._segment_id(end - 1)
+        out: list[PrefetchCandidate] = []
+        for segment_id in range(first_segment, last_segment + 1):
+            candidates = self.candidates(
+                segment_id=segment_id,
+                step_id=step_id,
+                layer_caches=layer_caches,
+                inflight_keys=inflight_keys,
+            )
+            out.extend(
+                candidate
+                for candidate in candidates
+                if start <= int(candidate.layer_idx) < end
+            )
+        return out
+
 
 class PrefetchRuntime:
     def __init__(
@@ -1229,44 +1260,60 @@ class PrefetchRuntime:
         visible_budget_ms: float | None = None,
     ) -> int:
         """Submit prefetch for a verify segment's layers. Reads from draft-prepared candidate index."""
+        submit_t0 = time.perf_counter()
+        self._profile["verify_segment_prefetch_call_count"] += 1
         if int(self.config.prefetch_step_budget) <= 0:
+            self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
             return 0
 
-        segment_size = self.verify_segment_index.segment_size
-        target_seg = int(target_layer_start) // segment_size
+        target_start = int(target_layer_start)
+        target_end = int(target_layer_end)
+        target_seg = self.verify_segment_index._segment_id(target_start)
 
         min_submit = max(0, int(getattr(self.config, "verify_prefetch_min_per_boundary", 0)))
         configured_max = max(
             min_submit,
-            int(getattr(self.config, "verify_prefetch_max_per_boundary", 4)),
+            int(getattr(self.config, "verify_prefetch_max_per_boundary", 16)),
         )
         max_submit = min(max(0, int(self.config.prefetch_step_budget)), configured_max)
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
-        if max_submit <= 0 or inflight_budget <= 0:
+        if max_submit <= 0:
+            self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
+            return 0
+        if inflight_budget <= 0:
+            self._profile["verify_segment_prefetch_skipped_by_pending_count"] += 1
             return 0
         dispatch_budget = min(max_submit, inflight_budget)
 
         transfer_budget_ms = float(
             visible_budget_ms
             if visible_budget_ms is not None
-            else getattr(self.config, "verify_prefetch_visible_budget_ms", 3.0)
+            else getattr(self.config, "verify_prefetch_visible_budget_ms", 12.0)
         )
         inflight_keys = set(self.inflight.keys())
 
+        rank_t0 = time.perf_counter()
         ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
         for index in (self.draft_segment_index, self.verify_segment_index, self.long_term_segment_index):
-            candidates = index.candidates(
-                segment_id=target_seg,
+            candidates = index.candidates_for_layer_range(
+                layer_start=target_start,
+                layer_end=target_end,
                 step_id=step_id,
                 layer_caches=self.layer_caches,
                 inflight_keys=inflight_keys,
             )
+            self._profile["verify_segment_prefetch_candidate_scan_count"] += 1
+            self._profile["verify_segment_prefetch_candidate_ranked_count"] += len(candidates)
             for candidate in candidates:
                 key = (int(candidate.layer_idx), int(candidate.expert_idx))
                 prev = ranked_by_key.get(key)
                 if prev is None or candidate.priority > prev.priority:
                     ranked_by_key[key] = candidate
         ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+        self._profile["verify_segment_prefetch_candidate_merge_count"] += len(ranked)
+        self._profile["verify_segment_prefetch_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0
+        if not ranked:
+            self._profile["verify_segment_prefetch_no_candidate_count"] += 1
 
         submitted = 0
         used_transfer_ms = 0.0
@@ -1287,16 +1334,19 @@ class PrefetchRuntime:
 
             weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
             if not weights or "gate_up" not in weights or "down" not in weights:
+                self._profile["verify_segment_prefetch_missing_weights_count"] += 1
                 continue
 
             transfer_ms = self._estimated_expert_transfer_ms(weights)
             if not isfinite(transfer_ms):
+                self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
                 continue
             if (
                 transfer_budget_ms > 0.0
                 and submitted >= min_submit
                 and used_transfer_ms + transfer_ms > transfer_budget_ms
             ):
+                self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
                 break
 
             victim_slot = self._select_publish_slot_cpu(
@@ -1304,6 +1354,7 @@ class PrefetchRuntime:
             )
             if victim_slot is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
+                self._profile["verify_segment_prefetch_skipped_by_pending_count"] += 1
                 continue
 
             reservation = cache.reserve_active_slot_for_prefetch_deferred(
@@ -1311,6 +1362,7 @@ class PrefetchRuntime:
             )
             if reservation is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
+                self._profile["verify_segment_prefetch_skipped_by_pending_count"] += 1
                 continue
 
             ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
@@ -1345,11 +1397,13 @@ class PrefetchRuntime:
             self._profile["prefetch_submit_count"] += 1
             self._profile["direct_active_prefetch_submit_count"] += 1
             self._profile["verify_segment_prefetch_submit_count"] += 1
+            self._profile["verify_segment_prefetch_est_transfer_ms"] += transfer_ms
             self._record_source_submit(candidate.source)
 
+        self._profile["verify_segment_prefetch_used_transfer_budget_ms"] += used_transfer_ms
         self._profile["verify_segment_prefetch_visible_overhead_ms"] += (
-            used_transfer_ms
-        )
+            time.perf_counter() - submit_t0
+        ) * 1000.0
         return submitted
 
     def _estimated_expert_transfer_ms(self, weights: dict[str, torch.Tensor]) -> float:
@@ -1997,6 +2051,41 @@ class PrefetchRuntime:
             "verify_layer_prefetch_est_transfer_ms": float(self._profile.get("verify_layer_prefetch_est_transfer_ms", 0.0)),
             "verify_layer_prefetch_available_ms": float(self._profile.get("verify_layer_prefetch_available_ms", 0.0)),
             "verify_layer_prefetch_used_budget_ms": float(self._profile.get("verify_layer_prefetch_used_budget_ms", 0.0)),
+            "verify_segment_prefetch_call_count": int(self._profile.get("verify_segment_prefetch_call_count", 0.0)),
+            "verify_segment_prefetch_submit_count": int(self._profile.get("verify_segment_prefetch_submit_count", 0.0)),
+            "verify_segment_prefetch_candidate_scan_count": int(
+                self._profile.get("verify_segment_prefetch_candidate_scan_count", 0.0)
+            ),
+            "verify_segment_prefetch_candidate_ranked_count": int(
+                self._profile.get("verify_segment_prefetch_candidate_ranked_count", 0.0)
+            ),
+            "verify_segment_prefetch_candidate_merge_count": int(
+                self._profile.get("verify_segment_prefetch_candidate_merge_count", 0.0)
+            ),
+            "verify_segment_prefetch_no_candidate_count": int(
+                self._profile.get("verify_segment_prefetch_no_candidate_count", 0.0)
+            ),
+            "verify_segment_prefetch_skipped_by_budget_count": int(
+                self._profile.get("verify_segment_prefetch_skipped_by_budget_count", 0.0)
+            ),
+            "verify_segment_prefetch_skipped_by_pending_count": int(
+                self._profile.get("verify_segment_prefetch_skipped_by_pending_count", 0.0)
+            ),
+            "verify_segment_prefetch_missing_weights_count": int(
+                self._profile.get("verify_segment_prefetch_missing_weights_count", 0.0)
+            ),
+            "verify_segment_prefetch_rank_ms": float(
+                self._profile.get("verify_segment_prefetch_rank_ms", 0.0)
+            ),
+            "verify_segment_prefetch_visible_overhead_ms": float(
+                self._profile.get("verify_segment_prefetch_visible_overhead_ms", 0.0)
+            ),
+            "verify_segment_prefetch_est_transfer_ms": float(
+                self._profile.get("verify_segment_prefetch_est_transfer_ms", 0.0)
+            ),
+            "verify_segment_prefetch_used_transfer_budget_ms": float(
+                self._profile.get("verify_segment_prefetch_used_transfer_budget_ms", 0.0)
+            ),
             # Debug counters for submit_verify_layer_prefetch early-return reasons
             "_vls_dbg_call": int(self._vls_dbg.get("call", 0)) if hasattr(self, "_vls_dbg") else 0,
             "_vls_dbg_disabled": int(self._vls_dbg.get("disabled", 0)) if hasattr(self, "_vls_dbg") else 0,

@@ -62,6 +62,37 @@ class TestModelRunnerSpecModes(unittest.TestCase):
         self.assertEqual(mr.model.mode_calls[0][0], "verify")
         self.assertEqual(mr.model.mode_calls[-1][0], "normal")
 
+    def test_segmented_verify_receives_step_id_when_layer_prefetch_is_disabled(self):
+        mr = object.__new__(ModelRunner)
+        mr.model = _DummyModel()
+        mr.config = SimpleNamespace(
+            draft_top_c=1,
+            verify_cuda_graph_kt_hybrid=True,
+            prefetch_verify_layer_enabled=False,
+        )
+        mr.draft_scheduler = object()
+        mr.profile_enabled = False
+        mr.profile_cuda_sync = False
+        mr.world_size = 1
+        mr.rank = 0
+        mr._profile = {}
+        mr._prefetch_step_id = 0
+        mr.prepare_prefill = lambda seqs: (torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
+        mr._can_use_verify_cudagraph = MagicMock(return_value=True)
+        mr._verify_segment_graph_enabled = MagicMock(return_value=True)
+        mr._run_verify_with_kt_hybrid_segment_graph = MagicMock(
+            return_value=torch.tensor(
+                [[2.0, 0.0], [0.0, 3.0], [2.0, 0.0]],
+                dtype=torch.float32,
+            )
+        )
+
+        traces = ModelRunner.run_verify(mr, [SimpleNamespace(seq_id=1)], [3])
+
+        self.assertEqual(traces, [[0, 1, 0]])
+        call = mr._run_verify_with_kt_hybrid_segment_graph.call_args
+        self.assertEqual(call.kwargs["step_id"], 1)
+
     def test_run_verify_cache_fill_no_cpu_skips_verify_metadata_offload(self):
         mr = object.__new__(ModelRunner)
         mr.model = _DummyModel()
