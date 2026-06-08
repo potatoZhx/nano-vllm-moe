@@ -166,12 +166,14 @@ class ModelRunner:
                     layer_indices=sorted(self.layer_caches),
                     top_k=int(getattr(hf_config, "num_experts_per_tok", getattr(hf_config, "top_k", 1))),
                 )
-            # Create shared GPU fallback workspace for unified Triton grouped-GEMM.
-            # Pre-allocate one buffer pool for all layers so uncached expert routes
-            # use the same kernel as cached routes (deterministic alignment).
-            gpu_fallback_workspace = _create_gpu_fallback_workspace(
-                cpu_expert_pool, hf_config
-            )
+            # GPU fallback workspace: only needed when CPU expert execution is
+            # disabled and uncached experts run on GPU for kernel alignment.
+            if not getattr(config, "cpu_expert_execution_enabled", False):
+                gpu_fallback_workspace = _create_gpu_fallback_workspace(
+                    cpu_expert_pool, hf_config
+                )
+            else:
+                gpu_fallback_workspace = None
             self.model.enable_heterogeneous_mode(
                 layer_caches,
                 cpu_expert_pool,
