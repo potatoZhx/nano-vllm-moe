@@ -427,6 +427,8 @@ class PrefetchRuntime:
         self.global_queue = GlobalWarmStartQueue(config)
         self.long_term_segment_index = SegmentCandidateIndex(config)
         self.draft_segment_index = SegmentCandidateIndex(config)
+        self.verify_segment_index = SegmentCandidateIndex(config)
+        self.verify_segment_index.segment_size = max(1, int(getattr(config, "verify_prefetch_segment_size", 12)))
         self.transfer_streams: list[torch.cuda.Stream | None] = []
         self.transfer_stream: torch.cuda.Stream | None = None
         self._next_transfer_stream_idx = 0
@@ -752,6 +754,10 @@ class PrefetchRuntime:
 
     def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
         self._update_rank_guard_scores(runtime_meta)
+        if runtime_meta is not None:
+            self.verify_segment_index.update_from_runtime_meta(
+                runtime_meta, "verify_history", step_id, self.layer_caches,
+            )
         if bool(self.config.prefetch_use_verify_history):
             return self.observe_runtime_meta(
                 runtime_meta,
@@ -1213,6 +1219,138 @@ class PrefetchRuntime:
             self._profile["draft_segment_indexed_prefetch_budget_increase_count"] += 1
         self._draft_segment_indexed_budget = current
         self._profile["draft_segment_indexed_prefetch_adaptive_budget"] = float(current)
+
+    def submit_verify_segment_prefetch(
+        self,
+        *,
+        step_id: int,
+        target_layer_start: int,
+        target_layer_end: int,
+        visible_budget_ms: float | None = None,
+    ) -> int:
+        """Submit prefetch for a verify segment's layers. Reads from draft-prepared candidate index."""
+        if int(self.config.prefetch_step_budget) <= 0:
+            return 0
+
+        segment_size = self.verify_segment_index.segment_size
+        target_seg = int(target_layer_start) // segment_size
+
+        min_submit = max(0, int(getattr(self.config, "verify_prefetch_min_per_boundary", 0)))
+        configured_max = max(
+            min_submit,
+            int(getattr(self.config, "verify_prefetch_max_per_boundary", 4)),
+        )
+        max_submit = min(max(0, int(self.config.prefetch_step_budget)), configured_max)
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        if max_submit <= 0 or inflight_budget <= 0:
+            return 0
+        dispatch_budget = min(max_submit, inflight_budget)
+
+        transfer_budget_ms = float(
+            visible_budget_ms
+            if visible_budget_ms is not None
+            else getattr(self.config, "verify_prefetch_visible_budget_ms", 3.0)
+        )
+        inflight_keys = set(self.inflight.keys())
+
+        ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
+        for index in (self.draft_segment_index, self.verify_segment_index, self.long_term_segment_index):
+            candidates = index.candidates(
+                segment_id=target_seg,
+                step_id=step_id,
+                layer_caches=self.layer_caches,
+                inflight_keys=inflight_keys,
+            )
+            for candidate in candidates:
+                key = (int(candidate.layer_idx), int(candidate.expert_idx))
+                prev = ranked_by_key.get(key)
+                if prev is None or candidate.priority > prev.priority:
+                    ranked_by_key[key] = candidate
+        ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+
+        submitted = 0
+        used_transfer_ms = 0.0
+        for candidate in ranked:
+            if submitted >= dispatch_budget:
+                break
+
+            layer_idx = int(candidate.layer_idx)
+            expert_idx = int(candidate.expert_idx)
+            key = (layer_idx, expert_idx)
+            cache = self.layer_caches.get(layer_idx)
+            if cache is None:
+                continue
+            if cache.is_cached_cpu(expert_idx) or cache.is_pending_cpu(expert_idx):
+                continue
+            if key in self.inflight:
+                continue
+
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+
+            transfer_ms = self._estimated_expert_transfer_ms(weights)
+            if not isfinite(transfer_ms):
+                continue
+            if (
+                transfer_budget_ms > 0.0
+                and submitted >= min_submit
+                and used_transfer_ms + transfer_ms > transfer_budget_ms
+            ):
+                break
+
+            victim_slot = self._select_publish_slot_cpu(
+                cache, expert_idx=expert_idx, step_id=step_id, layer_idx=layer_idx,
+            )
+            if victim_slot is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
+                continue
+
+            reservation = cache.reserve_active_slot_for_prefetch_deferred(
+                layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
+            )
+            if reservation is None:
+                self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
+                continue
+
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
+                cache=cache, reservation=reservation, weights=weights,
+                source="verify_segment", direct_active=True,
+            )
+
+            ticket = PrefetchTicket(
+                step_id=step_id,
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source="verify_segment",
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=submit_ts_ms,
+                ready_event=ready_event,
+                ready=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                segment_id=target_seg,
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
+                transfer_stream_idx=stream_idx,
+            )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
+            submitted += 1
+            used_transfer_ms += transfer_ms
+            inflight_keys.add(key)
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile["verify_segment_prefetch_submit_count"] += 1
+            self._record_source_submit(candidate.source)
+
+        self._profile["verify_segment_prefetch_visible_overhead_ms"] += (
+            used_transfer_ms
+        )
+        return submitted
 
     def _estimated_expert_transfer_ms(self, weights: dict[str, torch.Tensor]) -> float:
         bandwidth_gbps = float(getattr(self.config, "prefetch_verify_layer_transfer_bandwidth_gbps", 12.0))
@@ -2046,6 +2184,10 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         )
 
     def observe_verify(self, runtime_meta, step_id: int) -> dict[str, float]:
+        if runtime_meta is not None:
+            self.verify_segment_index.update_from_runtime_meta(
+                runtime_meta, "verify_history", step_id, self.layer_caches,
+            )
         out = self.observe_runtime_meta(
             runtime_meta,
             source="verify_history",

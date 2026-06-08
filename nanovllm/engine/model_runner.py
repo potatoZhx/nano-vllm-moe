@@ -391,6 +391,21 @@ class ModelRunner:
         segment_size = self._draft_segment_size()
         return [(start, min(start + segment_size, num_layers)) for start in range(0, num_layers, segment_size)]
 
+    def _verify_segment_size(self) -> int:
+        return max(1, int(getattr(self.config, "verify_prefetch_segment_size", 12)))
+
+    def _verify_segment_boundaries(self) -> list[tuple[int, int]]:
+        num_layers = int(getattr(getattr(self.config, "hf_config", None), "num_hidden_layers", 0))
+        if num_layers <= 0:
+            return []
+        segment_size = self._verify_segment_size()
+        return [(s, min(s + segment_size, num_layers)) for s in range(0, num_layers, segment_size)]
+
+    def _verify_segment_graph_enabled(self) -> bool:
+        if not getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
+            return False
+        return len(self._verify_segment_boundaries()) > 1
+
     def _draft_prefetch_frontier_layer_idx(self) -> int | None:
         layer_caches = getattr(self, "layer_caches", None)
         if not layer_caches:
@@ -1657,7 +1672,10 @@ class ModelRunner:
             else:
                 if self._can_use_verify_cudagraph(int(input_ids.numel())):
                     if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
-                        hidden_states = self._run_verify_with_kt_hybrid_graph(input_ids, positions)
+                        if self._verify_segment_graph_enabled():
+                            hidden_states = self._run_verify_with_kt_hybrid_segment_graph(input_ids, positions)
+                        else:
+                            hidden_states = self._run_verify_with_kt_hybrid_graph(input_ids, positions)
                     else:
                         hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
                     logits = F.linear(hidden_states, self.model.lm_head.weight)
@@ -1718,28 +1736,33 @@ class ModelRunner:
                     with self._prefetch_runtime_lock:
                         prefetch_runtime.end_draft_iteration()
                 return verify_outputs
-            _offload_capacity = max(self.verify_graph_bs) if (_use_kt_hybrid and self.verify_graph_bs) else int(input_ids.numel())
-            host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
-                mode=_verify_meta_mode,
-                token_capacity=_offload_capacity,
-            )
-            enqueue_t0 = perf_counter()
-            handle = runtime_meta_recorder.offload_async(
-                prefetch_runtime.metadata_stream,
-                host_buffer_slot=host_buffer_slot,
-            )
-            enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
-            self._enqueue_prefetch_metadata(
-                mode=_verify_meta_mode,
-                step_id=step_id,
-                handle=handle,
-                enqueue_ms=enqueue_ms,
-                host_buffer_slot=host_buffer_slot,
-                submit_after_phase="after_verify",
-                record_verify_consumed=True,
-            )
-            runtime_meta_recorder.reset()
-            self._flush_pending_prefetch_metadata(block=False)
+            _used_segment_graph = _use_kt_hybrid and self._verify_segment_graph_enabled()
+            if _used_segment_graph:
+                runtime_meta_recorder.reset()
+                self._flush_pending_prefetch_metadata(block=False)
+            else:
+                _offload_capacity = max(self.verify_graph_bs) if (_use_kt_hybrid and self.verify_graph_bs) else int(input_ids.numel())
+                host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+                    mode=_verify_meta_mode,
+                    token_capacity=_offload_capacity,
+                )
+                enqueue_t0 = perf_counter()
+                handle = runtime_meta_recorder.offload_async(
+                    prefetch_runtime.metadata_stream,
+                    host_buffer_slot=host_buffer_slot,
+                )
+                enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                self._enqueue_prefetch_metadata(
+                    mode=_verify_meta_mode,
+                    step_id=step_id,
+                    handle=handle,
+                    enqueue_ms=enqueue_ms,
+                    host_buffer_slot=host_buffer_slot,
+                    submit_after_phase="after_verify",
+                    record_verify_consumed=True,
+                )
+                runtime_meta_recorder.reset()
+                self._flush_pending_prefetch_metadata(block=False)
             if self._prefetch_runtime_mode() == "draft_segment_indexed":
                 with self._prefetch_runtime_lock:
                     prefetch_runtime.end_draft_iteration()
@@ -2116,6 +2139,9 @@ class ModelRunner:
 
     def _capture_verify_cudagraph_kt_hybrid(self):
         """Capture full-model CUDA graphs for verify with hybrid GPU + kt_direct."""
+        if self._verify_segment_graph_enabled():
+            self._capture_verify_cudagraph_kt_hybrid_segments()
+            return
         from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCPUBuffer
 
         config = self.config
@@ -2218,12 +2244,148 @@ class ModelRunner:
         )
         self._verify_graph_pool = verify_graph_pool
 
+    def _capture_verify_cudagraph_kt_hybrid_segments(self):
+        """Capture per-segment CUDA graphs for verify with hybrid GPU + kt_direct."""
+        from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCPUBuffer
+
+        boundaries = self._verify_segment_boundaries()
+        config = self.config
+        hf_config = config.hf_config
+        hidden_size = int(hf_config.hidden_size)
+        num_hidden_layers = int(hf_config.num_hidden_layers)
+        max_seqs = min(config.max_num_seqs, 64)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        bucket_steps = sorted(set(getattr(config, "verify_cuda_graph_bucket_steps", [4, 8, 12, 16])))
+        self.verify_graph_bs = bucket_steps
+        max_bucket = max(bucket_steps)
+
+        for bs in bucket_steps:
+            KtDirectCPUBuffer.capture_bs.add(bs)
+
+        input_ids = torch.zeros(max_bucket, dtype=torch.int64)
+        positions = torch.zeros(max_bucket, dtype=torch.int64)
+        cu_seqlens_q = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        slot_mapping = torch.full((max_bucket,), -1, dtype=torch.int32)
+        block_tables = torch.zeros(max_seqs, max_num_blocks, dtype=torch.int32)
+
+        dtype = self.model.lm_head.weight.dtype
+        device = self.model.lm_head.weight.device
+        segment_outputs = [
+            torch.zeros(max_bucket, hidden_size, dtype=dtype, device=device)
+            for _ in boundaries
+        ]
+
+        self.verify_kt_hybrid_segment_graphs: dict[int, list[torch.cuda.CUDAGraph]] = {}
+        self.verify_kt_hybrid_segment_boundaries: dict[int, list[tuple[int, int]]] = {}
+        self.verify_kt_hybrid_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_prefix_graphs = {}
+        self.verify_dense_graphs = {}
+        verify_graph_pool = getattr(self, "draft_graph_pool", None)
+
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+
+        self._set_speculative_execution_mode("verify")
+        try:
+            for bs in reversed(bucket_steps):
+                graphs: list[torch.cuda.CUDAGraph] = []
+                cu_seqlens_q[0] = 0
+                cu_seqlens_q[1] = bs
+                cu_seqlens_k[0] = 0
+                cu_seqlens_k[1] = bs
+                set_context(
+                    True,
+                    cu_seqlens_q=cu_seqlens_q[:2],
+                    cu_seqlens_k=cu_seqlens_k[:2],
+                    max_seqlen_q=bs,
+                    max_seqlen_k=config.max_model_len,
+                    slot_mapping=slot_mapping[:bs],
+                    block_tables=block_tables[:1],
+                )
+
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="verify_kt_hybrid",
+                        step_id=0,
+                        token_capacity=max_bucket,
+                        logical_token_count=bs,
+                    )
+
+                for seg_idx, (layer_start, layer_end) in enumerate(boundaries):
+                    apply_norm = int(layer_end) >= num_hidden_layers
+                    if seg_idx == 0:
+                        segment_outputs[0][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                            input_ids[:bs], None, positions[:bs],
+                            start_layer=int(layer_start), end_layer=int(layer_end),
+                            apply_norm=apply_norm,
+                        )
+                    else:
+                        segment_outputs[seg_idx][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                            None, segment_outputs[seg_idx - 1][:bs], positions[:bs],
+                            start_layer=int(layer_start), end_layer=int(layer_end),
+                            apply_norm=apply_norm,
+                        )
+                torch.cuda.synchronize()
+
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="verify_kt_hybrid",
+                        step_id=0,
+                        token_capacity=max_bucket,
+                        logical_token_count=bs,
+                    )
+
+                for seg_idx, (layer_start, layer_end) in enumerate(boundaries):
+                    graph = torch.cuda.CUDAGraph()
+                    apply_norm = int(layer_end) >= num_hidden_layers
+                    with torch.cuda.graph(graph, pool=verify_graph_pool):
+                        if seg_idx == 0:
+                            segment_outputs[0][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                                input_ids[:bs], None, positions[:bs],
+                                start_layer=int(layer_start), end_layer=int(layer_end),
+                                apply_norm=apply_norm,
+                            )
+                        else:
+                            segment_outputs[seg_idx][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                                None, segment_outputs[seg_idx - 1][:bs], positions[:bs],
+                                start_layer=int(layer_start), end_layer=int(layer_end),
+                                apply_norm=apply_norm,
+                            )
+                    if verify_graph_pool is None:
+                        verify_graph_pool = graph.pool()
+                    graphs.append(graph)
+
+                self.verify_kt_hybrid_segment_graphs[bs] = graphs
+                self.verify_kt_hybrid_segment_boundaries[bs] = list(boundaries)
+                torch.cuda.synchronize()
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.reset()
+                reset_context()
+        finally:
+            self._set_speculative_execution_mode("normal")
+
+        self.verify_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            hidden_states=segment_outputs[-1],
+            segment_outputs=segment_outputs,
+        )
+        self._verify_graph_pool = verify_graph_pool
+
     def _can_use_verify_cudagraph(self, num_tokens: int) -> bool:
         if not getattr(self.config, "verify_cuda_graph", False):
             return False
         kt_hybrid = getattr(self.config, "verify_cuda_graph_kt_hybrid", False)
         if kt_hybrid:
-            if not getattr(self, "verify_kt_hybrid_graphs", None):
+            if self._verify_segment_graph_enabled():
+                if not getattr(self, "verify_kt_hybrid_segment_graphs", None):
+                    return False
+            elif not getattr(self, "verify_kt_hybrid_graphs", None):
                 return False
         else:
             if not self.verify_prefix_graphs:
@@ -2544,5 +2706,171 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             self._profile["verify_kt_hybrid_graph_replay_count"] = (
                 float(self._profile.get("verify_kt_hybrid_graph_replay_count", 0.0)) + 1.0
+            )
+        return gv["hidden_states"][:num_tokens]
+
+    def _enqueue_verify_segment_metadata(
+        self,
+        *,
+        step_id: int,
+        token_capacity: int,
+        layer_start_idx: int,
+        layer_end_idx: int,
+        is_last_segment: bool,
+    ) -> None:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        if prefetch_runtime is None or runtime_meta_recorder is None:
+            return
+
+        host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
+            mode="verify_kt_hybrid",
+            token_capacity=int(token_capacity),
+        )
+        enqueue_t0 = perf_counter()
+        handle = runtime_meta_recorder.offload_async(
+            prefetch_runtime.metadata_stream,
+            host_buffer_slot=host_buffer_slot,
+            layer_start_idx=int(layer_start_idx),
+            layer_end_idx=int(layer_end_idx),
+        )
+        enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+        if handle is None:
+            return
+        self._enqueue_prefetch_metadata(
+            mode="verify_kt_hybrid",
+            step_id=int(step_id),
+            handle=handle,
+            enqueue_ms=enqueue_ms,
+            host_buffer_slot=host_buffer_slot,
+            submit_after_phase=None,
+            record_verify_consumed=bool(is_last_segment),
+        )
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_segment_metadata_enqueue_count"] = (
+                    float(self._profile.get("verify_segment_metadata_enqueue_count", 0.0)) + 1.0
+                )
+                self._profile["verify_segment_metadata_enqueue_ms"] = (
+                    float(self._profile.get("verify_segment_metadata_enqueue_ms", 0.0)) + enqueue_ms
+                )
+        if not getattr(self, "_prefetch_async_enabled", False):
+            self._flush_pending_prefetch_metadata(block=False)
+
+    def _run_verify_with_kt_hybrid_segment_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute verify forward using per-segment CUDA graphs with inter-segment prefetching."""
+        num_tokens = input_ids.numel()
+        bucket = self._select_verify_bucket(num_tokens)
+        graphs = self.verify_kt_hybrid_segment_graphs[bucket]
+        boundaries = self.verify_kt_hybrid_segment_boundaries[bucket]
+        gv = self.verify_graph_vars
+        context = get_context()
+
+        gv["input_ids"][:num_tokens].copy_(input_ids)
+        gv["positions"][:num_tokens].copy_(positions)
+        if context.cu_seqlens_q is not None:
+            n_seqs = context.cu_seqlens_q.numel()
+            gv["cu_seqlens_q"][:n_seqs].copy_(context.cu_seqlens_q)
+        if context.cu_seqlens_k is not None:
+            n_seqs = context.cu_seqlens_k.numel()
+            gv["cu_seqlens_k"][:n_seqs].copy_(context.cu_seqlens_k)
+        gv["slot_mapping"].fill_(-1)
+        if context.slot_mapping is not None:
+            gv["slot_mapping"][:context.slot_mapping.numel()].copy_(context.slot_mapping)
+        if context.block_tables is not None:
+            bt = context.block_tables
+            gv["block_tables"][:bt.shape[0], :bt.shape[1]].copy_(bt)
+
+        n_seqs_actual = (context.cu_seqlens_q.numel() - 1) if context.cu_seqlens_q is not None else 1
+        set_context(
+            True,
+            cu_seqlens_q=gv["cu_seqlens_q"][:n_seqs_actual + 1],
+            cu_seqlens_k=gv["cu_seqlens_k"][:n_seqs_actual + 1],
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=gv["slot_mapping"][:bucket],
+            block_tables=gv["block_tables"][:n_seqs_actual],
+        )
+
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        max_bucket = max(self.verify_graph_bs)
+        step_id = int(getattr(self, "_current_verify_prefetch_step_id", 0))
+        if runtime_meta_recorder is not None:
+            runtime_meta_recorder.arm(
+                mode="verify_kt_hybrid",
+                step_id=step_id,
+                token_capacity=max_bucket,
+                logical_token_count=num_tokens,
+            )
+
+        num_segments = len(graphs)
+        for seg_idx, (graph, (layer_start, layer_end)) in enumerate(
+            zip(graphs, boundaries, strict=True)
+        ):
+            if prefetch_runtime is not None:
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+
+            graph.replay()
+
+            if step_id >= 0:
+                is_last = seg_idx == num_segments - 1
+                self._enqueue_verify_segment_metadata(
+                    step_id=step_id,
+                    token_capacity=max_bucket,
+                    layer_start_idx=int(layer_start),
+                    layer_end_idx=int(layer_end),
+                    is_last_segment=is_last,
+                )
+                if prefetch_runtime is not None:
+                    next_seg = (seg_idx + 1) % num_segments
+                    next_start = boundaries[next_seg][0]
+                    next_end = boundaries[next_seg][1]
+                    with self._prefetch_runtime_lock:
+                        prefetch_runtime.submit_verify_segment_prefetch(
+                            step_id=step_id,
+                            target_layer_start=int(next_start),
+                            target_layer_end=int(next_end),
+                            visible_budget_ms=float(getattr(
+                                self.config, "verify_prefetch_visible_budget_ms", 3.0)),
+                        )
+
+        if runtime_meta_recorder is not None:
+            key = runtime_meta_recorder.active_key
+            if key is not None:
+                dev = runtime_meta_recorder.device_buffers.get(key)
+                if dev is not None and "expert_status" in dev:
+                    from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
+                    status_cpu = dev["expert_status"].cpu()
+                    act_count_cpu = dev["activation_count"].cpu()
+                    for decoder_layer in self.model.model.layers:
+                        mlp = decoder_layer.mlp
+                        if not isinstance(mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                            continue
+                        lidx = mlp.layer_idx
+                        s = status_cpu[lidx]
+                        ac = act_count_cpu[lidx]
+                        is_real_active = ac > 0
+                        miss_routes = int(ac[s == 2].sum().item())
+                        total_routes = int(ac.sum().item()) or int(num_tokens * mlp.num_selected)
+                        miss_experts = int(((s == 2) & is_real_active).sum().item())
+                        mlp._last_profile = {
+                            "pre_transfer_cache_miss_sum": float(miss_routes),
+                            "pre_transfer_active_count_sum": float(total_routes),
+                            "moe_profile_count": 1.0,
+                            "cpu_route_ratio_sum": float(miss_routes) / max(float(total_routes), 1.0),
+                            "cpu_routes_sum": float(miss_routes),
+                            "cpu_weight_mass_ratio_sum": 0.0,
+                            "realized_cpu_expert_count_sum": float(miss_experts),
+                        }
+
+        if self.profile_enabled and self.rank == 0:
+            self._profile["verify_kt_hybrid_segment_graph_replay_count"] = (
+                float(self._profile.get("verify_kt_hybrid_segment_graph_replay_count", 0.0)) + 1.0
             )
         return gv["hidden_states"][:num_tokens]

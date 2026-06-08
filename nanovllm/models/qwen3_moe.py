@@ -1042,6 +1042,31 @@ class Qwen3MoeModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def forward_verify_kt_hybrid_segment(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        apply_norm: bool,
+    ) -> torch.Tensor:
+        """Graph-capturable verify segment: layers [start_layer, end_layer) with hybrid GPU+kt_direct."""
+        for decoder_layer in self.layers:
+            layer_idx = decoder_layer.layer_idx
+            if layer_idx < start_layer or layer_idx >= end_layer:
+                continue
+            is_moe = isinstance(decoder_layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock)
+            if is_moe:
+                hidden_states = decoder_layer.forward_verify_kt_hybrid(
+                    hidden_states, position_ids,
+                )
+            else:
+                hidden_states = decoder_layer(hidden_states, position_ids)
+        if apply_norm:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -1085,6 +1110,28 @@ class Qwen3MoeForCausalLM(nn.Module):
                 raise ValueError("input_ids are required for the first draft segment")
             hidden_states = self.model.embed_tokens(input_ids)
         return self.model.forward_layers(
+            hidden_states,
+            position_ids,
+            start_layer=int(start_layer),
+            end_layer=int(end_layer),
+            apply_norm=bool(apply_norm),
+        )
+
+    def forward_verify_kt_hybrid_segment(
+        self,
+        input_ids: torch.Tensor | None,
+        hidden_states: torch.Tensor | None,
+        position_ids: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        apply_norm: bool,
+    ) -> torch.Tensor:
+        if hidden_states is None:
+            if input_ids is None:
+                raise ValueError("input_ids required for first verify segment")
+            hidden_states = self.model.embed_tokens(input_ids)
+        return self.model.forward_verify_kt_hybrid_segment(
             hidden_states,
             position_ids,
             start_layer=int(start_layer),

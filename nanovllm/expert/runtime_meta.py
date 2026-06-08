@@ -116,6 +116,10 @@ class ModelRuntimeMetaRecorder:
                 segment_size = 1 if granularity == "layer" else max(1, int(getattr(self.config, "draft_prefetch_segment_size", 12)))
                 segment_count = max(1, (self.num_layers + segment_size - 1) // segment_size)
                 target = max(target, min(64, segment_count + 2))
+        if str(mode) == "verify_kt_hybrid":
+            segment_size = max(1, int(getattr(self.config, "verify_prefetch_segment_size", 12)))
+            segment_count = max(1, (self.num_layers + segment_size - 1) // segment_size)
+            target = max(target, min(64, segment_count + 2))
         return max(1, target)
 
     def _use_histogram_metadata(self, mode: str) -> bool:
