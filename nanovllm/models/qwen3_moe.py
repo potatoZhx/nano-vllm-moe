@@ -37,6 +37,7 @@ from nanovllm.expert.placement import (
     build_draft_plan_gpu,
     build_prefill_plan_gpu,
     build_verify_plan_gpu,
+    build_verify_graph_safe_plan_gpu,
     collect_cache_fill_no_cpu_expert_ids,
 )
 from nanovllm.scheduling.draft_reroute import ROUND_ROBIN, DraftReroutePolicy
@@ -691,6 +692,62 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self._last_profile = profile
         return out
 
+    @torch.no_grad()
+    def forward_verify_kt_hybrid(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Graph-capturable verify: GPU cached experts + kt_direct miss experts."""
+        router_logits = self.gate(hidden_states)
+        router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+        routing_weights, selected_experts = torch.topk(
+            router_probs, self.num_selected, dim=-1,
+        )
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        plan = build_verify_graph_safe_plan_gpu(
+            layer_idx=self.layer_idx,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            expert_cache=self.expert_cache,
+            num_experts=self.num_experts,
+        )
+
+        if self.runtime_meta_recorder is not None:
+            self.runtime_meta_recorder.record_layer(
+                layer_idx=self.layer_idx,
+                selected_experts=selected_experts,
+                routing_weights=routing_weights,
+                uncached_route_mask=plan.cpu_route_mask,
+            )
+
+        self.cpu_backend.begin_forward_graph_verify(
+            hidden_states, selected_experts, routing_weights,
+        )
+
+        top_k = routing_weights.size(1)
+        gpu_route_indices = plan.gpu_route_indices
+        gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
+        gpu_hidden = hidden_states[gpu_token_indices]
+        gpu_weights = plan.gpu_route_weights.index_select(0, gpu_route_indices)
+
+        gate_up_buffer, down_buffer = self.expert_cache.get_layer_buffers()
+        gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.gpu_m_sizes)
+        gpu_expert_out = fused_moe_linear(self.act_fn(gate_up), down_buffer, plan.gpu_m_sizes)
+        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+
+        kt_output = self.cpu_backend.finish_forward_graph_verify(hidden_states)
+
+        num_tokens, hidden_dim = hidden_states.shape
+        num_routes = num_tokens * top_k
+        route_buffer = torch.zeros(
+            num_routes, hidden_dim, dtype=gpu_expert_out.dtype, device=hidden_states.device,
+        )
+        route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
+        token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+        output = token_output.to(dtype=hidden_states.dtype)
+        output.add_(kt_output.to(dtype=hidden_states.dtype, device=hidden_states.device))
+        return output
+
     def consume_profile(self) -> dict[str, float]:
         out = self._last_profile
         self._last_profile = {}
@@ -857,6 +914,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
         _accumulate_gpu_routes_deterministic(output, gpu_route_indices, gpu_expert_out, top_k)
         return residual + output
 
+    def forward_verify_kt_hybrid(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full graph-capturable verify forward: attn + hybrid MoE (GPU cached + kt_direct miss)."""
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp.forward_verify_kt_hybrid(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
 
 class Qwen3MoeModel(nn.Module):
 
@@ -944,6 +1018,26 @@ class Qwen3MoeModel(nn.Module):
                 hidden_states = dense_replay_fn(layer_idx, decoder_layer, hidden_states, position_ids)
             if controller is not None:
                 controller.after_verify_layer(layer_idx)
+        if apply_norm:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+    def forward_verify_kt_hybrid_layers(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        *,
+        apply_norm: bool,
+    ) -> torch.Tensor:
+        """Graph-capturable full verify loop: MoE layers use hybrid GPU+kt_direct."""
+        for decoder_layer in self.layers:
+            is_moe = isinstance(decoder_layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock)
+            if is_moe:
+                hidden_states = decoder_layer.forward_verify_kt_hybrid(
+                    hidden_states, position_ids,
+                )
+            else:
+                hidden_states = decoder_layer(hidden_states, position_ids)
         if apply_norm:
             hidden_states = self.norm(hidden_states)
         return hidden_states

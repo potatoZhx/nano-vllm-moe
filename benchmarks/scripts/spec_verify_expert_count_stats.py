@@ -342,6 +342,7 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "verify_prefix_fallback_count": int(ep.get("model_verify_prefix_graph_fallback_count", 0) or 0),
             "verify_dense_replay_count": int(ep.get("model_verify_dense_graph_replay_count", 0) or 0),
             "verify_dense_fallback_count": int(ep.get("model_verify_dense_graph_fallback_count", 0) or 0),
+            "verify_kt_hybrid_replay_count": int(ep.get("model_verify_kt_hybrid_graph_replay_count", 0) or 0),
         },
         "cache": {
             "route_hit_rate": float(max(0.0, min(1.0, 1.0 - cpu_route_ratio))),

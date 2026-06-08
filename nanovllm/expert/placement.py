@@ -615,6 +615,64 @@ def build_verify_plan(
     )
 
 
+def build_verify_graph_safe_plan_gpu(
+    layer_idx: int,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    expert_cache: LayerExpertCache,
+    num_experts: int,
+) -> MoEExecutionPlan:
+    """Graph-safe verify plan: all tensor ops, no torch.nonzero or .item().
+
+    GPU processes ALL routes (uncached routes mapped to cached slots via
+    substitution LUT with zeroed weights).  kt_direct handles miss experts
+    (skips GPU-cached ones via gpu_expert_mask_cpu).
+    """
+    flat_selected = _flatten_experts(selected_experts)
+    flat_weights = _flatten_weights(routing_weights)
+    device = flat_selected.device
+
+    cached_expert_mask = expert_cache.get_cached_expert_mask()
+    slot_to_expert_lut = expert_cache.get_slot_to_expert_lut()
+
+    substitution_lut = _build_topc0_substitution_lut(
+        num_experts=num_experts,
+        cached_expert_mask=cached_expert_mask,
+        slot_to_expert_lut=slot_to_expert_lut,
+        device=device,
+    )
+    flat_effective = substitution_lut.index_select(0, flat_selected)
+
+    gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_effective)
+    gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
+    m_sizes, gpu_route_indices = _build_grouped_layout(
+        gpu_slots, gpu_route_indices, expert_cache.num_slots,
+    )
+
+    uncached_route_mask = ~cached_expert_mask.index_select(0, flat_selected)
+    gpu_route_weights = torch.where(
+        uncached_route_mask,
+        torch.zeros_like(flat_weights),
+        flat_weights,
+    )
+
+    return MoEExecutionPlan(
+        layer_idx=layer_idx,
+        gpu_route_indices=gpu_route_indices,
+        gpu_m_sizes=m_sizes,
+        cpu_route_indices=None,
+        cpu_task_expert_ids=None,
+        cpu_task_offsets=None,
+        flat_selected_original=flat_selected,
+        flat_selected_effective=flat_effective,
+        gpu_route_weights=gpu_route_weights,
+        cpu_graph_enabled=True,
+        substitution_lut=substitution_lut,
+        gpu_route_mask=torch.ones_like(flat_selected, dtype=torch.bool),
+        cpu_route_mask=uncached_route_mask,
+    )
+
+
 def build_prefill_plan_gpu(
     layer_idx: int,
     selected_experts: torch.Tensor,

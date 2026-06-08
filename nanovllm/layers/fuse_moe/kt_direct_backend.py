@@ -645,3 +645,65 @@ class KtDirectCpuMoeBackend:
             prep_ms=prep_ms,
             compute_ms=compute_ms,
         )
+
+    @torch.no_grad()
+    def begin_forward_graph_verify(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> int:
+        """Submit kt_direct CPU work for CUDA graph capture/replay.
+
+        Call before GPU GEMM to allow GPU-CPU overlap.  Returns the buffer slot.
+        """
+        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
+        topk_ids = selected_experts.reshape(-1, self.num_experts_per_tok).contiguous()
+        topk_weights = routing_weights.reshape(-1, self.num_experts_per_tok).contiguous()
+
+        (
+            input_cpu,
+            expert_ids_cpu,
+            routing_weights_cpu,
+            output_cpu,
+            batch_size_cpu,
+            output_device,
+        ) = KtDirectCPUBuffer.get_buffer(flat_hidden, self.num_experts_per_tok)
+        slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
+
+        self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
+        input_cpu[slot].copy_(flat_hidden, non_blocking=True)
+        expert_ids_cpu[slot].copy_(topk_ids, non_blocking=True)
+        routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)
+
+        task = self.moe.forward_task(
+            batch_size_cpu[slot].data_ptr(),
+            self.num_experts_per_tok,
+            expert_ids_cpu[slot].data_ptr(),
+            routing_weights_cpu[slot].data_ptr(),
+            input_cpu[slot].data_ptr(),
+            output_cpu[slot].data_ptr(),
+            False,
+        )
+        stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
+        self.runtime.cpu_infer.submit_with_cuda_stream(stream, task)
+        return slot
+
+    @torch.no_grad()
+    def finish_forward_graph_verify(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sync kt_direct CPU work + copy output back to GPU.
+
+        Call after GPU GEMM.  Returns per-token output tensor on GPU.
+        """
+        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
+        slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
+        (_, _, _, output_cpu, _, output_device) = KtDirectCPUBuffer.get_buffer(
+            flat_hidden, self.num_experts_per_tok,
+        )
+        stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
+        self.runtime.cpu_infer.sync_with_cuda_stream(stream, 0)
+        output_device[slot].copy_(output_cpu[slot], non_blocking=True)
+        return output_device[slot]

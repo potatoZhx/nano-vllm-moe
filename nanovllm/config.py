@@ -51,6 +51,7 @@ class Config:
     prefetch_use_prefill_history: bool = True
     prefetch_use_verify_history: bool = True
     prefetch_use_draft_live: bool = True
+    prefetch_draft_layer_enabled: bool = True
     prefetch_verify_layer_enabled: bool = True
     prefetch_verify_layer_safety_ratio: float = 0.8
     prefetch_verify_layer_min_compute_ms: float = 0.05
@@ -100,6 +101,7 @@ class Config:
     draft_cuda_graph_cpu_backend: str = "none"  # "none" | "fused" | "fused_sync"; experimental top_c>0 graph bridge
     verify_cuda_graph: bool = False
     verify_cuda_graph_bucket_steps: list[int] = field(default_factory=lambda: [4, 8, 12, 16])
+    verify_cuda_graph_kt_hybrid: bool = False
     perf_profile_level: str = "basic"
 
     def __post_init__(self):
@@ -201,6 +203,13 @@ class Config:
         assert all(x >= 1 for x in self.verify_cuda_graph_bucket_steps)
         if self.verify_cuda_graph and self.enforce_eager:
             self.verify_cuda_graph = False
+        if (
+            self.verify_cuda_graph
+            and self.cpu_expert_backend == "kt_direct"
+            and self.spec_verify_miss_policy == "cpu"
+        ):
+            self.verify_cuda_graph_kt_hybrid = True
+            self.prefetch_verify_layer_enabled = False
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

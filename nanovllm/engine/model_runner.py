@@ -610,7 +610,7 @@ class ModelRunner:
                     observe_stats = prefetch_runtime.observe_prefill(runtime_meta, step_id=step_id)
                 elif mode == "draft":
                     observe_stats = prefetch_runtime.observe_draft(runtime_meta, step_id=step_id)
-                elif mode == "verify":
+                elif mode in ("verify", "verify_kt_hybrid"):
                     observe_stats = prefetch_runtime.observe_verify(runtime_meta, step_id=step_id)
                     if bool(item["record_verify_consumed"]):
                         prefetch_runtime.record_verify_consumed(runtime_meta, step_id=step_id)
@@ -678,7 +678,7 @@ class ModelRunner:
                 self._profile[f"{prefix}_segment_index_filter_ms"] += float(observe_stats.get("segment_index_filter_ms", 0.0))
                 self._profile[f"{prefix}_segment_index_entry_update_ms"] += float(observe_stats.get("segment_index_entry_update_ms", 0.0))
                 self._profile[f"{prefix}_async_turnaround_ms"] += turnaround_ms
-                if item["mode"] in {"draft", "verify"}:
+                if item["mode"] in {"draft", "verify", "verify_kt_hybrid"}:
                     self._profile[f"run_{item['mode']}_submit_after_ms"] += submit_after_ms
                 if processing_origin == "worker":
                     self._profile["prefetch_async_worker_item_count"] += 1
@@ -1580,16 +1580,20 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
 
+        _use_kt_hybrid = bool(getattr(self.config, "verify_cuda_graph_kt_hybrid", False))
+        _verify_meta_mode = "verify_kt_hybrid" if _use_kt_hybrid else "verify"
         skip_verify_metadata = self._skip_verify_metadata_offload()
         if prefetch_runtime is not None and runtime_meta_recorder is not None and not skip_verify_metadata:
             token_count = int(input_ids.numel())
-            self._wait_for_prefetch_device_reuse(mode="verify", token_capacity=token_count)
-            runtime_meta_recorder.arm(
-                mode="verify",
-                step_id=step_id,
-                token_capacity=token_count,
-                logical_token_count=token_count,
-            )
+            _meta_capacity = max(self.verify_graph_bs) if (_use_kt_hybrid and self.verify_graph_bs) else token_count
+            self._wait_for_prefetch_device_reuse(mode=_verify_meta_mode, token_capacity=_meta_capacity)
+            if not _use_kt_hybrid:
+                runtime_meta_recorder.arm(
+                    mode=_verify_meta_mode,
+                    step_id=step_id,
+                    token_capacity=_meta_capacity,
+                    logical_token_count=token_count,
+                )
 
         verify_layer_prefetch_enabled = (
             prefetch_runtime is not None
@@ -1652,7 +1656,10 @@ class ModelRunner:
                 self._verify_torch_profile_done = True
             else:
                 if self._can_use_verify_cudagraph(int(input_ids.numel())):
-                    hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
+                    if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
+                        hidden_states = self._run_verify_with_kt_hybrid_graph(input_ids, positions)
+                    else:
+                        hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
                     logits = F.linear(hidden_states, self.model.lm_head.weight)
                 else:
                     hidden_states = self.model(input_ids, positions)
@@ -1711,9 +1718,10 @@ class ModelRunner:
                     with self._prefetch_runtime_lock:
                         prefetch_runtime.end_draft_iteration()
                 return verify_outputs
+            _offload_capacity = max(self.verify_graph_bs) if (_use_kt_hybrid and self.verify_graph_bs) else int(input_ids.numel())
             host_buffer_slot, _ = self._acquire_prefetch_host_buffer_slot(
-                mode="verify",
-                token_capacity=int(input_ids.numel()),
+                mode=_verify_meta_mode,
+                token_capacity=_offload_capacity,
             )
             enqueue_t0 = perf_counter()
             handle = runtime_meta_recorder.offload_async(
@@ -1722,7 +1730,7 @@ class ModelRunner:
             )
             enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
             self._enqueue_prefetch_metadata(
-                mode="verify",
+                mode=_verify_meta_mode,
                 step_id=step_id,
                 handle=handle,
                 enqueue_ms=enqueue_ms,
@@ -1992,6 +2000,11 @@ class ModelRunner:
             self.verify_dense_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
             self.verify_graph_bs: list[int] = []
             self.verify_graph_vars: dict = {}
+            self.verify_kt_hybrid_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+            return
+
+        if getattr(config, "verify_cuda_graph_kt_hybrid", False):
+            self._capture_verify_cudagraph_kt_hybrid()
             return
 
         hf_config = config.hf_config
@@ -2020,6 +2033,7 @@ class ModelRunner:
 
         self.verify_prefix_graphs = {}
         self.verify_dense_graphs = {}
+        self.verify_kt_hybrid_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         verify_graph_pool = getattr(self, "draft_graph_pool", None)
 
         self._set_speculative_execution_mode("verify")
@@ -2100,11 +2114,120 @@ class ModelRunner:
         )
         self._verify_graph_pool = verify_graph_pool
 
+    def _capture_verify_cudagraph_kt_hybrid(self):
+        """Capture full-model CUDA graphs for verify with hybrid GPU + kt_direct."""
+        from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCPUBuffer
+
+        config = self.config
+        hf_config = config.hf_config
+        hidden_size = int(hf_config.hidden_size)
+        max_seqs = min(config.max_num_seqs, 64)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        bucket_steps = sorted(set(getattr(config, "verify_cuda_graph_bucket_steps", [4, 8, 12, 16])))
+        self.verify_graph_bs = bucket_steps
+        max_bucket = max(bucket_steps)
+
+        for bs in bucket_steps:
+            KtDirectCPUBuffer.capture_bs.add(bs)
+
+        input_ids = torch.zeros(max_bucket, dtype=torch.int64)
+        positions = torch.zeros(max_bucket, dtype=torch.int64)
+        cu_seqlens_q = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(max_seqs + 1, dtype=torch.int32)
+        slot_mapping = torch.full((max_bucket,), -1, dtype=torch.int32)
+        block_tables = torch.zeros(max_seqs, max_num_blocks, dtype=torch.int32)
+        hidden_states = torch.zeros(
+            max_bucket, hidden_size,
+            dtype=self.model.lm_head.weight.dtype,
+            device=self.model.lm_head.weight.device,
+        )
+
+        self.verify_kt_hybrid_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_prefix_graphs = {}
+        self.verify_dense_graphs = {}
+        verify_graph_pool = getattr(self, "draft_graph_pool", None)
+
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+
+        self._set_speculative_execution_mode("verify")
+        try:
+            for bs in reversed(bucket_steps):
+                cu_seqlens_q[0] = 0
+                cu_seqlens_q[1] = bs
+                cu_seqlens_k[0] = 0
+                cu_seqlens_k[1] = bs
+                set_context(
+                    True,
+                    cu_seqlens_q=cu_seqlens_q[:2],
+                    cu_seqlens_k=cu_seqlens_k[:2],
+                    max_seqlen_q=bs,
+                    max_seqlen_k=config.max_model_len,
+                    slot_mapping=slot_mapping[:bs],
+                    block_tables=block_tables[:1],
+                )
+
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="verify_kt_hybrid",
+                        step_id=0,
+                        token_capacity=max_bucket,
+                        logical_token_count=bs,
+                    )
+
+                hidden_states[:bs] = self.model.model.embed_tokens(input_ids[:bs])
+                self.model.model.forward_verify_kt_hybrid_layers(
+                    hidden_states[:bs], positions[:bs], apply_norm=True,
+                )
+                torch.cuda.synchronize()
+
+                if runtime_meta_recorder is not None:
+                    runtime_meta_recorder.arm(
+                        mode="verify_kt_hybrid",
+                        step_id=0,
+                        token_capacity=max_bucket,
+                        logical_token_count=bs,
+                    )
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=verify_graph_pool):
+                    hidden_states[:bs] = self.model.model.embed_tokens(input_ids[:bs])
+                    hidden_states[:bs] = self.model.model.forward_verify_kt_hybrid_layers(
+                        hidden_states[:bs], positions[:bs], apply_norm=True,
+                    )
+                if verify_graph_pool is None:
+                    verify_graph_pool = graph.pool()
+                self.verify_kt_hybrid_graphs[bs] = graph
+
+                torch.cuda.synchronize()
+                reset_context()
+
+            if runtime_meta_recorder is not None:
+                runtime_meta_recorder.reset()
+        finally:
+            self._set_speculative_execution_mode("normal")
+
+        self.verify_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            slot_mapping=slot_mapping,
+            block_tables=block_tables,
+            hidden_states=hidden_states,
+        )
+        self._verify_graph_pool = verify_graph_pool
+
     def _can_use_verify_cudagraph(self, num_tokens: int) -> bool:
         if not getattr(self.config, "verify_cuda_graph", False):
             return False
-        if not self.verify_prefix_graphs:
-            return False
+        kt_hybrid = getattr(self.config, "verify_cuda_graph_kt_hybrid", False)
+        if kt_hybrid:
+            if not getattr(self, "verify_kt_hybrid_graphs", None):
+                return False
+        else:
+            if not self.verify_prefix_graphs:
+                return False
         context = get_context()
         if context.cu_seqlens_q is not None and context.cu_seqlens_q.numel() > 2:
             return False
@@ -2338,3 +2461,88 @@ class ModelRunner:
         if self.profile_enabled and self.rank == 0:
             self._profile["verify_graph_call_count"] += 1
         return hidden[:num_tokens]
+
+    def _run_verify_with_kt_hybrid_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute verify forward using full-model CUDA graph with hybrid GPU + kt_direct."""
+        num_tokens = input_ids.numel()
+        bucket = self._select_verify_bucket(num_tokens)
+        gv = self.verify_graph_vars
+        context = get_context()
+
+        gv["input_ids"][:num_tokens].copy_(input_ids)
+        gv["positions"][:num_tokens].copy_(positions)
+        if context.cu_seqlens_q is not None:
+            n_seqs = context.cu_seqlens_q.numel()
+            gv["cu_seqlens_q"][:n_seqs].copy_(context.cu_seqlens_q)
+        if context.cu_seqlens_k is not None:
+            n_seqs = context.cu_seqlens_k.numel()
+            gv["cu_seqlens_k"][:n_seqs].copy_(context.cu_seqlens_k)
+        gv["slot_mapping"].fill_(-1)
+        if context.slot_mapping is not None:
+            gv["slot_mapping"][:context.slot_mapping.numel()].copy_(context.slot_mapping)
+        if context.block_tables is not None:
+            bt = context.block_tables
+            gv["block_tables"][:bt.shape[0], :bt.shape[1]].copy_(bt)
+
+        n_seqs_actual = (context.cu_seqlens_q.numel() - 1) if context.cu_seqlens_q is not None else 1
+        set_context(
+            True,
+            cu_seqlens_q=gv["cu_seqlens_q"][:n_seqs_actual + 1],
+            cu_seqlens_k=gv["cu_seqlens_k"][:n_seqs_actual + 1],
+            max_seqlen_q=context.max_seqlen_q,
+            max_seqlen_k=context.max_seqlen_k,
+            slot_mapping=gv["slot_mapping"][:bucket],
+            block_tables=gv["block_tables"][:n_seqs_actual],
+        )
+
+        runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        max_bucket = max(self.verify_graph_bs)
+        if runtime_meta_recorder is not None:
+            runtime_meta_recorder.arm(
+                mode="verify_kt_hybrid",
+                step_id=getattr(self, "_current_verify_prefetch_step_id", 0),
+                token_capacity=max_bucket,
+                logical_token_count=num_tokens,
+            )
+
+        graph = self.verify_kt_hybrid_graphs[bucket]
+        graph.replay()
+
+        if runtime_meta_recorder is not None:
+            key = runtime_meta_recorder.active_key
+            if key is not None:
+                dev = runtime_meta_recorder.device_buffers.get(key)
+                if dev is not None and "expert_status" in dev:
+                    from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
+                    status_cpu = dev["expert_status"].cpu()
+                    act_count_cpu = dev["activation_count"].cpu()
+                    for decoder_layer in self.model.model.layers:
+                        mlp = decoder_layer.mlp
+                        if not isinstance(mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                            continue
+                        lidx = mlp.layer_idx
+                        s = status_cpu[lidx]
+                        ac = act_count_cpu[lidx]
+                        is_real_active = ac > 0
+                        miss_routes = int(ac[s == 2].sum().item())
+                        total_routes = int(ac.sum().item()) or int(num_tokens * mlp.num_selected)
+                        miss_experts = int(((s == 2) & is_real_active).sum().item())
+                        mlp._last_profile = {
+                            "pre_transfer_cache_miss_sum": float(miss_routes),
+                            "pre_transfer_active_count_sum": float(total_routes),
+                            "moe_profile_count": 1.0,
+                            "cpu_route_ratio_sum": float(miss_routes) / max(float(total_routes), 1.0),
+                            "cpu_routes_sum": float(miss_routes),
+                            "cpu_weight_mass_ratio_sum": 0.0,
+                            "realized_cpu_expert_count_sum": float(miss_experts),
+                        }
+
+        if self.profile_enabled and self.rank == 0:
+            self._profile["verify_kt_hybrid_graph_replay_count"] = (
+                float(self._profile.get("verify_kt_hybrid_graph_replay_count", 0.0)) + 1.0
+            )
+        return gv["hidden_states"][:num_tokens]
