@@ -510,7 +510,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         draft_reroute_artifact=args.draft_reroute_artifact,
         acceptance_strategy=args.acceptance_strategy,
         acceptance_threshold=args.acceptance_threshold,
-        cpu_expert_execution_enabled=True,
+        cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_pin_memory=args.cpu_expert_pin_memory,
         cpu_expert_backend=args.cpu_expert_backend,
         cpu_expert_workspace_max_routes=args.cpu_expert_workspace_max_routes,
@@ -1000,6 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
     p.add_argument("--cpu-expert-backend", default="fused")
+    p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=True)
     p.add_argument(
         "--cpu-expert-backends",
         default="fused,torch",

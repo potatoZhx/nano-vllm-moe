@@ -23,19 +23,22 @@ print("torch", torch.__version__)
 print("cuda_available", torch.cuda.is_available())
 print("cuda_device_count", torch.cuda.device_count())
 PY
-python scripts/small_bench.py \
-    --output-dir results/tmp_vpre \
-    --runtime-kinds legacy,predictive \
-    --output-lens 256 \
-    --cache-ratios 0.25,0.75 \
+CUDA_VISIBLE_DEVICES=2 python scripts/small_bench.py \
+    --output-dir results/tmp_testr \
+    --runtime-kinds predictive \
+    --output-lens 8192,4096,10000 \
+    --gpu-memory-utilization 0.99 \
+    --cache-ratios 0.3125 \
     --verify-cuda-graph-values true \
-    --cache-strategies lru,lfu \
-    --max-draft-tokens-values 8 \
-    --max-model-len 8192 \
+    --cache-strategies lru \
+    --max-draft-tokens-values 8,5,4,3 \
+    --max-model-len 10240 \
     --prefetch-verify-attention-ratio 1.0 \
-    --prefetch-step-budget 8 \
+    --prefetch-step-budget 3 \
     --prefetch-verify-layer-max-budget 8 \
-    --prefetch-max-inflight 16
+    --prefetch-max-inflight 16 \
+    --cpu-expert-backend kt_direct --spec-verify-miss-policy cpu \
+    --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 32 
 EOS
 """
 
@@ -51,7 +54,7 @@ PROMPT_TEXT = (
 )
 
 DEFAULT_PROFILE = "results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors"
-MODEL_PATH = "/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B"
+MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
 
 
 def str2bool(value: str | bool) -> bool:
@@ -760,6 +763,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
     p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cache_fill_no_cpu")
     p.add_argument("--cpu-expert-backend", default="fused")
+    p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=True,
+                   help="When True, uncached experts run on CPU instead of GPU fallback workspace.")
     p.add_argument("--cpu-expert-pin-memory", type=str2bool, default=True)
     p.add_argument("--cpu-expert-workspace-max-routes", type=int, default=327680)
     p.add_argument("--cpu-expert-num-threads", type=int, default=4)
@@ -780,11 +785,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-step-budget", type=int, default=4)
     p.add_argument("--prefetch-verify-layer-max-budget", type=int, default=2)
     p.add_argument("--prefetch-max-inflight", type=int, default=8)
-    p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
-    p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
+    p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=0)
+    p.add_argument("--cache-eviction-budget-per-step", type=int, default=8)
     p.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
-    p.add_argument("--predictive-phase1-budget", type=int, default=4)
+    p.add_argument("--predictive-phase1-budget", type=int, default=8)
     p.add_argument("--verify-cuda-graph", type=str2bool, default=True)
     p.add_argument("--verify-cuda-graph-values", default="",
                    help="CSV of true/false values to sweep for verify-cuda-graph. "
