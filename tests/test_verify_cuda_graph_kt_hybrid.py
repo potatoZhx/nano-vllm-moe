@@ -334,9 +334,9 @@ class TestKtDirectGraphMethods(unittest.TestCase):
         )
 
         backend = self._make_fake_backend()
-        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cpu")
-        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-        weights = torch.ones(2, 2, dtype=torch.float32)
+        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cuda")
+        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+        weights = torch.ones(2, 2, dtype=torch.float32, device="cuda")
 
         # Call begin — should submit
         slot = KtDirectCpuMoeBackend.begin_forward_graph_verify(
@@ -352,9 +352,9 @@ class TestKtDirectGraphMethods(unittest.TestCase):
         )
 
         backend = self._make_fake_backend()
-        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cpu")
-        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-        weights = torch.ones(2, 2, dtype=torch.float32)
+        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cuda")
+        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+        weights = torch.ones(2, 2, dtype=torch.float32, device="cuda")
 
         KtDirectCpuMoeBackend.begin_forward_graph_verify(
             backend, hidden, experts, weights,
@@ -371,9 +371,9 @@ class TestKtDirectGraphMethods(unittest.TestCase):
             KtDirectCPUBuffer,
         )
 
-        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cpu")
-        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
-        weights = torch.ones(2, 2, dtype=torch.float32)
+        hidden = torch.randn(2, 8, dtype=torch.bfloat16, device="cuda")
+        experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+        weights = torch.ones(2, 2, dtype=torch.float32, device="cuda")
 
         b0 = self._make_fake_backend(layer_idx=0)
         slot0 = KtDirectCpuMoeBackend.begin_forward_graph_verify(

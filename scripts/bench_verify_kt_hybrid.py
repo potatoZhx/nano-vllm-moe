@@ -13,10 +13,11 @@ Usage example (slurm):
     conda activate nano_moe
     cd /home/mumura/moe_spec/nano-vllm-moe/
     python scripts/bench_verify_kt_hybrid.py \
+        --gpu-memory-utilization 0.99 \
         --output-dir results/kt_hybrid_bench \
-        --cache-ratios 0.25,0.50,0.75 \
-        --output-lens 128,256 \
-        --max-draft-tokens-values 4,8
+        --cache-ratios 0.25,0.3125 \
+        --output-lens 128 \
+        --max-draft-tokens-values 3
     EOS
 """
 from __future__ import annotations
@@ -42,7 +43,7 @@ PROMPT_TEXT = (
 )
 
 DEFAULT_PROFILE = "results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors"
-MODEL_PATH = "/data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B"
+MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
 
 
 def str2bool(value: str | bool) -> bool:

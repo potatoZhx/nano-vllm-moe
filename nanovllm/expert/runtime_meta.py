@@ -188,6 +188,11 @@ class ModelRuntimeMetaRecorder:
                 dev_buf["expert_status"] = torch.zeros(
                     (self.num_layers, self.num_experts), dtype=torch.int8, device=device,
                 )
+                dev_buf["expert_status_hit_val"] = torch.ones(1, dtype=torch.int8, device=device)
+                dev_buf["expert_status_miss_val"] = torch.full((1,), 2, dtype=torch.int8, device=device)
+                dev_buf["expert_status_vals"] = torch.empty(
+                    int(token_capacity) * self.top_k, dtype=torch.int8, device=device,
+                )
             self.device_buffers[key] = dev_buf
         else:
             selected_device = torch.empty(
@@ -305,9 +310,10 @@ class ModelRuntimeMetaRecorder:
                 status_row = dev["expert_status"][layer_idx]
                 status_row.zero_()
                 is_cached = ~uncached_route_mask[:flat_ids.numel()].to(device=status_row.device)
-                hit_val = torch.ones(1, dtype=torch.int8, device=status_row.device)
-                miss_val = torch.tensor([2], dtype=torch.int8, device=status_row.device)
-                status_vals = torch.where(is_cached, hit_val.expand(flat_ids.numel()), miss_val.expand(flat_ids.numel()))
+                hit_val = dev["expert_status_hit_val"]
+                miss_val = dev["expert_status_miss_val"]
+                status_vals = dev["expert_status_vals"][:flat_ids.numel()]
+                torch.where(is_cached, hit_val.expand(flat_ids.numel()), miss_val.expand(flat_ids.numel()), out=status_vals)
                 # No active_routes mask: cached status is per-expert so all routes
                 # (real + padding) to the same expert write the same value.
                 # Padding-only experts are filtered out via activation_count > 0
