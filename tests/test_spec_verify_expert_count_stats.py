@@ -112,6 +112,88 @@ class TestSpecVerifyExpertCountStats(unittest.TestCase):
 
         self.assertEqual(args.spec_verify_miss_policy, "cache_fill_no_cpu")
 
+    def test_parser_exposes_dual_queue_runtime_knobs(self):
+        args = self.mod.build_parser().parse_args(
+            [
+                "--single-case",
+                "--output",
+                "/tmp/out.json",
+                "--prefetch-runtime-kind",
+                "dual_queue",
+                "--dual-queue-segment-size",
+                "8",
+                "--dual-queue-ground-truth-decay",
+                "0.75",
+                "--dual-queue-ground-truth-ttl-rounds",
+                "7",
+                "--dual-queue-ground-truth-count-weight",
+                "0.2",
+                "--dual-queue-budget-safety-ratio",
+                "0.6",
+                "--dual-queue-segment-time-ema-alpha",
+                "0.3",
+                "--prefetch-transfer-stream-count",
+                "2",
+                "--prefetch-metadata-host-buffer-pool-size",
+                "5",
+            ]
+        )
+
+        self.assertEqual(args.prefetch_runtime_kind, "dual_queue")
+        self.assertEqual(args.dual_queue_segment_size, 8)
+        self.assertEqual(args.dual_queue_ground_truth_decay, 0.75)
+        self.assertEqual(args.dual_queue_ground_truth_ttl_rounds, 7)
+        self.assertEqual(args.dual_queue_ground_truth_count_weight, 0.2)
+        self.assertEqual(args.dual_queue_budget_safety_ratio, 0.6)
+        self.assertEqual(args.dual_queue_segment_time_ema_alpha, 0.3)
+        self.assertEqual(args.prefetch_transfer_stream_count, 2)
+        self.assertEqual(args.prefetch_metadata_host_buffer_pool_size, 5)
+
+    def test_summary_reports_dual_queue_source_metrics(self):
+        summary = self.mod._summarize_case(
+            {
+                "case": {"prefetch_runtime_kind": "dual_queue"},
+                "generated_output_tokens": 16,
+                "throughput_output_tok_s": 2.0,
+                "engine_profile": {
+                    "model_dual_queue_draft_budget": 3,
+                    "model_dual_queue_verify_budget": 5,
+                    "model_dual_queue_expert_transfer_ms": 0.4,
+                    "model_dual_queue_target_miss_count": 2,
+                    "model_dual_queue_round_end_discard_count": 1,
+                    "model_dual_queue_round_clear_count": 4,
+                    "model_dual_queue_all_slots_protected_count": 6,
+                    "model_prefetch_submit_count_by_source": {
+                        "dual_queue_draft_predict": 7,
+                        "dual_queue_ground_truth": 8,
+                    },
+                    "model_prefetch_published_count_by_source": {
+                        "dual_queue_draft_predict": 5,
+                        "dual_queue_ground_truth": 6,
+                    },
+                    "spec_step_traces": [],
+                },
+            },
+            [],
+        )
+
+        dual = summary["dual_queue"]
+        self.assertEqual(dual["draft_budget"], 3)
+        self.assertEqual(dual["verify_budget"], 5)
+        self.assertEqual(dual["expert_transfer_ms"], 0.4)
+        self.assertEqual(dual["target_miss_count"], 2)
+        self.assertEqual(dual["round_end_discard_count"], 1)
+        self.assertEqual(dual["round_clear_count"], 4)
+        self.assertEqual(dual["all_slots_protected_count"], 6)
+        self.assertEqual(
+            dual["submit_count_by_source"]["dual_queue_draft_predict"],
+            7,
+        )
+        self.assertEqual(
+            dual["published_count_by_source"]["dual_queue_ground_truth"],
+            6,
+        )
+
     def test_m3_perfect_fraction_groups_draft_layers_and_step0(self):
         events = [
             {"layer_idx": 0, "cpu_expert_count": 0, "cpu_route_ratio": 0.0},

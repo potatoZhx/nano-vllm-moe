@@ -14,11 +14,12 @@ unique miss experts, and cache hit rate changes.
 
     python scripts/bench_verify_segment_graph.py \
         --gpu-memory-utilization 0.99 \
-        --output-dir results/verify_segment_bench \
-        --cache-ratios 0.3125 \
-        --output-lens 64 \
-        --max-draft-tokens-values 3 \
-        --segment-sizes 12
+        --output-dir results/verify_segment_bench_more \
+        --cache-ratios 0.25,0.3125 \
+        --output-lens 128,512,1024,4096,8092 \
+        --max-draft-tokens-values 4,5,8,10 \
+        --segment-sizes 12 \
+        --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 32 
     EOS
 """
 from __future__ import annotations

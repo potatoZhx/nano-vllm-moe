@@ -438,6 +438,182 @@ class SegmentCandidateIndex:
         return out
 
 
+@dataclass
+class DualQueueEntry:
+    layer_idx: int
+    expert_idx: int
+    score_sum: float
+    activation_count: float
+    last_seen_round: int
+
+
+class DualQueueSegmentIndex:
+    """Segment index used only by the dual-queue runtime.
+
+    Draft entries accumulate within one speculative round. Ground-truth
+    entries retain normalized verify/prefill history with round-based decay.
+    Cache residency is deliberately filtered at selection time, not update
+    time, so a currently cached expert remains useful history after eviction.
+    """
+
+    def __init__(self, *, segment_size: int, history: bool, config: Config):
+        self.segment_size = max(1, int(segment_size))
+        self.history = bool(history)
+        self.config = config
+        self.entries_by_segment: dict[int, dict[tuple[int, int], DualQueueEntry]] = defaultdict(dict)
+
+    def clear(self) -> None:
+        self.entries_by_segment.clear()
+
+    def _segment_id(self, layer_idx: int) -> int:
+        return int(layer_idx) // self.segment_size
+
+    @staticmethod
+    def _aggregated(meta: LayerRuntimeMetaCPU) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if meta.aggregated_expert_ids is not None and meta.aggregated_score_sum is not None:
+            expert_ids = meta.aggregated_expert_ids.to(device="cpu", dtype=torch.int64)
+            counts = (
+                meta.aggregated_activation_count.to(device="cpu", dtype=torch.float32)
+                if meta.aggregated_activation_count is not None
+                else torch.zeros(expert_ids.numel(), dtype=torch.float32)
+            )
+            return (
+                expert_ids,
+                meta.aggregated_score_sum.to(device="cpu", dtype=torch.float32),
+                counts,
+            )
+        if meta.selected_experts is None or meta.routing_weights is None:
+            return None
+        flat_ids = meta.selected_experts.reshape(-1).to(device="cpu", dtype=torch.int64)
+        if flat_ids.numel() == 0:
+            return None
+        flat_weights = meta.routing_weights.reshape(-1).to(device="cpu", dtype=torch.float32)
+        unique_ids, inverse = torch.unique(flat_ids, return_inverse=True)
+        score_sum = torch.zeros(unique_ids.numel(), dtype=torch.float32)
+        score_sum.scatter_add_(0, inverse, flat_weights)
+        counts = torch.zeros(unique_ids.numel(), dtype=torch.float32)
+        counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float32))
+        return unique_ids, score_sum, counts
+
+    def update(
+        self,
+        runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
+        *,
+        round_id: int,
+    ) -> set[tuple[int, int]]:
+        activated: set[tuple[int, int]] = set()
+        if not runtime_meta:
+            return activated
+        decay = float(getattr(self.config, "dual_queue_ground_truth_decay", 0.9))
+        for layer_idx, meta in runtime_meta.items():
+            aggregated = self._aggregated(meta)
+            if aggregated is None:
+                continue
+            expert_ids, score_sums, counts = aggregated
+            token_count = max(1, int(meta.token_count))
+            segment_entries = self.entries_by_segment[self._segment_id(int(layer_idx))]
+            for expert_idx, score_sum, count in zip(
+                expert_ids.tolist(), score_sums.tolist(), counts.tolist(), strict=True
+            ):
+                key = (int(layer_idx), int(expert_idx))
+                activated.add(key)
+                new_score = float(score_sum)
+                new_count = float(count)
+                if self.history:
+                    new_score /= token_count
+                    new_count /= token_count
+                entry = segment_entries.get(key)
+                if entry is None:
+                    segment_entries[key] = DualQueueEntry(
+                        layer_idx=key[0],
+                        expert_idx=key[1],
+                        score_sum=new_score,
+                        activation_count=new_count,
+                        last_seen_round=int(round_id),
+                    )
+                    continue
+                if self.history and entry.last_seen_round != int(round_id):
+                    gap = max(1, int(round_id) - int(entry.last_seen_round))
+                    factor = decay ** gap
+                    entry.score_sum *= factor
+                    entry.activation_count *= factor
+                entry.score_sum += new_score
+                entry.activation_count += new_count
+                entry.last_seen_round = int(round_id)
+        return activated
+
+    def _priority(self, entry: DualQueueEntry, round_id: int) -> float:
+        if not self.history:
+            return float(entry.score_sum)
+        age = max(0, int(round_id) - int(entry.last_seen_round))
+        decay = float(getattr(self.config, "dual_queue_ground_truth_decay", 0.9)) ** age
+        count_weight = float(getattr(self.config, "dual_queue_ground_truth_count_weight", 0.1))
+        return decay * (float(entry.score_sum) + count_weight * float(entry.activation_count))
+
+    def ranked_for_range(
+        self,
+        *,
+        layer_start: int,
+        layer_end: int,
+        round_id: int,
+        layer_caches: dict[int, LayerExpertCache],
+        inflight_keys: set[tuple[int, int]],
+        source: str,
+    ) -> list[PrefetchCandidate]:
+        start = int(layer_start)
+        end = int(layer_end)
+        if start >= end:
+            return []
+        ttl = int(getattr(self.config, "dual_queue_ground_truth_ttl_rounds", 64))
+        first_segment = self._segment_id(start)
+        last_segment = self._segment_id(end - 1)
+        ranked: list[PrefetchCandidate] = []
+        for segment_id in range(first_segment, last_segment + 1):
+            entries = self.entries_by_segment.get(segment_id)
+            if not entries:
+                continue
+            stale: list[tuple[int, int]] = []
+            for key, entry in entries.items():
+                layer_idx, expert_idx = key
+                if not (start <= layer_idx < end):
+                    continue
+                age = max(0, int(round_id) - int(entry.last_seen_round))
+                if self.history and age > ttl:
+                    stale.append(key)
+                    continue
+                cache = layer_caches.get(layer_idx)
+                if (
+                    cache is None
+                    or key in inflight_keys
+                    or cache.is_cached_cpu(expert_idx)
+                    or cache.is_pending_cpu(expert_idx)
+                ):
+                    continue
+                ranked.append(
+                    PrefetchCandidate(
+                        layer_idx=layer_idx,
+                        expert_idx=expert_idx,
+                        source=source,
+                        score_sum=float(entry.score_sum),
+                        activation_count=int(round(entry.activation_count)),
+                        first_seen_step=int(entry.last_seen_round),
+                        last_seen_step=int(entry.last_seen_round),
+                        priority=self._priority(entry, int(round_id)),
+                    )
+                )
+            for key in stale:
+                entries.pop(key, None)
+        ranked.sort(key=lambda item: (-item.priority, item.layer_idx, item.expert_idx))
+        return ranked
+
+    def priority_for(self, layer_idx: int, expert_idx: int, round_id: int) -> float:
+        entries = self.entries_by_segment.get(self._segment_id(int(layer_idx)))
+        if not entries:
+            return 0.0
+        entry = entries.get((int(layer_idx), int(expert_idx)))
+        return 0.0 if entry is None else self._priority(entry, int(round_id))
+
+
 class PrefetchRuntime:
     def __init__(
         self,
@@ -2601,6 +2777,566 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             ),
             "predictive_draft_stale_observe_count": int(
                 self._profile.get("predictive_draft_stale_observe_count", 0.0)
+            ),
+        }
+        out = super().get_profile(reset=reset)
+        out.update(extra)
+        return out
+
+
+class DualQueuePrefetchRuntime(PrefetchRuntime):
+    """Segment prefetcher with isolated draft-predict and ground-truth queues."""
+
+    DRAFT_SOURCE = "dual_queue_draft_predict"
+    GROUND_TRUTH_SOURCE = "dual_queue_ground_truth"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        segment_size = max(1, int(getattr(self.config, "dual_queue_segment_size", 12)))
+        self.draft_predict_index = DualQueueSegmentIndex(
+            segment_size=segment_size,
+            history=False,
+            config=self.config,
+        )
+        self.ground_truth_index = DualQueueSegmentIndex(
+            segment_size=segment_size,
+            history=True,
+            config=self.config,
+        )
+        self._round_id = 0
+        self._round_active = False
+        self._draft_forward_index = -1
+        self._round_protected: dict[int, set[int]] = defaultdict(set)
+        self._calibrating = False
+        self._calibrated = False
+        self._segment_compute_ms: dict[str, dict[int, float]] = {
+            "draft": {},
+            "verify": {},
+        }
+        self._expired_tickets: set[tuple[int, int]] = set()
+        self._expert_transfer_ms = self._estimated_representative_transfer_ms()
+
+    def _segment_indexed_enabled(self) -> bool:
+        return True
+
+    def begin_draft_iteration(self, step_id: int) -> None:
+        if not self._round_active:
+            self._round_id += 1
+            self._round_active = True
+            self._draft_forward_index = 0
+            self._round_protected.clear()
+            self.draft_predict_index.clear()
+        else:
+            self._draft_forward_index += 1
+        self._draft_iteration_open = True
+        self._active_draft_iteration_steps.add(int(step_id))
+
+    def end_draft_iteration(self) -> None:
+        self._active_draft_iteration_steps.clear()
+        self._draft_iteration_open = False
+
+    def is_first_draft_forward(self) -> bool:
+        return self._draft_forward_index == 0
+
+    def finish_verify_round(self) -> None:
+        self.draft_predict_index.clear()
+        self._round_protected.clear()
+        self._active_draft_iteration_steps.clear()
+        self._draft_iteration_open = False
+        self._round_active = False
+        self._draft_forward_index = -1
+        self._profile["dual_queue_round_clear_count"] += 1
+
+    def set_calibrating(self, enabled: bool) -> None:
+        self._calibrating = bool(enabled)
+        if enabled:
+            self._segment_compute_ms = {"draft": {}, "verify": {}}
+
+    @staticmethod
+    def _mark_cache_access(
+        layer_caches: dict[int, LayerExpertCache],
+        runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
+        step_id: int,
+    ) -> None:
+        if not runtime_meta:
+            return
+        for layer_idx, meta in runtime_meta.items():
+            cache = layer_caches.get(int(layer_idx))
+            if cache is None:
+                continue
+            if meta.aggregated_expert_ids is not None:
+                cache.mark_access_aggregated(
+                    meta.aggregated_expert_ids,
+                    meta.aggregated_activation_count,
+                    meta.aggregated_score_sum,
+                    step_id=int(step_id),
+                )
+            elif meta.selected_experts is not None:
+                cache.mark_access(meta.selected_experts, meta.routing_weights, step_id=int(step_id))
+
+    def observe_prefill(self, runtime_meta, step_id: int) -> dict[str, float]:
+        t0 = time.perf_counter()
+        self._mark_cache_access(self.layer_caches, runtime_meta, step_id)
+        self.ground_truth_index.update(runtime_meta, round_id=self._round_id)
+        return {"queue_update_ms": (time.perf_counter() - t0) * 1000.0}
+
+    def observe_verify(self, runtime_meta, step_id: int) -> dict[str, float]:
+        t0 = time.perf_counter()
+        self._mark_cache_access(self.layer_caches, runtime_meta, step_id)
+        self.ground_truth_index.update(runtime_meta, round_id=self._round_id)
+        self._update_rank_guard_scores(runtime_meta)
+        return {"queue_update_ms": (time.perf_counter() - t0) * 1000.0}
+
+    def observe_draft(self, runtime_meta, step_id: int) -> dict[str, float]:
+        if int(step_id) not in self._active_draft_iteration_steps:
+            self._profile["dual_queue_stale_draft_metadata_count"] += 1
+            return {}
+        t0 = time.perf_counter()
+        activated = self.draft_predict_index.update(runtime_meta, round_id=self._round_id)
+        for layer_idx, expert_idx in activated:
+            self._round_protected[int(layer_idx)].add(int(expert_idx))
+        return {"queue_update_ms": (time.perf_counter() - t0) * 1000.0}
+
+    def _estimated_representative_transfer_ms(self) -> float:
+        for layer_pool in self.cpu_expert_pool.values():
+            for weights in layer_pool.values():
+                return max(1e-6, self._estimated_expert_transfer_ms(weights))
+        return 1.0
+
+    def calibrate_expert_transfer_ms(self, repeats: int = 3) -> float:
+        representative = None
+        for layer_pool in self.cpu_expert_pool.values():
+            if layer_pool:
+                representative = next(iter(layer_pool.values()))
+                break
+        if representative is None or not torch.cuda.is_available():
+            return float(self._expert_transfer_ms)
+
+        gate_up = representative["gate_up"]
+        down = representative["down"]
+        target_gate_up = torch.empty_like(gate_up, device=torch.device("cuda"))
+        target_down = torch.empty_like(down, device=torch.device("cuda"))
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            target_gate_up.copy_(gate_up, non_blocking=True)
+            target_down.copy_(down, non_blocking=True)
+        stream.synchronize()
+
+        samples: list[float] = []
+        for _ in range(max(1, int(repeats))):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(stream):
+                start.record(stream)
+                target_gate_up.copy_(gate_up, non_blocking=True)
+                target_down.copy_(down, non_blocking=True)
+                end.record(stream)
+            end.synchronize()
+            samples.append(float(start.elapsed_time(end)))
+        self._expert_transfer_ms = max(1e-6, max(samples))
+        return float(self._expert_transfer_ms)
+
+    def record_segment_compute_ms(self, phase: str, segment_id: int, compute_ms: float) -> None:
+        phase_key = str(phase)
+        if phase_key not in self._segment_compute_ms or compute_ms < 0.0:
+            return
+        values = self._segment_compute_ms[phase_key]
+        previous = values.get(int(segment_id))
+        alpha = float(getattr(self.config, "dual_queue_segment_time_ema_alpha", 0.2))
+        values[int(segment_id)] = (
+            float(compute_ms)
+            if previous is None
+            else (1.0 - alpha) * float(previous) + alpha * float(compute_ms)
+        )
+        if self._calibrated and not self._calibrating:
+            self._recompute_prefetch_budgets()
+
+    def _recompute_prefetch_budgets(self) -> tuple[int, int]:
+        safety = float(getattr(self.config, "dual_queue_budget_safety_ratio", 0.8))
+        max_inflight = max(0, int(getattr(self.config, "prefetch_max_inflight", 0)))
+
+        def phase_budget(phase: str, fallback: int) -> int:
+            samples = self._segment_compute_ms.get(phase, {})
+            if not samples or self._expert_transfer_ms <= 0.0:
+                return max(0, min(max_inflight, int(fallback)))
+            capacity = int(safety * min(samples.values()) / self._expert_transfer_ms)
+            return max(0, min(max_inflight, capacity))
+
+        draft_budget = phase_budget(
+            "draft", int(getattr(self.config, "draft_prefetch_max_per_boundary", 0))
+        )
+        verify_budget = phase_budget(
+            "verify", int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
+        )
+        self.config.draft_prefetch_max_per_boundary = draft_budget
+        self.config.verify_prefetch_max_per_boundary = verify_budget
+        self._profile["dual_queue_draft_budget"] = draft_budget
+        self._profile["dual_queue_verify_budget"] = verify_budget
+        return draft_budget, verify_budget
+
+    def finalize_calibration(self) -> dict[str, float | int]:
+        self.calibrate_expert_transfer_ms()
+        self._calibrated = True
+        self._calibrating = False
+        draft_budget, verify_budget = self._recompute_prefetch_budgets()
+        return {
+            "draft_prefetch_max_per_boundary": int(draft_budget),
+            "verify_prefetch_max_per_boundary": int(verify_budget),
+            "expert_transfer_ms": float(self._expert_transfer_ms),
+            "draft_min_segment_ms": float(min(self._segment_compute_ms["draft"].values(), default=0.0)),
+            "verify_min_segment_ms": float(min(self._segment_compute_ms["verify"].values(), default=0.0)),
+        }
+
+    def _select_dual_queue_victim(
+        self,
+        cache: LayerExpertCache,
+        *,
+        layer_idx: int,
+        source: str,
+        boundary_protected: set[int] | None = None,
+    ) -> int | None:
+        for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
+            if int(slot_expert) < 0 and not cache.is_active_slot_pending(slot_idx):
+                return slot_idx
+
+        protected = self._round_protected.get(int(layer_idx), set())
+        protected_this_boundary = boundary_protected or set()
+        best: tuple[float, int, int] | None = None
+        for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
+            if cache.is_active_slot_pending(slot_idx):
+                continue
+            expert_idx = int(slot_expert)
+            if expert_idx in protected_this_boundary:
+                continue
+            if source == self.DRAFT_SOURCE and expert_idx in protected:
+                continue
+            score = self.ground_truth_index.priority_for(layer_idx, expert_idx, self._round_id)
+            last_access = int(cache.last_access_step[expert_idx]) if expert_idx >= 0 else -1
+            candidate = (float(score), last_access, int(slot_idx))
+            if best is None or candidate < best:
+                best = candidate
+        return None if best is None else int(best[2])
+
+    def submit_segment_prefetch(
+        self,
+        *,
+        step_id: int,
+        target_layer_start: int,
+        target_layer_end: int,
+        target_segment_id: int,
+        source: str,
+        phase: str,
+    ) -> int:
+        if self._calibrating:
+            return 0
+        if source == self.GROUND_TRUTH_SOURCE:
+            index = self.ground_truth_index
+        elif source == self.DRAFT_SOURCE:
+            index = self.draft_predict_index
+        else:
+            raise ValueError(f"unsupported dual-queue source: {source}")
+
+        budget = int(
+            getattr(
+                self.config,
+                "draft_prefetch_max_per_boundary"
+                if phase == "draft"
+                else "verify_prefetch_max_per_boundary",
+                0,
+            )
+        )
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        dispatch_budget = min(max(0, budget), inflight_budget)
+        if dispatch_budget <= 0:
+            return 0
+
+        inflight_keys = set(self.inflight.keys())
+        ranked = index.ranked_for_range(
+            layer_start=int(target_layer_start),
+            layer_end=int(target_layer_end),
+            round_id=self._round_id,
+            layer_caches=self.layer_caches,
+            inflight_keys=inflight_keys,
+            source=source,
+        )
+        submitted = 0
+        for candidate in ranked:
+            if submitted >= dispatch_budget:
+                break
+            layer_idx = int(candidate.layer_idx)
+            expert_idx = int(candidate.expert_idx)
+            key = (layer_idx, expert_idx)
+            cache = self.layer_caches.get(layer_idx)
+            if cache is None or key in self.inflight:
+                continue
+            if cache.is_cached_cpu(expert_idx) or cache.is_pending_cpu(expert_idx):
+                continue
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+            reservation = cache.reserve_staging_slot(expert_idx)
+            if reservation is None:
+                continue
+            reservation.layer_idx = layer_idx
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
+                cache=cache,
+                reservation=reservation,
+                weights=weights,
+                source=source,
+                direct_active=False,
+            )
+            ticket = PrefetchTicket(
+                step_id=int(step_id),
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source=source,
+                staging_slot_idx=reservation.staging_slot_idx,
+                staging_generation=reservation.generation,
+                submit_ts_ms=submit_ts_ms,
+                ready_event=ready_event,
+                direct_active=False,
+                segment_id=int(target_segment_id),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
+                transfer_stream_idx=stream_idx,
+            )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
+            submitted += 1
+            inflight_keys.add(key)
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["staging_prefetch_submit_count"] += 1
+            self._profile[f"{source}_submit_count"] += 1
+        return submitted
+
+    def _reap_expired_tickets(self) -> None:
+        for key in list(self._expired_tickets):
+            ticket = self.inflight.get(key)
+            if ticket is None:
+                self._expired_tickets.discard(key)
+                continue
+            if not bool(ticket.ready_event.query()):
+                continue
+            cache = self.layer_caches.get(ticket.layer_idx)
+            if cache is not None:
+                cache.cancel_staging_reservation(
+                    StagingReservation(
+                        layer_idx=ticket.layer_idx,
+                        staging_slot_idx=ticket.staging_slot_idx,
+                        expert_idx=ticket.expert_idx,
+                        generation=ticket.staging_generation,
+                    )
+                )
+            self.inflight.pop(key, None)
+            self._expired_tickets.discard(key)
+            self._profile["dual_queue_expired_transfer_count"] += 1
+            self._profile["prefetch_late_count"] += 1
+            self._record_prefetch_late(ticket)
+
+    def _expire_unfinished_round_tickets(self) -> None:
+        for key, ticket in self.inflight.items():
+            if ticket.source not in {self.DRAFT_SOURCE, self.GROUND_TRUTH_SOURCE}:
+                continue
+            if key in self._expired_tickets:
+                continue
+            self._expired_tickets.add(key)
+            self._profile["dual_queue_round_end_discard_count"] += 1
+
+    def publish_segment_ready(self, *, step_id: int, segment_id: int) -> int:
+        self._reap_expired_tickets()
+        published = 0
+        boundary_protected: dict[int, set[int]] = defaultdict(set)
+        for key, ticket in list(self.inflight.items()):
+            if (
+                ticket.direct_active
+                or ticket.source not in {self.DRAFT_SOURCE, self.GROUND_TRUTH_SOURCE}
+                or int(ticket.segment_id) != int(segment_id)
+                or key in self._expired_tickets
+            ):
+                continue
+            if not bool(ticket.ready_event.query()):
+                self._expired_tickets.add(key)
+                self._profile["dual_queue_target_miss_count"] += 1
+                continue
+            cache = self.layer_caches.get(ticket.layer_idx)
+            reservation = StagingReservation(
+                layer_idx=ticket.layer_idx,
+                staging_slot_idx=ticket.staging_slot_idx,
+                expert_idx=ticket.expert_idx,
+                generation=ticket.staging_generation,
+            )
+            if cache is None or not cache.mark_staging_ready(reservation):
+                self.inflight.pop(key, None)
+                self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
+                continue
+            self._profile["prefetch_completed_count"] += 1
+            self._record_prefetch_completed(ticket)
+            victim_slot = self._select_dual_queue_victim(
+                cache,
+                layer_idx=ticket.layer_idx,
+                source=ticket.source,
+                boundary_protected=boundary_protected[ticket.layer_idx],
+            )
+            if victim_slot is None:
+                cache.cancel_staging_reservation(reservation)
+                self.inflight.pop(key, None)
+                self._profile["dual_queue_all_slots_protected_count"] += 1
+                self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
+                continue
+            published_item = cache.publish_ready_staging_to_active(
+                reservation=reservation,
+                active_slot_idx=victim_slot,
+                stream=self.publish_stream,
+            )
+            if published_item is None:
+                cache.cancel_staging_reservation(reservation)
+                self.inflight.pop(key, None)
+                self._profile["prefetch_late_count"] += 1
+                self._record_prefetch_late(ticket)
+                continue
+            self._finalize_publish(cache, published_item)
+            self.inflight.pop(key, None)
+            self._recent_published[key] = int(step_id)
+            self._recent_published_source[key] = str(ticket.source)
+            boundary_protected[ticket.layer_idx].add(ticket.expert_idx)
+            published += 1
+            self._profile["publish_count"] += 1
+            self._profile["staging_prefetch_publish_count"] += 1
+            self._profile[f"{ticket.source}_publish_count"] += 1
+            self._record_prefetch_published(ticket)
+        return published
+
+    def on_draft_segment_start(
+        self,
+        *,
+        step_id: int,
+        segment_id: int,
+        boundaries: list[tuple[int, int]],
+    ) -> int:
+        published = self.publish_segment_ready(step_id=step_id, segment_id=segment_id)
+        num_segments = len(boundaries)
+        if num_segments <= 1 or self._calibrating:
+            return published
+        if self.is_first_draft_forward():
+            if segment_id != 0:
+                return published
+            target = 1
+            source = self.GROUND_TRUTH_SOURCE
+        else:
+            target = (int(segment_id) + 1) % num_segments
+            source = self.DRAFT_SOURCE
+        start, end = boundaries[target]
+        return published + self.submit_segment_prefetch(
+            step_id=step_id,
+            target_layer_start=start,
+            target_layer_end=end,
+            target_segment_id=target,
+            source=source,
+            phase="draft",
+        )
+
+    def on_draft_segment_end(
+        self,
+        *,
+        step_id: int,
+        segment_id: int,
+        boundaries: list[tuple[int, int]],
+    ) -> int:
+        if not self.is_first_draft_forward() or self._calibrating:
+            return 0
+        num_segments = len(boundaries)
+        if num_segments <= 1:
+            return 0
+        if segment_id <= num_segments - 3:
+            target = int(segment_id) + 2
+            source = self.GROUND_TRUTH_SOURCE
+        elif segment_id == num_segments - 2:
+            target = 0
+            source = self.DRAFT_SOURCE
+        else:
+            target = 1
+            source = self.DRAFT_SOURCE
+        start, end = boundaries[target]
+        return self.submit_segment_prefetch(
+            step_id=step_id,
+            target_layer_start=start,
+            target_layer_end=end,
+            target_segment_id=target,
+            source=source,
+            phase="draft",
+        )
+
+    def on_verify_segment_start(
+        self,
+        *,
+        step_id: int,
+        segment_id: int,
+        boundaries: list[tuple[int, int]],
+    ) -> int:
+        published = self.publish_segment_ready(step_id=step_id, segment_id=segment_id)
+        if len(boundaries) <= 1 or self._calibrating:
+            return published
+        target = (int(segment_id) + 1) % len(boundaries)
+        start, end = boundaries[target]
+        return published + self.submit_segment_prefetch(
+            step_id=step_id,
+            target_layer_start=start,
+            target_layer_end=end,
+            target_segment_id=target,
+            source=self.DRAFT_SOURCE,
+            phase="verify",
+        )
+
+    def complete_verify_round(self, *, step_id: int) -> None:
+        # The final verify segment is the last overlap window for segment 0.
+        self.publish_segment_ready(step_id=step_id, segment_id=0)
+        self._expire_unfinished_round_tickets()
+        self.finish_verify_round()
+        self._reap_expired_tickets()
+
+    def discard_verify_round(self) -> None:
+        self._expire_unfinished_round_tickets()
+        self.finish_verify_round()
+        self._reap_expired_tickets()
+
+    def drain_direct_active_ready(self, step_id: int, *, source: str | None = None) -> int:
+        self._reap_expired_tickets()
+        return self.publish_direct_active_ready(step_id=int(step_id), source=source)
+
+    def wait_for_verify(self, step_id: int, timeout_ms: float) -> None:
+        _ = timeout_ms
+        self.publish_direct_active_ready(step_id=int(step_id))
+
+    def get_profile(self, reset: bool = False) -> dict:
+        extra = {
+            "dual_queue_round_id": int(self._round_id),
+            "dual_queue_draft_forward_index": int(self._draft_forward_index),
+            "dual_queue_draft_budget": int(getattr(self.config, "draft_prefetch_max_per_boundary", 0)),
+            "dual_queue_verify_budget": int(getattr(self.config, "verify_prefetch_max_per_boundary", 0)),
+            "dual_queue_expert_transfer_ms": float(self._expert_transfer_ms),
+            "dual_queue_target_miss_count": int(self._profile.get("dual_queue_target_miss_count", 0.0)),
+            "dual_queue_round_end_discard_count": int(
+                self._profile.get("dual_queue_round_end_discard_count", 0.0)
+            ),
+            "dual_queue_expired_transfer_count": int(
+                self._profile.get("dual_queue_expired_transfer_count", 0.0)
+            ),
+            "dual_queue_stale_draft_metadata_count": int(
+                self._profile.get("dual_queue_stale_draft_metadata_count", 0.0)
+            ),
+            "dual_queue_round_clear_count": int(
+                self._profile.get("dual_queue_round_clear_count", 0.0)
+            ),
+            "dual_queue_all_slots_protected_count": int(
+                self._profile.get("dual_queue_all_slots_protected_count", 0.0)
+            ),
+            "dual_queue_draft_predict_size": sum(
+                len(entries) for entries in self.draft_predict_index.entries_by_segment.values()
+            ),
+            "dual_queue_ground_truth_size": sum(
+                len(entries) for entries in self.ground_truth_index.entries_by_segment.values()
             ),
         }
         out = super().get_profile(reset=reset)

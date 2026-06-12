@@ -66,6 +66,14 @@ class Config:
     prefetch_verify_attention_ratio: float = 0.3
     # Phase-1 cold-start prefetch budget (number of experts) for segment n-1.
     predictive_phase1_budget: int = 4
+    # Dual-queue segment prefetcher. A single segment size drives both draft and
+    # verify graphs so queue segment ids have identical layer ranges.
+    dual_queue_segment_size: int = 12
+    dual_queue_ground_truth_decay: float = 0.9
+    dual_queue_ground_truth_ttl_rounds: int = 64
+    dual_queue_ground_truth_count_weight: float = 0.1
+    dual_queue_budget_safety_ratio: float = 0.8
+    dual_queue_segment_time_ema_alpha: float = 0.2
     draft_prefetch_frontier_granularity: str = "segment"
     draft_prefetch_segment_size: int = 12
     draft_prefetch_segment_host_buffer_pool_size: int = 0
@@ -168,13 +176,29 @@ class Config:
         assert self.prefetch_verify_layer_transfer_bandwidth_gbps > 0.0
         assert self.prefetch_verify_layer_max_budget >= 0
         assert self.prefetch_metadata_host_buffer_pool_size >= 1
-        assert self.prefetch_runtime_kind in {"legacy", "predictive"}
+        assert self.prefetch_runtime_kind in {"legacy", "predictive", "dual_queue"}
         assert 0.0 < self.prefetch_verify_attention_ratio <= 1.0
         assert self.predictive_phase1_budget >= 0
-        if self.prefetch_runtime_kind == "predictive":
+        assert self.dual_queue_segment_size >= 1
+        assert 0.0 <= self.dual_queue_ground_truth_decay <= 1.0
+        assert self.dual_queue_ground_truth_ttl_rounds >= 1
+        assert self.dual_queue_ground_truth_count_weight >= 0.0
+        assert 0.0 < self.dual_queue_budget_safety_ratio <= 1.0
+        assert 0.0 < self.dual_queue_segment_time_ema_alpha <= 1.0
+        if self.prefetch_runtime_kind in {"predictive", "dual_queue"}:
             # The predictive prefetcher reuses the segment-indexed integration
             # gates in model_runner; force the mode so those gates fire.
             self.prefetch_runtime_mode = "draft_segment_indexed"
+        if self.prefetch_runtime_kind == "dual_queue":
+            assert not self.enforce_eager, "dual_queue requires CUDA graph execution"
+            assert self.cpu_expert_backend == "kt_direct", "dual_queue verify requires cpu_expert_backend=kt_direct"
+            assert self.spec_verify_miss_policy == "cpu", "dual_queue verify requires spec_verify_miss_policy=cpu"
+            self.draft_prefetch_frontier_granularity = "segment"
+            self.draft_prefetch_segment_size = int(self.dual_queue_segment_size)
+            self.verify_prefetch_segment_size = int(self.dual_queue_segment_size)
+            self.draft_cuda_graph_enabled = True
+            self.verify_cuda_graph = True
+            self.verify_cuda_graph_kt_hybrid = True
         assert self.prefetch_runtime_mode in {"baseline_staging", "draft_direct_active", "draft_segment_indexed"}
         assert self.draft_prefetch_frontier_granularity in {"iteration", "segment", "layer"}
         assert self.draft_prefetch_segment_size >= 1
@@ -219,5 +243,12 @@ class Config:
             self.prefetch_verify_layer_enabled = False
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.prefetch_runtime_kind == "dual_queue":
+            assert self.prefetch_staging_slots_per_layer >= 1, (
+                "dual_queue requires prefetch_staging_slots_per_layer >= 1"
+            )
+            assert int(self.hf_config.num_hidden_layers) > int(self.dual_queue_segment_size), (
+                "dual_queue requires at least two segments"
+            )
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len

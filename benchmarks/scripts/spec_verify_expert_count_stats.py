@@ -408,6 +408,37 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
                 ep.get("model_verify_segment_prefetch_visible_overhead_ms", 0.0) or 0.0
             ),
         },
+        "dual_queue": {
+            "draft_budget": int(ep.get("model_dual_queue_draft_budget", 0) or 0),
+            "verify_budget": int(ep.get("model_dual_queue_verify_budget", 0) or 0),
+            "expert_transfer_ms": float(ep.get("model_dual_queue_expert_transfer_ms", 0.0) or 0.0),
+            "draft_predict_size": int(ep.get("model_dual_queue_draft_predict_size", 0) or 0),
+            "ground_truth_size": int(ep.get("model_dual_queue_ground_truth_size", 0) or 0),
+            "target_miss_count": int(ep.get("model_dual_queue_target_miss_count", 0) or 0),
+            "round_end_discard_count": int(
+                ep.get("model_dual_queue_round_end_discard_count", 0) or 0
+            ),
+            "expired_transfer_count": int(
+                ep.get("model_dual_queue_expired_transfer_count", 0) or 0
+            ),
+            "stale_draft_metadata_count": int(
+                ep.get("model_dual_queue_stale_draft_metadata_count", 0) or 0
+            ),
+            "round_clear_count": int(ep.get("model_dual_queue_round_clear_count", 0) or 0),
+            "all_slots_protected_count": int(
+                ep.get("model_dual_queue_all_slots_protected_count", 0) or 0
+            ),
+            "metadata_host_buffer_drop_count": int(
+                ep.get("model_dual_queue_metadata_host_buffer_drop_count", 0) or 0
+            ),
+            "submit_count_by_source": ep.get("model_prefetch_submit_count_by_source", {}),
+            "completed_count_by_source": ep.get("model_prefetch_completed_count_by_source", {}),
+            "published_count_by_source": ep.get("model_prefetch_published_count_by_source", {}),
+            "late_count_by_source": ep.get("model_prefetch_late_count_by_source", {}),
+            "submitted_bytes_by_source": ep.get("model_prefetch_submitted_bytes_by_source", {}),
+            "published_bytes_by_source": ep.get("model_prefetch_published_bytes_by_source", {}),
+            "late_bytes_by_source": ep.get("model_prefetch_late_bytes_by_source", {}),
+        },
         "verify_cache_fill": {
             "policy": raw.get("case", {}).get("spec_verify_miss_policy", "cpu"),
             "promoted_expert_count": int(ep.get("model_verify_cache_fill_promoted_expert_count", 0) or 0),
@@ -484,6 +515,12 @@ def run_single_case(args: argparse.Namespace) -> None:
         "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
         "prefetch_runtime_mode": args.prefetch_runtime_mode,
         "prefetch_runtime_kind": args.prefetch_runtime_kind,
+        "dual_queue_segment_size": int(args.dual_queue_segment_size),
+        "dual_queue_ground_truth_decay": float(args.dual_queue_ground_truth_decay),
+        "dual_queue_ground_truth_ttl_rounds": int(args.dual_queue_ground_truth_ttl_rounds),
+        "dual_queue_ground_truth_count_weight": float(args.dual_queue_ground_truth_count_weight),
+        "dual_queue_budget_safety_ratio": float(args.dual_queue_budget_safety_ratio),
+        "dual_queue_segment_time_ema_alpha": float(args.dual_queue_segment_time_ema_alpha),
         "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
         "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
@@ -536,10 +573,18 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_strategy=args.prefetch_strategy,
         prefetch_runtime_mode=args.prefetch_runtime_mode,
         prefetch_runtime_kind=args.prefetch_runtime_kind,
+        dual_queue_segment_size=args.dual_queue_segment_size,
+        dual_queue_ground_truth_decay=args.dual_queue_ground_truth_decay,
+        dual_queue_ground_truth_ttl_rounds=args.dual_queue_ground_truth_ttl_rounds,
+        dual_queue_ground_truth_count_weight=args.dual_queue_ground_truth_count_weight,
+        dual_queue_budget_safety_ratio=args.dual_queue_budget_safety_ratio,
+        dual_queue_segment_time_ema_alpha=args.dual_queue_segment_time_ema_alpha,
         prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
         predictive_phase1_budget=args.predictive_phase1_budget,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
         prefetch_max_inflight=args.prefetch_max_inflight,
+        prefetch_transfer_stream_count=args.prefetch_transfer_stream_count,
+        prefetch_metadata_host_buffer_pool_size=args.prefetch_metadata_host_buffer_pool_size,
         prefetch_verify_layer_max_budget=args.prefetch_verify_layer_max_budget,
         prefetch_step_budget=args.prefetch_step_budget,
         cache_eviction_budget_per_step=args.cache_eviction_budget_per_step,
@@ -557,6 +602,11 @@ def run_single_case(args: argparse.Namespace) -> None:
         prefetch_use_draft_live=args.prefetch_use_draft_live,
         draft_cuda_graph_enabled=args.draft_cuda_graph_enabled,
         draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
+        draft_prefetch_segment_size=args.draft_prefetch_segment_size,
+        draft_prefetch_segment_host_buffer_pool_size=args.draft_prefetch_segment_host_buffer_pool_size,
+        draft_prefetch_visible_budget_ms=args.draft_prefetch_visible_budget_ms,
+        draft_prefetch_min_per_boundary=args.draft_prefetch_min_per_boundary,
+        draft_prefetch_max_per_boundary=args.draft_prefetch_max_per_boundary,
         verify_cuda_graph=args.verify_cuda_graph,
         verify_cuda_graph_bucket_steps=_parse_int_csv(args.verify_cuda_graph_bucket_steps),
         verify_prefetch_segment_size=args.verify_prefetch_segment_size,
@@ -1038,11 +1088,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"],
         default="baseline_staging",
     )
-    p.add_argument("--prefetch-runtime-kind", choices=["legacy", "predictive"], default="legacy")
+    p.add_argument(
+        "--prefetch-runtime-kind",
+        choices=["legacy", "predictive", "dual_queue"],
+        default="legacy",
+    )
+    p.add_argument("--dual-queue-segment-size", type=int, default=12)
+    p.add_argument("--dual-queue-ground-truth-decay", type=float, default=0.9)
+    p.add_argument("--dual-queue-ground-truth-ttl-rounds", type=int, default=64)
+    p.add_argument("--dual-queue-ground-truth-count-weight", type=float, default=0.1)
+    p.add_argument("--dual-queue-budget-safety-ratio", type=float, default=0.8)
+    p.add_argument("--dual-queue-segment-time-ema-alpha", type=float, default=0.2)
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
     p.add_argument("--predictive-phase1-budget", type=int, default=4)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--prefetch-max-inflight", type=int, default=8)
+    p.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
+    p.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     p.add_argument("--prefetch-step-budget", type=int, default=4)
     p.add_argument("--prefetch-verify-layer-max-budget", type=int, default=2)
     p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
@@ -1060,6 +1122,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
     p.add_argument("--draft-cuda-graph-enabled", type=str2bool, default=True)
     p.add_argument("--draft-cuda-graph-cpu-backend", choices=["none", "fused", "fused_sync"], default="none")
+    p.add_argument("--draft-prefetch-segment-size", type=int, default=12)
+    p.add_argument("--draft-prefetch-segment-host-buffer-pool-size", type=int, default=0)
+    p.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
+    p.add_argument("--draft-prefetch-min-per-boundary", type=int, default=0)
+    p.add_argument("--draft-prefetch-max-per-boundary", type=int, default=4)
     p.add_argument("--verify-cuda-graph", type=str2bool, default=False)
     p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
     p.add_argument("--verify-prefetch-segment-size", type=int, default=12)

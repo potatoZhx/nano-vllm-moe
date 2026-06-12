@@ -38,6 +38,46 @@ class LLMEngine:
         self.profile_enabled = bool(getattr(config, "engine_profile", False))
         self._profile = defaultdict(float)
         atexit.register(self.exit)
+        if (
+            bool(getattr(config, "spec_enable_prefetch", False))
+            and str(getattr(config, "prefetch_runtime_kind", "legacy")) == "dual_queue"
+        ):
+            self._calibrate_dual_queue_prefetch()
+
+    def _calibrate_dual_queue_prefetch(self) -> None:
+        self.model_runner.call("begin_dual_queue_calibration")
+        calibration = {}
+        try:
+            token_id = int(self.config.eos) if int(self.config.eos) >= 0 else 0
+            params = SamplingParams(
+                temperature=0.0,
+                max_tokens=max(2, int(self.config.max_draft_tokens) + 2),
+                ignore_eos=True,
+            )
+            self.generate([[token_id]], params, use_tqdm=False)
+        finally:
+            calibration = self.model_runner.call("finalize_dual_queue_calibration") or {}
+
+        draft_budget = int(calibration.get(
+            "draft_prefetch_max_per_boundary",
+            self.config.draft_prefetch_max_per_boundary,
+        ))
+        verify_budget = int(calibration.get(
+            "verify_prefetch_max_per_boundary",
+            self.config.verify_prefetch_max_per_boundary,
+        ))
+        self.config.draft_prefetch_max_per_boundary = draft_budget
+        self.config.verify_prefetch_max_per_boundary = verify_budget
+        print(
+            "[dual_queue] calibrated "
+            f"draft_prefetch_max_per_boundary={draft_budget} "
+            f"verify_prefetch_max_per_boundary={verify_budget} "
+            f"expert_transfer_ms={float(calibration.get('expert_transfer_ms', 0.0)):.4f} "
+            f"draft_min_segment_ms={float(calibration.get('draft_min_segment_ms', 0.0)):.4f} "
+            f"verify_min_segment_ms={float(calibration.get('verify_min_segment_ms', 0.0)):.4f}",
+            flush=True,
+        )
+        self.get_profile(reset=True)
 
     def get_profile(self, reset: bool = False) -> dict:
         """Return merged engine/model/spec profile counters on rank-0 process."""

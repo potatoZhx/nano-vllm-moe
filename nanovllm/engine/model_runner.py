@@ -28,7 +28,11 @@ from nanovllm.expert.placement import (
     apply_verify_cache_fill_policy,
     collect_cache_fill_no_cpu_expert_ids,
 )
-from nanovllm.expert.prefetcher import PredictivePrefetchRuntime, PrefetchRuntime
+from nanovllm.expert.prefetcher import (
+    DualQueuePrefetchRuntime,
+    PredictivePrefetchRuntime,
+    PrefetchRuntime,
+)
 from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -119,6 +123,7 @@ class ModelRunner:
         self._verify_layer_compute_ms_ema: dict[int, float] = {}
         self._verify_layer_timing_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
         self._verify_layer_active_timing: dict[int, object] = {}
+        self._dual_queue_segment_timing_events: list[tuple[str, int, object, object]] = []
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
 
@@ -206,11 +211,12 @@ class ModelRunner:
 
             if self.prefetch_effective_enabled:
                 self.runtime_meta_recorder = ModelRuntimeMetaRecorder(config=config, hf_config=config.hf_config)
-                prefetch_cls = (
-                    PredictivePrefetchRuntime
-                    if str(getattr(config, "prefetch_runtime_kind", "legacy")) == "predictive"
-                    else PrefetchRuntime
-                )
+                runtime_kind = str(getattr(config, "prefetch_runtime_kind", "legacy"))
+                prefetch_cls = {
+                    "legacy": PrefetchRuntime,
+                    "predictive": PredictivePrefetchRuntime,
+                    "dual_queue": DualQueuePrefetchRuntime,
+                }[runtime_kind]
                 self.prefetch_runtime = prefetch_cls(
                     config=config,
                     layer_caches=self.layer_caches,
@@ -349,6 +355,8 @@ class ModelRunner:
             self._verify_layer_timing_events = []
         if not hasattr(self, "_verify_layer_active_timing"):
             self._verify_layer_active_timing = {}
+        if not hasattr(self, "_dual_queue_segment_timing_events"):
+            self._dual_queue_segment_timing_events = []
 
     def _record_profile(self, key: str, dt_sec: float) -> None:
         self._ensure_prefetch_internal_state()
@@ -362,6 +370,9 @@ class ModelRunner:
 
     def _prefetch_runtime_mode(self) -> str:
         return str(getattr(getattr(self, "config", None), "prefetch_runtime_mode", "baseline_staging"))
+
+    def _dual_queue_prefetch_enabled(self) -> bool:
+        return str(getattr(getattr(self, "config", None), "prefetch_runtime_kind", "legacy")) == "dual_queue"
 
     def _draft_prefetch_granularity(self) -> str:
         return str(getattr(getattr(self, "config", None), "draft_prefetch_frontier_granularity", "segment"))
@@ -530,7 +541,12 @@ class ModelRunner:
             )
         return wait_ms
 
-    def _acquire_prefetch_host_buffer_slot(self, *, mode: str, token_capacity: int) -> tuple[int, float]:
+    def _acquire_prefetch_host_buffer_slot(
+        self,
+        *,
+        mode: str,
+        token_capacity: int,
+    ) -> tuple[int | None, float]:
         self._ensure_prefetch_internal_state()
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         if runtime_meta_recorder is None:
@@ -567,6 +583,9 @@ class ModelRunner:
                         return slot_idx, wait_ms
                 if runtime_meta_recorder.maybe_grow_host_buffer_pool(mode_key, capacity):
                     continue
+                if self._dual_queue_prefetch_enabled():
+                    self._profile["dual_queue_metadata_host_buffer_drop_count"] += 1
+                    return None, (perf_counter() - wait_t0) * 1000.0
                 self._raise_prefetch_worker_error()
                 self._prefetch_worker_cv.wait(timeout=0.001)
         return 0, 0.0
@@ -854,7 +873,9 @@ class ModelRunner:
         if self.rank != 0:
             return {}
         self._poll_verify_layer_timing_events()
-        self._flush_pending_prefetch_metadata(block=True)
+        dual_queue = self._dual_queue_prefetch_enabled()
+        self._poll_dual_queue_segment_timings(block=not dual_queue)
+        self._flush_pending_prefetch_metadata(block=not dual_queue)
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
         decode_count = int(self._profile.get("decode_count", 0))
@@ -1146,6 +1167,8 @@ class ModelRunner:
             mode="draft",
             token_capacity=int(token_capacity),
         )
+        if host_buffer_slot is None:
+            return
         enqueue_t0 = perf_counter()
         handle = runtime_meta_recorder.offload_async(
             prefetch_runtime.metadata_stream,
@@ -1163,7 +1186,7 @@ class ModelRunner:
             handle=handle,
             enqueue_ms=enqueue_ms,
             host_buffer_slot=host_buffer_slot,
-            submit_after_phase="after_draft_segment",
+            submit_after_phase=None if self._dual_queue_prefetch_enabled() else "after_draft_segment",
             frontier_layer_idx=frontier,
         )
         self._draft_segment_metadata_enqueued_step_id = int(step_id)
@@ -1192,9 +1215,21 @@ class ModelRunner:
 
         replay_t0 = perf_counter()
         step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
-        for graph, (layer_start, layer_end) in zip(graphs, boundaries, strict=True):
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        for segment_id, (graph, (layer_start, layer_end)) in enumerate(
+            zip(graphs, boundaries, strict=True)
+        ):
+            if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.on_draft_segment_start(
+                        step_id=step_id,
+                        segment_id=segment_id,
+                        boundaries=boundaries,
+                    )
+            timing_start = self._start_dual_queue_segment_timing()
             segment_t0 = perf_counter()
             graph.replay()
+            self._end_dual_queue_segment_timing("draft", segment_id, timing_start)
             segment_enqueue_ms = (perf_counter() - segment_t0) * 1000.0
             if self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
@@ -1207,6 +1242,14 @@ class ModelRunner:
                     layer_start_idx=int(layer_start),
                     layer_end_idx=int(layer_end),
                 )
+            if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
+                with self._prefetch_runtime_lock:
+                    prefetch_runtime.on_draft_segment_end(
+                        step_id=step_id,
+                        segment_id=segment_id,
+                        boundaries=boundaries,
+                    )
+            self._poll_dual_queue_segment_timings(block=False)
 
         if self.profile_enabled and self.rank == 0:
             if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
@@ -1305,19 +1348,20 @@ class ModelRunner:
                 mode="prefill",
                 token_capacity=int(input_ids.numel()),
             )
-            enqueue_t0 = perf_counter()
-            handle = runtime_meta_recorder.offload_async(
-                prefetch_runtime.metadata_stream,
-                host_buffer_slot=host_buffer_slot,
-            )
-            enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
-            self._enqueue_prefetch_metadata(
-                mode="prefill",
-                step_id=prefill_step_id,
-                handle=handle,
-                enqueue_ms=enqueue_ms,
-                host_buffer_slot=host_buffer_slot,
-            )
+            if host_buffer_slot is not None:
+                enqueue_t0 = perf_counter()
+                handle = runtime_meta_recorder.offload_async(
+                    prefetch_runtime.metadata_stream,
+                    host_buffer_slot=host_buffer_slot,
+                )
+                enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                self._enqueue_prefetch_metadata(
+                    mode="prefill",
+                    step_id=prefill_step_id,
+                    handle=handle,
+                    enqueue_ms=enqueue_ms,
+                    host_buffer_slot=host_buffer_slot,
+                )
             runtime_meta_recorder.reset()
             self._flush_pending_prefetch_metadata(block=False)
 
@@ -1424,20 +1468,21 @@ class ModelRunner:
                         mode="draft",
                         token_capacity=draft_capacity,
                     )
-                    enqueue_t0 = perf_counter()
-                    handle = runtime_meta_recorder.offload_async(
-                        prefetch_runtime.metadata_stream,
-                        host_buffer_slot=host_buffer_slot,
-                    )
-                    enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
-                    self._enqueue_prefetch_metadata(
-                        mode="draft",
-                        step_id=step_id,
-                        handle=handle,
-                        enqueue_ms=enqueue_ms,
-                        host_buffer_slot=host_buffer_slot,
-                        submit_after_phase="after_draft",
-                    )
+                    if host_buffer_slot is not None:
+                        enqueue_t0 = perf_counter()
+                        handle = runtime_meta_recorder.offload_async(
+                            prefetch_runtime.metadata_stream,
+                            host_buffer_slot=host_buffer_slot,
+                        )
+                        enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                        self._enqueue_prefetch_metadata(
+                            mode="draft",
+                            step_id=step_id,
+                            handle=handle,
+                            enqueue_ms=enqueue_ms,
+                            host_buffer_slot=host_buffer_slot,
+                            submit_after_phase=None if self._dual_queue_prefetch_enabled() else "after_draft",
+                        )
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
             if return_logits and self.rank == 0:
@@ -1506,6 +1551,67 @@ class ModelRunner:
                     self._profile["verify_layer_timing_sample_count"] += 1
                     self._profile["verify_layer_compute_ms_sample_sum"] += compute_ms
         self._verify_layer_timing_events = remaining
+
+    def _start_dual_queue_segment_timing(self):
+        if not self._dual_queue_prefetch_enabled():
+            return None
+        if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(torch.cuda.current_stream())
+            return event
+        return perf_counter()
+
+    def _end_dual_queue_segment_timing(self, phase: str, segment_id: int, start) -> None:
+        if start is None:
+            return
+        if isinstance(start, torch.cuda.Event):
+            end = torch.cuda.Event(enable_timing=True)
+            end.record(torch.cuda.current_stream())
+            self._dual_queue_segment_timing_events.append((str(phase), int(segment_id), start, end))
+            return
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is not None:
+            prefetch_runtime.record_segment_compute_ms(
+                str(phase),
+                int(segment_id),
+                (perf_counter() - float(start)) * 1000.0,
+            )
+
+    def _poll_dual_queue_segment_timings(self, *, block: bool) -> None:
+        pending = getattr(self, "_dual_queue_segment_timing_events", [])
+        if not pending:
+            return
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is None:
+            pending.clear()
+            return
+        remaining = []
+        for phase, segment_id, start, end in pending:
+            if block:
+                end.synchronize()
+            elif not bool(end.query()):
+                remaining.append((phase, segment_id, start, end))
+                continue
+            prefetch_runtime.record_segment_compute_ms(
+                phase,
+                segment_id,
+                float(start.elapsed_time(end)),
+            )
+        self._dual_queue_segment_timing_events = remaining
+
+    def begin_dual_queue_calibration(self) -> None:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if isinstance(prefetch_runtime, DualQueuePrefetchRuntime):
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.set_calibrating(True)
+
+    def finalize_dual_queue_calibration(self) -> dict[str, float | int]:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if not isinstance(prefetch_runtime, DualQueuePrefetchRuntime):
+            return {}
+        self._poll_dual_queue_segment_timings(block=True)
+        with self._prefetch_runtime_lock:
+            return prefetch_runtime.finalize_calibration()
 
     def _record_verify_layer_timing_start(self, layer_idx: int) -> None:
         self._ensure_prefetch_internal_state()
@@ -1623,6 +1729,7 @@ class ModelRunner:
             self._current_verify_prefetch_step_id = int(step_id)
             self.model.set_verify_prefetch_controller(self)
 
+        used_verify_segment_graph = False
         # compute_logits() slices prefill outputs to last token per sequence.
         # Verify needs logits for every queried token position.
         try:
@@ -1675,6 +1782,7 @@ class ModelRunner:
                 if self._can_use_verify_cudagraph(int(input_ids.numel())):
                     if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
                         if self._verify_segment_graph_enabled():
+                            used_verify_segment_graph = True
                             hidden_states = self._run_verify_with_kt_hybrid_segment_graph(
                                 input_ids,
                                 positions,
@@ -1716,6 +1824,13 @@ class ModelRunner:
             self._set_speculative_execution_mode("normal")
 
         reset_context()
+        if (
+            self._dual_queue_prefetch_enabled()
+            and prefetch_runtime is not None
+            and not used_verify_segment_graph
+        ):
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.discard_verify_round()
 
         if self.rank != 0:
             return None
@@ -1746,7 +1861,7 @@ class ModelRunner:
                     with self._prefetch_runtime_lock:
                         prefetch_runtime.end_draft_iteration()
                 return verify_outputs
-            _used_segment_graph = _use_kt_hybrid and self._verify_segment_graph_enabled()
+            _used_segment_graph = used_verify_segment_graph
             if _used_segment_graph:
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
@@ -1756,21 +1871,22 @@ class ModelRunner:
                     mode=_verify_meta_mode,
                     token_capacity=_offload_capacity,
                 )
-                enqueue_t0 = perf_counter()
-                handle = runtime_meta_recorder.offload_async(
-                    prefetch_runtime.metadata_stream,
-                    host_buffer_slot=host_buffer_slot,
-                )
-                enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
-                self._enqueue_prefetch_metadata(
-                    mode=_verify_meta_mode,
-                    step_id=step_id,
-                    handle=handle,
-                    enqueue_ms=enqueue_ms,
-                    host_buffer_slot=host_buffer_slot,
-                    submit_after_phase="after_verify",
-                    record_verify_consumed=True,
-                )
+                if host_buffer_slot is not None:
+                    enqueue_t0 = perf_counter()
+                    handle = runtime_meta_recorder.offload_async(
+                        prefetch_runtime.metadata_stream,
+                        host_buffer_slot=host_buffer_slot,
+                    )
+                    enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+                    self._enqueue_prefetch_metadata(
+                        mode=_verify_meta_mode,
+                        step_id=step_id,
+                        handle=handle,
+                        enqueue_ms=enqueue_ms,
+                        host_buffer_slot=host_buffer_slot,
+                        submit_after_phase=None if self._dual_queue_prefetch_enabled() else "after_verify",
+                        record_verify_consumed=True,
+                    )
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
             if self._prefetch_runtime_mode() == "draft_segment_indexed":
@@ -2739,6 +2855,8 @@ class ModelRunner:
             mode="verify_kt_hybrid",
             token_capacity=int(token_capacity),
         )
+        if host_buffer_slot is None:
+            return
         enqueue_t0 = perf_counter()
         handle = runtime_meta_recorder.offload_async(
             prefetch_runtime.metadata_stream,
@@ -2828,13 +2946,22 @@ class ModelRunner:
         ):
             if prefetch_runtime is not None:
                 with self._prefetch_runtime_lock:
-                    on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
-                    if on_verify_layer_start is not None:
-                        for layer_idx in range(int(layer_start), int(layer_end)):
-                            on_verify_layer_start(layer_idx)
-                    prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+                    if self._dual_queue_prefetch_enabled():
+                        prefetch_runtime.on_verify_segment_start(
+                            step_id=step_id,
+                            segment_id=seg_idx,
+                            boundaries=boundaries,
+                        )
+                    else:
+                        on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
+                        if on_verify_layer_start is not None:
+                            for layer_idx in range(int(layer_start), int(layer_end)):
+                                on_verify_layer_start(layer_idx)
+                        prefetch_runtime.publish_direct_active_ready(step_id=step_id)
 
+            timing_start = self._start_dual_queue_segment_timing()
             graph.replay()
+            self._end_dual_queue_segment_timing("verify", seg_idx, timing_start)
 
             is_last = seg_idx == num_segments - 1
             self._enqueue_verify_segment_metadata(
@@ -2844,7 +2971,7 @@ class ModelRunner:
                 layer_end_idx=int(layer_end),
                 is_last_segment=is_last,
             )
-            if prefetch_runtime is not None:
+            if prefetch_runtime is not None and not self._dual_queue_prefetch_enabled():
                 next_seg = (seg_idx + 1) % num_segments
                 next_start = boundaries[next_seg][0]
                 next_end = boundaries[next_seg][1]
@@ -2856,6 +2983,11 @@ class ModelRunner:
                         visible_budget_ms=float(getattr(
                             self.config, "verify_prefetch_visible_budget_ms", 12.0)),
                     )
+            self._poll_dual_queue_segment_timings(block=False)
+
+        if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.complete_verify_round(step_id=step_id)
 
         if runtime_meta_recorder is not None:
             key = runtime_meta_recorder.active_key

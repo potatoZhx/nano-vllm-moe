@@ -141,6 +141,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
             prefetch_strategy="history_window",
             prefetch_runtime_mode="draft_segment_indexed",
             prefetch_runtime_kind=args.prefetch_runtime_kind,
+            dual_queue_segment_size=args.dual_queue_segment_size,
             prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
             predictive_phase1_budget=args.predictive_phase1_budget,
             prefetch_staging_slots_per_layer=2,
@@ -189,6 +190,7 @@ def run_case(args: argparse.Namespace) -> dict[str, Any]:
                 "prefetch_verify_layer_enabled": bool(args.prefetch_verify_layer_enabled),
                 "spec_verify_miss_policy": args.spec_verify_miss_policy,
                 "prefetch_runtime_kind": args.prefetch_runtime_kind,
+                "dual_queue_segment_size": int(args.dual_queue_segment_size),
                 "output_len": int(args.output_len),
                 "max_draft_tokens": int(args.max_draft_tokens),
                 "actual_input_tokens": [len(prompts[0])],
@@ -220,7 +222,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slots-per-layer", type=int, default=0)
     p.add_argument("--prefetch-enabled", type=str2bool, default=True)
     p.add_argument("--prefetch-verify-layer-enabled", type=str2bool, default=True)
-    p.add_argument("--prefetch-runtime-kind", choices=["legacy", "predictive"], default="legacy")
+    p.add_argument(
+        "--prefetch-runtime-kind",
+        choices=["legacy", "predictive", "dual_queue"],
+        default="legacy",
+    )
+    p.add_argument("--dual-queue-segment-size", type=int, default=12)
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
     p.add_argument("--predictive-phase1-budget", type=int, default=4)
     p.add_argument("--spec-verify-miss-policy", choices=["cpu", "cache_fill", "cache_fill_no_cpu"], default="cache_fill")
