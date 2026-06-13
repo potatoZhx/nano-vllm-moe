@@ -2975,8 +2975,6 @@ class ModelRunner:
                             target_layer_start=int(next_start),
                             target_layer_end=int(next_end),
                             target_segment_id=next_seg,
-                            visible_budget_ms=float(getattr(
-                                self.config, "verify_prefetch_visible_budget_ms", 12.0)),
                         )
                     else:
                         on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)

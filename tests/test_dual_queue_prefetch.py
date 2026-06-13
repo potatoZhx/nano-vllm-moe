@@ -387,6 +387,32 @@ class TestDualQueueBestEffort(unittest.TestCase):
         draft_budget, verify_budget = runtime._recompute_prefetch_budgets()
         self.assertEqual(draft_budget, 2)
         self.assertEqual(verify_budget, 3)
+        self.assertEqual(runtime._verify_segment_budgets[0], 8)
+        self.assertEqual(runtime._verify_segment_budgets[1], 3)
+
+    def test_per_segment_verify_budget_lookup(self):
+        runtime, _ = _runtime(verify_prefetch_max_per_boundary=4, prefetch_max_inflight=16)
+        runtime._verify_segment_budgets = {0: 8, 1: 3, 2: 5}
+        self.assertEqual(runtime._verify_budget_for_segment(0), 8)
+        self.assertEqual(runtime._verify_budget_for_segment(1), 3)
+        self.assertEqual(runtime._verify_budget_for_segment(2), 5)
+        self.assertEqual(runtime._verify_budget_for_segment(99), 4)
+
+    def test_per_segment_verify_budget_fallback_when_empty(self):
+        runtime, _ = _runtime(verify_prefetch_max_per_boundary=7, prefetch_max_inflight=16)
+        self.assertEqual(runtime._verify_budget_for_segment(0), 7)
+        self.assertEqual(runtime._verify_budget_for_segment(1), 7)
+
+    def test_visible_budget_ms_for_segment_uses_ema(self):
+        runtime, _ = _runtime(dual_queue_budget_safety_ratio=0.8)
+        runtime._segment_compute_ms = {"draft": {}, "verify": {0: 30.0, 1: 10.0}}
+        self.assertAlmostEqual(runtime._visible_budget_ms_for_segment(0), 24.0)
+        self.assertAlmostEqual(runtime._visible_budget_ms_for_segment(1), 8.0)
+
+    def test_visible_budget_ms_for_segment_returns_none_without_data(self):
+        runtime, _ = _runtime()
+        self.assertIsNone(runtime._visible_budget_ms_for_segment(0))
+        self.assertIsNone(runtime._visible_budget_ms_for_segment(99))
 
     def test_merge_indices_primary_preferred_over_secondary(self):
         runtime, caches = _runtime(

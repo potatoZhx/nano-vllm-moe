@@ -77,6 +77,10 @@ class LLMEngine:
             f"verify_min_segment_ms={float(calibration.get('verify_min_segment_ms', 0.0)):.4f}",
             flush=True,
         )
+        seg_budgets = calibration.get("verify_segment_budgets")
+        if seg_budgets:
+            budget_summary = " ".join(f"s{k}={v}" for k, v in sorted(seg_budgets.items()))
+            print(f"[dual_queue] per-segment verify budgets: {budget_summary}", flush=True)
         self.get_profile(reset=True)
 
     def get_profile(self, reset: bool = False) -> dict:

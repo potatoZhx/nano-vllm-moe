@@ -437,6 +437,9 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "metadata_host_buffer_drop_count": int(
                 ep.get("model_dual_queue_metadata_host_buffer_drop_count", 0) or 0
             ),
+            "verify_segment_budgets": ep.get("model_dual_queue_verify_segment_budgets", {}),
+            "verify_budget_min": int(ep.get("model_dual_queue_verify_budget_min", 0) or 0),
+            "verify_budget_max": int(ep.get("model_dual_queue_verify_budget_max", 0) or 0),
             "submit_count_by_source": ep.get("model_prefetch_submit_count_by_source", {}),
             "completed_count_by_source": ep.get("model_prefetch_completed_count_by_source", {}),
             "published_count_by_source": ep.get("model_prefetch_published_count_by_source", {}),
@@ -535,6 +538,56 @@ def run_single_case(args: argparse.Namespace) -> None:
         "verify_cuda_graph": bool(args.verify_cuda_graph),
         "verify_cuda_graph_bucket_steps": _parse_int_csv(args.verify_cuda_graph_bucket_steps),
     }
+
+    # ---- monkey-patch: cap verify CPU routes per layer ----
+    _verify_max_cpu_routes = int(getattr(args, "verify_max_cpu_routes_per_layer", 0) or 0)
+    if _verify_max_cpu_routes > 0:
+        from nanovllm.expert import placement as _placement_mod
+
+        _orig_build_prefill = _placement_mod.build_prefill_plan_gpu
+
+        def _capped_build_prefill(layer_idx, selected_experts, routing_weights,
+                                  expert_cache, num_experts):
+            plan = _orig_build_prefill(
+                layer_idx, selected_experts, routing_weights,
+                expert_cache, num_experts,
+            )
+            cpu_indices = plan.cpu_route_indices
+            if cpu_indices is None or cpu_indices.numel() <= _verify_max_cpu_routes:
+                return plan
+
+            n = int(cpu_indices.numel())
+            new_n = _verify_max_cpu_routes
+            # Truncate route indices (sorted by expert, contiguous per expert).
+            plan.cpu_route_indices = cpu_indices[:new_n].contiguous()
+
+            offsets = plan.cpu_task_offsets
+            if offsets is not None and offsets.numel() > 1:
+                # offsets[i] = start of expert i; offsets[-1] = n
+                keep = int((offsets[:-1] < new_n).sum().item())
+                new_offsets = offsets[:keep + 1].clone()
+                new_offsets[-1] = new_n
+                plan.cpu_task_offsets = new_offsets
+                plan.cpu_task_expert_ids = plan.cpu_task_expert_ids[:keep].contiguous()
+                if plan.cpu_task_expert_ids_host is not None:
+                    plan.cpu_task_expert_ids_host = (
+                        plan.cpu_task_expert_ids_host[:keep]
+                    )
+                if plan.cpu_task_offsets_host is not None:
+                    plan.cpu_task_offsets_host = (
+                        plan.cpu_task_offsets_host[:keep + 1]
+                    )
+                    plan.cpu_task_offsets_host[-1] = new_n
+            return plan
+
+        _placement_mod.build_prefill_plan_gpu = _capped_build_prefill
+        # build_verify_plan_gpu delegates to build_prefill_plan_gpu so it is
+        # covered automatically.
+        print(
+            f"[patch] verify_max_cpu_routes_per_layer={_verify_max_cpu_routes} "
+            f"applied to build_prefill_plan_gpu",
+            flush=True,
+        )
 
     llm = LLM(
         args.model_path,
@@ -1151,6 +1204,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt-text-file", default="",
                    help="Optional path to file containing custom prompt text.")
     p.add_argument("--case-timeout-sec", type=int, default=1800)
+    p.add_argument("--verify-max-cpu-routes-per-layer", type=int, default=0,
+                   help="If >0, cap CPU expert routes per MoE layer during verify. "
+                        "Excess routes are discarded (zero output). Useful for latency "
+                        "baselines that control CPU work per layer.")
     return p
 
 

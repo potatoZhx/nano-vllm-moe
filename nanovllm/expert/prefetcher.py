@@ -2829,6 +2829,7 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         self._ema_alpha = float(getattr(self.config, "dual_queue_segment_time_ema_alpha", 0.2))
         self._budget_recompute_interval = 8
         self._budget_recompute_counter = 0
+        self._verify_segment_budgets: dict[int, int] = {}
 
     def _segment_indexed_enabled(self) -> bool:
         return True
@@ -2865,6 +2866,7 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         self._calibrating = bool(enabled)
         if enabled:
             self._segment_compute_ms = {"draft": {}, "verify": {}}
+            self._verify_segment_budgets = {}
 
     @staticmethod
     def _mark_cache_access(
@@ -2968,6 +2970,22 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
                 self._budget_recompute_counter = 0
                 self._recompute_prefetch_budgets()
 
+    def _visible_budget_ms_for_segment(self, segment_id: int) -> float | None:
+        seg_times = self._segment_compute_ms.get("verify", {})
+        seg_time = seg_times.get(int(segment_id))
+        if seg_time is not None and seg_time > 0.0:
+            safety = float(getattr(self.config, "dual_queue_budget_safety_ratio", 0.8))
+            return safety * float(seg_time)
+        return None
+
+    def _verify_budget_for_segment(self, segment_id: int) -> int:
+        if self._verify_segment_budgets:
+            return self._verify_segment_budgets.get(
+                int(segment_id),
+                int(getattr(self.config, "verify_prefetch_max_per_boundary", 0)),
+            )
+        return int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
+
     def _recompute_prefetch_budgets(self) -> tuple[int, int]:
         safety = float(getattr(self.config, "dual_queue_budget_safety_ratio", 0.8))
         max_inflight = max(0, int(getattr(self.config, "prefetch_max_inflight", 0)))
@@ -2985,24 +3003,38 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         verify_budget = phase_budget(
             "verify", int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
         )
+
+        verify_samples = self._segment_compute_ms.get("verify", {})
+        if verify_samples and self._expert_transfer_ms > 0.0:
+            per_seg: dict[int, int] = {}
+            for seg_id, compute_ms in verify_samples.items():
+                capacity = int(safety * float(compute_ms) / self._expert_transfer_ms)
+                per_seg[int(seg_id)] = max(0, min(max_inflight, capacity))
+            self._verify_segment_budgets = per_seg
+        else:
+            self._verify_segment_budgets = {}
+
         self.config.draft_prefetch_max_per_boundary = draft_budget
         self.config.verify_prefetch_max_per_boundary = verify_budget
         self._profile["dual_queue_draft_budget"] = draft_budget
         self._profile["dual_queue_verify_budget"] = verify_budget
         return draft_budget, verify_budget
 
-    def finalize_calibration(self) -> dict[str, float | int]:
+    def finalize_calibration(self) -> dict:
         self.calibrate_expert_transfer_ms()
         self._calibrated = True
         self._calibrating = False
         draft_budget, verify_budget = self._recompute_prefetch_budgets()
-        return {
+        result: dict = {
             "draft_prefetch_max_per_boundary": int(draft_budget),
             "verify_prefetch_max_per_boundary": int(verify_budget),
             "expert_transfer_ms": float(self._expert_transfer_ms),
             "draft_min_segment_ms": float(min(self._segment_compute_ms["draft"].values(), default=0.0)),
             "verify_min_segment_ms": float(min(self._segment_compute_ms["verify"].values(), default=0.0)),
         }
+        if self._verify_segment_budgets:
+            result["verify_segment_budgets"] = dict(self._verify_segment_budgets)
+        return result
 
     def _select_dual_queue_victim(
         self,
@@ -3057,15 +3089,10 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         else:
             raise ValueError(f"unsupported dual-queue source: {source}")
 
-        budget = int(
-            getattr(
-                self.config,
-                "draft_prefetch_max_per_boundary"
-                if phase == "draft"
-                else "verify_prefetch_max_per_boundary",
-                0,
-            )
-        )
+        if phase == "draft":
+            budget = int(getattr(self.config, "draft_prefetch_max_per_boundary", 0))
+        else:
+            budget = self._verify_budget_for_segment(target_segment_id)
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
         dispatch_budget = min(max(0, budget), inflight_budget)
         if dispatch_budget <= 0:
@@ -3326,12 +3353,14 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         """Synchronous verify prefetch merging both draft-predict and ground-truth indices."""
         if self._calibrating:
             return 0
-        budget = max(0, int(getattr(self.config, "verify_prefetch_max_per_boundary", 16)))
+        budget = max(0, self._verify_budget_for_segment(target_segment_id))
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
         dispatch_budget = min(budget, inflight_budget)
         if dispatch_budget <= 0:
             return 0
 
+        if visible_budget_ms is None:
+            visible_budget_ms = self._visible_budget_ms_for_segment(target_segment_id)
         transfer_budget_ms = float(
             visible_budget_ms
             if visible_budget_ms is not None
@@ -3482,6 +3511,15 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
                 len(entries) for entries in self.ground_truth_index.entries_by_segment.values()
             ),
         }
+        if self._verify_segment_budgets:
+            extra["dual_queue_verify_segment_budgets"] = dict(self._verify_segment_budgets)
+            seg_vals = list(self._verify_segment_budgets.values())
+            extra["dual_queue_verify_budget_min"] = min(seg_vals)
+            extra["dual_queue_verify_budget_max"] = max(seg_vals)
+        else:
+            fallback = int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
+            extra["dual_queue_verify_budget_min"] = fallback
+            extra["dual_queue_verify_budget_max"] = fallback
         out = super().get_profile(reset=reset)
         out.update(extra)
         return out

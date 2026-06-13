@@ -10,13 +10,14 @@ Example:
 
     conda activate nano_moe
     cd /home/linke/nano-vllm-moe
+    rm -rf results/dual_queue_bench_613
     python scripts/bench_dual_queue_prefetch.py \
-        --output-dir results/dual_queue_bench \
+        --output-dir results/dual_queue_bench_613 \
         --gpu-memory-utilization 0.99 \
-        --cache-ratios 0.25,0.3125 \
-        --output-lens 128,512 \
-        --budget-safety-ratio 0.6 \
-        --max-draft-tokens-values 4,8 \
+        --cache-ratios 0.3125 \
+        --output-lens 512,4096 \
+        --budget-safety-ratio 0.8 \
+        --max-draft-tokens-values 4 \
         --segment-sizes 12 \
         --runtime-kinds dual_queue,predictive \
         --kt-num-threads 32
@@ -195,6 +196,8 @@ def _row_from_raw(
         # -- dual_queue budget / queue --
         "draft_budget": int(dual_queue.get("draft_budget", 0) or 0),
         "verify_budget": int(dual_queue.get("verify_budget", 0) or 0),
+        "verify_budget_min": int(dual_queue.get("verify_budget_min", 0) or 0),
+        "verify_budget_max": int(dual_queue.get("verify_budget_max", 0) or 0),
         "expert_transfer_ms": float(dual_queue.get("expert_transfer_ms", 0.0) or 0.0),
         "draft_predict_size": int(dual_queue.get("draft_predict_size", 0) or 0),
         "ground_truth_size": int(dual_queue.get("ground_truth_size", 0) or 0),
@@ -302,6 +305,8 @@ def _comparison_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "dual_verify_per_fwd": float(dual["verify_prefetch_per_forward"]),
                 "pred_verify_per_fwd": float(predictive["verify_prefetch_per_forward"]),
                 "dual_publish_ratio": float(dual["dual_publish_ratio"]),
+                "dual_verify_budget_min": int(dual.get("verify_budget_min", 0)),
+                "dual_verify_budget_max": int(dual.get("verify_budget_max", 0)),
                 "dual_target_miss_count": int(dual["target_miss_count"]),
                 "dual_round_end_discard_count": int(dual["round_end_discard_count"]),
             }
@@ -393,6 +398,8 @@ def _command(
         str(args.prefetch_verify_layer_max_budget),
         "--prefetch-verify-wait-ms",
         "0",
+        "--prefetch-verify-attention-ratio",
+        str(args.prefetch_verify_attention_ratio),
         "--cache-eviction-budget-per-step",
         str(args.cache_eviction_budget_per_step),
         "--prefetch-global-queue-capacity",
@@ -539,8 +546,15 @@ def run_case(
         flush=True,
     )
     if str(row["runtime_kind"]) == "dual_queue":
+        vb_min = row.get("verify_budget_min", 0)
+        vb_max = row.get("verify_budget_max", 0)
+        vb_range = (
+            f"[{vb_min},{vb_max}]"
+            if vb_min != vb_max
+            else str(row["verify_budget"])
+        )
         print(
-            f"  dual_queue: budget={row['draft_budget']}/{row['verify_budget']} "
+            f"  dual_queue: budget_d={row['draft_budget']} budget_v={vb_range} "
             f"submit={row['dual_submit_count']} publish={row['dual_published_count']} "
             f"late={row['dual_late_count']} "
             f"target_miss={row['target_miss_count']} "
@@ -570,11 +584,15 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
-        budget_str = (
-            f"{row['draft_budget']}/{row['verify_budget']}"
-            if row.get("draft_budget") or row.get("verify_budget")
-            else "-"
-        )
+        vb_min = row.get("verify_budget_min", 0)
+        vb_max = row.get("verify_budget_max", 0)
+        if row.get("draft_budget") or row.get("verify_budget"):
+            if vb_min != vb_max and vb_min > 0:
+                budget_str = f"{row['draft_budget']}/{row['verify_budget']}[{vb_min}-{vb_max}]"
+            else:
+                budget_str = f"{row['draft_budget']}/{row['verify_budget']}"
+        else:
+            budget_str = "-"
         lines.append(
             "| "
             f"{row['runtime_kind']} | {row['segment_size']} | {row['output_len']} | "
@@ -718,6 +736,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     parser.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
     parser.add_argument("--prefetch-verify-layer-max-budget", type=int, default=8)
+    parser.add_argument("--prefetch-verify-attention-ratio", type=float, default=1.0)
     parser.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     parser.add_argument("--draft-segment-host-buffer-pool-size", type=int, default=0)
     parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)

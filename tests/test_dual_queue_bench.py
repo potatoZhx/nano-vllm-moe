@@ -134,6 +134,8 @@ class TestDualQueueBench(unittest.TestCase):
                     },
                     "target_miss_count": 2,
                     "round_end_discard_count": 1,
+                    "verify_budget_min": 2,
+                    "verify_budget_max": 5,
                 },
             },
         }
@@ -142,6 +144,8 @@ class TestDualQueueBench(unittest.TestCase):
 
         self.assertEqual(row["draft_budget"], 2)
         self.assertEqual(row["verify_budget"], 3)
+        self.assertEqual(row["verify_budget_min"], 2)
+        self.assertEqual(row["verify_budget_max"], 5)
         self.assertEqual(row["dual_submit_count"], 10)
         self.assertEqual(row["dual_completed_count"], 8)
         self.assertEqual(row["dual_published_count"], 6)
@@ -174,12 +178,16 @@ class TestDualQueueBench(unittest.TestCase):
                 "runtime_kind": "dual_queue",
                 "throughput_output_tok_s": 4.0,
                 "outputs_digest": "same",
+                "verify_budget_min": 2,
+                "verify_budget_max": 5,
             },
             {
                 **base,
                 "runtime_kind": "predictive",
                 "throughput_output_tok_s": 2.0,
                 "outputs_digest": "same",
+                "verify_budget_min": 0,
+                "verify_budget_max": 0,
             },
         ]
 
