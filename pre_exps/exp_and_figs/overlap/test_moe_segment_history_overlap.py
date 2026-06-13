@@ -28,6 +28,15 @@ Examples:
   python test_moe_segment_history_overlap.py \
       --segment_size 3 --target_segments 32 64 128 --history_k 10
 
+CUDA_VISIBLE_DEVICES=2 python test_moe_segment_history_overlap.py \
+  --prompts_file long_reasoning_prompts_en.json \
+  --model_name /workspace/wyt/ktransformers1/Qwen--Qwen3-30B-A3B-Base \
+  --segment_size 3 \
+  --target_segments 16 32 64 128 256 512 1024 2048 4096 \
+  --history_k 10 \
+  --dtype bfloat16 \
+  --output segment_history_overlap_results_long_text.json
+
 Requirements:
   pip install torch transformers accelerate bitsandbytes numpy
 """
