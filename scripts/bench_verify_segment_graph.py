@@ -12,9 +12,9 @@ unique miss experts, and cache hit rate changes.
 
     conda activate nano_moe
 
-    python scripts/bench_verify_segment_graph.py \
+    CUDA_VISIBLE_DEVICES=3 python scripts/bench_verify_segment_graph.py \
         --gpu-memory-utilization 0.99 \
-        --output-dir results/verify_segment_bench_more \
+        --output-dir results/verify_segment_bench_more_613 \
         --cache-ratios 0.25,0.3125 \
         --output-lens 128,512,1024,4096,8092 \
         --max-draft-tokens-values 4,5,8,10 \
@@ -82,25 +82,25 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "mode": f"kt_hybrid_seg{seg_size}",
                     })
                 # Mode 1: eager (no graph)
-                cases.append({
-                    "output_len": int(output_len),
-                    "cache_ratio": float(ratio),
-                    "max_draft_tokens": int(mdt),
-                    "verify_cuda_graph": False,
-                    "segment_size": 0,
-                    "cache_strategy": args.cache_strategy,
-                    "mode": "eager",
-                })
-                # Mode 2: kt_hybrid monolithic
-                cases.append({
-                    "output_len": int(output_len),
-                    "cache_ratio": float(ratio),
-                    "max_draft_tokens": int(mdt),
-                    "verify_cuda_graph": True,
-                    "segment_size": 9999,
-                    "cache_strategy": args.cache_strategy,
-                    "mode": "kt_hybrid_mono",
-                })
+                # cases.append({
+                #     "output_len": int(output_len),
+                #     "cache_ratio": float(ratio),
+                #     "max_draft_tokens": int(mdt),
+                #     "verify_cuda_graph": False,
+                #     "segment_size": 0,
+                #     "cache_strategy": args.cache_strategy,
+                #     "mode": "eager",
+                # })
+                # # Mode 2: kt_hybrid monolithic
+                # cases.append({
+                #     "output_len": int(output_len),
+                #     "cache_ratio": float(ratio),
+                #     "max_draft_tokens": int(mdt),
+                #     "verify_cuda_graph": True,
+                #     "segment_size": 9999,
+                #     "cache_strategy": args.cache_strategy,
+                #     "mode": "kt_hybrid_mono",
+                # })
 
     return cases
 
@@ -292,7 +292,9 @@ def run_case(
         f"  mode={row['mode']} accept={row['acceptance_rate']:.4f} hit={row['route_hit_rate']:.4f} "
         f"miss_routes/layer={row['avg_miss_routes_per_layer']:.2f} "
         f"miss_unique/layer={row['avg_miss_unique_experts_per_layer']:.2f} "
-        f"tok/s={row['throughput_output_tok_s']:.3f} verify_ms={row['verify_forward_ms_avg']:.3f} "
+        f"tok/s={row['throughput_output_tok_s']:.3f} "
+        f"decode_tok/s={row['decode_phase_output_tok_s']:.3f} "
+        f"verify_ms={row['verify_forward_ms_avg']:.3f} "
         f"seg_prefetch_submit={row['verify_segment_prefetch_submit_count']} "
         f"seg_prefetch/verify={row['verify_segment_prefetch_submit_per_verify']:.1f} "
         f"seg_candidates={row['verify_segment_prefetch_candidate_ranked_count']} "

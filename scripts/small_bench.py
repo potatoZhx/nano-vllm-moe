@@ -385,7 +385,9 @@ def run_case(args: argparse.Namespace, repo_root: Path, prompt_file: Path, case:
         f"  accept={row['acceptance_rate']:.4f} hit={row['route_hit_rate']:.4f} "
         f"post_xfer_hit={row['route_hit_rate_post_transfer']:.4f} "
         f"miss/layer={row['avg_miss_per_layer']:.2f} active/layer={row['avg_active_per_layer']:.2f} "
-        f"tok/s={row['throughput_output_tok_s']:.3f} draft_ms={row['draft_forward_ms_avg']:.3f} "
+        f"tok/s={row['throughput_output_tok_s']:.3f} "
+        f"decode_tok/s={row['decode_phase_output_tok_s']:.3f} "
+        f"draft_ms={row['draft_forward_ms_avg']:.3f} "
         f"verify_ms={row['verify_forward_ms_avg']:.3f} graph={row['draft_graph_replay_count']} "
         f"perfect={row['perfect_fraction']:.4f} step0={row['step0_perfect_fraction']:.4f} "
         f"text_ok={row['text_quality_ok']}",

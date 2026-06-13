@@ -437,6 +437,27 @@ class ModelRunner:
         phase: str,
         frontier_layer_idx: int | None = None,
     ) -> int:
+        if self._dual_queue_prefetch_enabled():
+            frontier = (
+                self._draft_prefetch_frontier_layer_idx()
+                if frontier_layer_idx is None
+                else int(frontier_layer_idx)
+            )
+            if frontier is None:
+                return 0
+            if mode == "draft":
+                return prefetch_runtime.submit_deferred_draft_segment(
+                    step_id=step_id,
+                    frontier_layer_idx=frontier,
+                    boundaries=self._draft_segment_boundaries(),
+                )
+            if mode in {"verify", "verify_kt_hybrid"}:
+                return prefetch_runtime.submit_deferred_verify_segment(
+                    step_id=step_id,
+                    frontier_layer_idx=frontier,
+                    boundaries=self._verify_segment_boundaries(),
+                )
+            return 0
         if mode == "draft" and self._prefetch_runtime_mode() == "draft_direct_active":
             return prefetch_runtime.submit_draft_direct_active_prefetch(
                 step_id=step_id,
@@ -1186,7 +1207,7 @@ class ModelRunner:
             handle=handle,
             enqueue_ms=enqueue_ms,
             host_buffer_slot=host_buffer_slot,
-            submit_after_phase=None if self._dual_queue_prefetch_enabled() else "after_draft_segment",
+            submit_after_phase="after_draft_segment",
             frontier_layer_idx=frontier,
         )
         self._draft_segment_metadata_enqueued_step_id = int(step_id)
@@ -1216,10 +1237,11 @@ class ModelRunner:
         replay_t0 = perf_counter()
         step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        dual_queue = self._dual_queue_prefetch_enabled()
         for segment_id, (graph, (layer_start, layer_end)) in enumerate(
             zip(graphs, boundaries, strict=True)
         ):
-            if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
+            if dual_queue and prefetch_runtime is not None:
                 with self._prefetch_runtime_lock:
                     prefetch_runtime.on_draft_segment_start(
                         step_id=step_id,
@@ -1242,13 +1264,6 @@ class ModelRunner:
                     layer_start_idx=int(layer_start),
                     layer_end_idx=int(layer_end),
                 )
-            if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
-                with self._prefetch_runtime_lock:
-                    prefetch_runtime.on_draft_segment_end(
-                        step_id=step_id,
-                        segment_id=segment_id,
-                        boundaries=boundaries,
-                    )
             self._poll_dual_queue_segment_timings(block=False)
 
         if self.profile_enabled and self.rank == 0:
@@ -1559,7 +1574,7 @@ class ModelRunner:
             event = torch.cuda.Event(enable_timing=True)
             event.record(torch.cuda.current_stream())
             return event
-        return perf_counter()
+        return None
 
     def _end_dual_queue_segment_timing(self, phase: str, segment_id: int, start) -> None:
         if start is None:
@@ -2874,6 +2889,7 @@ class ModelRunner:
             enqueue_ms=enqueue_ms,
             host_buffer_slot=host_buffer_slot,
             submit_after_phase=None,
+            frontier_layer_idx=int(layer_end_idx) - 1,
             record_verify_consumed=bool(is_last_segment),
         )
         if self.profile_enabled and self.rank == 0:
@@ -2951,6 +2967,16 @@ class ModelRunner:
                             step_id=step_id,
                             segment_id=seg_idx,
                             boundaries=boundaries,
+                        )
+                        next_seg = (seg_idx + 1) % num_segments
+                        next_start, next_end = boundaries[next_seg]
+                        prefetch_runtime.submit_verify_segment_prefetch(
+                            step_id=step_id,
+                            target_layer_start=int(next_start),
+                            target_layer_end=int(next_end),
+                            target_segment_id=next_seg,
+                            visible_budget_ms=float(getattr(
+                                self.config, "verify_prefetch_visible_budget_ms", 12.0)),
                         )
                     else:
                         on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)

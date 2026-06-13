@@ -1,6 +1,6 @@
 # Dual-Queue Segment Prefetch 设计与实现
 
-更新日期：2026-06-11
+更新日期：2026-06-12
 
 本文说明 speculative decoding 下 `dual_queue` expert prefetch 模式的设计、
 实现、调用链、时序、数据流、评分与淘汰策略，以及测试和性能测试方法。
@@ -27,12 +27,13 @@
 - 未在目标窗口内完成的传输标记为 expired，完成后释放 staging slot，不再写入 active cache。
 - verify round 结束时仍未完成的本轮传输全部丢弃。
 
-因此，“在 segment i 期间更新 segment i+1 cache”在实现上表示：
+因此，”在 segment i 期间更新 segment i+1 cache”在实现上表示：
 
-- segment i 期间提交 H2D；
+- segment i 的 metadata 到达 metadata worker 后，异步提交 H2D 直接写入
+  active slot（direct_active 模式，slot 处于 pending 状态）；
 - segment i+1 开始前查询完成事件；
-- 已完成才原子式发布到 active cache；
-- 未完成则不修改 active cache，也不等待。
+- 已完成才原子式 commit 到 active cache（更新 LUT）；
+- 未完成则保留 pending 状态，不等待。
 
 ## 2. 启用条件
 
@@ -101,13 +102,15 @@ metadata worker queue
 |            \ ranked_for_range(segment)                   |
 |             v                                           |
 |        submit_segment_prefetch()                         |
-|             |                                           |
+|             |  [metadata worker thread]                  |
 |             v                                           |
 |  shared inflight tickets + transfer stream pool          |
 |             |                                           |
 |             v                                           |
-|        per-layer staging slots                           |
-|             | ready event queried at target boundary     |
+|        direct_active: H2D -> active slot (deferred)      |
+|             | ready event queried at segment boundary    |
+|             v                                           |
+|        commit_deferred_active_prefetch()                  |
 |             v                                           |
 |        active expert cache                               |
 +---------------------------------------------------------+
@@ -422,95 +425,123 @@ ground-truth candidate。
 
 ### 7.1 当前 round 的第一次 draft_forward
 
+关键路径（graph replay thread）和 metadata worker thread 并行执行：
+
 ```text
+[graph replay thread]              [metadata worker thread]
+
 segment 1 start:
-    publish(segment 1 ready tickets)
-    submit GT(segment 2)
-
+    publish_direct_active_ready()
 segment 1 compute
-
 segment 1 end:
-    async offload/update DP(segment 1)
-    submit GT(segment 3)
+    offload_async(segment 1)  -->  observe_draft(segment 1)
+                                   submit_deferred_draft_segment():
+                                     submit GT(segment 2)
+                                     submit GT(segment 3)  [segment 0 是首段]
+
+segment 2 start:
+    publish_direct_active_ready()
+segment 2 compute
+segment 2 end:
+    offload_async(segment 2)  -->  observe_draft(segment 2)
+                                   submit_deferred_draft_segment():
+                                     submit GT(segment 4)
 
 ...
 
 segment n-1 start:
-    publish(segment n-1 ready tickets)
-
+    publish_direct_active_ready()
 segment n-1 compute
-
 segment n-1 end:
-    async offload/update DP(segment n-1)
-    submit DP(segment 1)
+    offload_async(segment n-1) --> observe_draft(segment n-1)
+                                   submit_deferred_draft_segment():
+                                     submit DP(segment 1)
 
 segment n start:
-    publish(segment n ready tickets)
-
+    publish_direct_active_ready()
 segment n compute
-
 segment n end:
-    async offload/update DP(segment n)
-    submit DP(segment 2)
+    offload_async(segment n)  -->  observe_draft(segment n)
+                                   submit_deferred_draft_segment():
+                                     submit DP(segment 2)
 ```
 
 DP 表示 `draft_predict`，GT 表示 `ground_truth`。
 
-注意：`async offload/update DP` 与随后的 submit 解耦。metadata worker 如果
+关键路径上只有 `publish_direct_active_ready()`（遍历 inflight tickets，对
+已完成的执行 `commit_deferred_active_prefetch()`）。所有 prefetch submission
+（含 victim 选择、active slot 预留、H2D 提交）都在 metadata worker thread
+中异步执行。
+
+`async offload/update DP` 与 submit 解耦。metadata worker 如果
 尚未完成，submit 使用当前已经可见的 DP 内容；不会为了等待刚结束 segment 的
 完整 metadata 而阻塞。
 
 代码对应：
 
 ```text
-on_draft_segment_start()
-on_draft_segment_end()
+on_draft_segment_start()           -> publish_direct_active_ready()  [graph replay thread]
+submit_deferred_draft_segment()    -> submit_segment_prefetch()      [metadata worker thread]
 ```
 
-第一轮的 GT 调度规则：
+第一轮的调度规则（由 `submit_deferred_draft_segment()` 实现）：
 
 ```text
-segment 1 start       -> GT segment 2
-segment i end         -> GT segment i+2, i <= n-2
-segment n-1 end       -> DP segment 1
-segment n end         -> DP segment 2
+segment 1 metadata arrives -> GT segment 2, GT segment 3
+segment i metadata arrives -> GT segment i+2, i <= n-2
+segment n-1 metadata arrives -> DP segment 1
+segment n metadata arrives   -> DP segment 2
 ```
 
 ### 7.2 第 2 到第 k 次 draft_forward
 
-每个 segment 开始时：
+每个 segment 开始时（graph replay thread）：
 
 ```text
-publish(current segment ready tickets)
-submit DP(next segment)
+publish_direct_active_ready()     [发布已完成 ticket]
 ```
 
-即：
+metadata worker 在处理完该 segment metadata 后：
 
 ```text
-target = (segment + 1) % n
+submit_deferred_draft_segment():
+    submit DP((segment + 1) % n)
 ```
 
-每个 segment 计算结束后异步卸载该 segment metadata，metadata worker 到达时
-更新相同 segment 的 DP。
+即 `target = (segment + 1) % n`。
 
 ### 7.3 Verify
 
-每个 verify segment 开始时：
+每个 verify segment 开始时（graph replay thread）：
 
 ```text
-publish(current segment ready tickets)
-submit DP(next segment)
+publish_direct_active_ready()     [发布已完成 ticket]
+```
+
+metadata worker 在处理完该 segment metadata 后：
+
+```text
+submit_deferred_verify_segment():
+    segment 1~n-1 -> submit DP((segment + 1) % n)
+    segment n     -> submit GT(segment 1)
 ```
 
 所以：
 
 ```text
-segment 1     -> prefetch DP segment 2
+segment 1 metadata -> prefetch DP segment 2, 更新 GT segment 1
 ...
-segment n-1   -> prefetch DP segment n
-segment n     -> prefetch DP segment 1
+segment n-1 metadata -> prefetch DP segment n, 更新 GT segment n-1
+segment n metadata -> prefetch GT segment 1, 更新 GT segment n
 ```
+
+segment 1~n-1 使用 DP 的原因：这些 segment 在准备下一轮 draft 的后续
+segment，draft_predict 保留了本轮 draft 原始路由的短期预测，用于预取与
+当前 draft 路由相关性最高的 expert。
+
+最后一个 segment n 使用 GT 的原因：该 segment 结束后 draft_predict 将被
+清空，此时预取的目标是下一轮第一个 draft segment。ground_truth 保留了跨
+round 的真实路由历史，是为全新 draft round cold start 提供候选的唯一来源。
 
 每个 segment graph replay 结束后异步卸载真实路由 metadata，更新对应
 ground-truth segment。
@@ -528,55 +559,80 @@ ground-truth segment。
 
 ## 8. Transfer 与发布状态机
 
-### 8.1 提交
+### 8.1 提交（direct_active 模式）
 
-`submit_segment_prefetch()`：
+`submit_segment_prefetch()` 使用 direct_active 模式，在提交时即选择 victim
+并预留 active slot：
 
 1. 根据 source 选择 DP 或 GT index。
 2. 读取当前 phase 的自动预算。
 3. 预算再受 `prefetch_max_inflight - len(inflight)` 限制。
 4. 仅在目标 layer range 内排序候选。
 5. 过滤 cached、pending、inflight 和无 CPU 权重的 expert。
-6. 为 candidate 申请 per-layer staging slot。
-7. 在 transfer stream 上异步复制 `gate_up` 和 `down`。
-8. 创建带 target `segment_id` 的 `PrefetchTicket`。
+6. 调用 `_select_dual_queue_victim()` 选择 active slot。
+7. 调用 `reserve_active_slot_for_prefetch_deferred()` 预留 active slot，
+   将该 slot 标记为 pending（deferred 模式）。
+8. 在 transfer stream 上以 `direct_active=True` 异步复制 `gate_up` 和
+   `down` 直接写入 active slot buffer。
+9. 创建带 target `segment_id` 的 `PrefetchTicket`，记录
+   `active_slot_idx`、`active_generation`、`active_slot_prev_expert`。
 
 两类来源共享 transfer stream pool，stream 使用 round-robin 分配。
 
-### 8.2 目标边界发布
+与原 staging 模式的区别：不申请 staging slot、不做 staging→active D2D 拷贝、
+不调用 `_finalize_publish()` 进行 publish stream 同步。
 
-`publish_segment_ready(segment_id)`：
+### 8.2 目标边界发布（direct_active）
+
+`publish_segment_ready()` 委托给 `publish_direct_active_ready()`：
 
 ```text
-ticket target != current segment -> 保留
-ticket 已 expired                -> 不处理
-ready_event.query() == false      -> 标记 expired，不等待
-ready_event.query() == true       -> staging ready，选择 victim
-victim 可用                       -> staging D2D 到 active slot 并 commit
-victim 不可用                     -> cancel staging，记 late
+遍历 inflight tickets:
+  ready_event.query() == false -> 保留，继续等待
+  ready_event.query() == true:
+    non-deferred source -> commit_active_prefetch()
+    deferred source     -> commit_deferred_active_prefetch()
+    commit 成功 -> 从 inflight 移除，计入 published
+    commit 失败 -> cancel_deferred_active_prefetch()（仅 deferred），计入 late
 ```
 
-发布使用单独 publish stream。`_finalize_publish()` 在 commit 前让当前 stream
-等待 publish stream，确保 active cache 的映射更新发生在数据可见之后。
+non-deferred source（`draft_direct_active`、`verify_layer_predict`、
+`predictive_phase1`）使用 `reserve_active_slot_for_prefetch()` 在预留时
+即清理旧 expert，必须与 `commit_active_prefetch()` 配对。
+
+deferred source（`draft_segment_indexed`、`verify_segment`、
+`dual_queue_draft_predict`、`dual_queue_ground_truth`）使用
+`reserve_active_slot_for_prefetch_deferred()` 保留旧 expert 在 slot 中，
+必须与 `commit_deferred_active_prefetch()` 配对，后者验证 `prev_expert`
+和 `generation` 一致性后才原子更新 LUT。
+
+两种 commit 操作都只需原子更新 cache LUT，无需额外数据拷贝或 stream 同步。
 
 ### 8.3 迟到传输
 
-未在 target segment 到达前完成的 ticket 加入 `_expired_tickets`。
+未在 target segment 到达前完成的 ticket 保留在 inflight 中，active slot 处于
+pending 状态。后续 `publish_direct_active_ready()` 调用仍会尝试发布。
 
-后续 `_reap_expired_tickets()` 只查询 event：
+`_reap_expired_tickets()` 在 round 结束时清理残留 ticket：
 
-- event 未完成：保留 staging reservation，但不影响 active cache。
-- event 完成：释放 staging slot，删除 inflight，记录 late/expired。
+- ticket 为 direct_active：调用 `cancel_deferred_active_prefetch()` 释放
+  pending slot，恢复原 expert。
+- ticket 为 staging（兼容路径）：调用 `cancel_staging_reservation()` 释放
+  staging slot。
 
-不会把迟到的数据发布到后续 segment，也不会同步等待它完成。
+不会把迟到的数据发布到错误的 segment，也不会同步等待。
 
-### 8.4 为什么使用 staging slot
+### 8.4 direct_active 模式的正确性保证
 
-H2D 首先写 staging，而不是直接覆盖 active slot，可以保证：
+H2D 直接写入 active slot 而非 staging buffer，通过以下机制保证安全：
 
-- 目标 segment 使用 active cache 时，不会读到传输中的半成品。
-- late transfer 不会破坏当前 resident expert。
-- victim 只在 ready event 成功后确定，缩短 active slot 被保留的时间。
+- `reserve_active_slot_for_prefetch_deferred()` 将 slot 标记为 pending，
+  segment graph replay 中的 cache lookup 不会选中 pending slot 中的旧数据。
+- `commit_deferred_active_prefetch()` 在 H2D 完成后原子更新 LUT，验证
+  `prev_expert` 和 `generation` 一致性。
+- cancel 时恢复 slot 到原状态（prev_expert），不丢失已有 expert。
+- 由于 prefetch submission 从关键路径移至 metadata worker 线程（见第 19.2 节），
+  victim 选择和 H2D 提交不阻塞 graph replay。
 
 ## 9. Victim 选择与保护
 
@@ -724,17 +780,25 @@ SpeculativeEngine
   -> _replay_draft_segment_graph()
        for each segment:
          on_draft_segment_start()
-           -> publish_segment_ready()
-           -> submit_segment_prefetch()
+           -> publish_direct_active_ready()       [轻量: 仅发布已完成 ticket]
          graph.replay()
-         record segment timing
+         record segment timing (perf_counter after calibration)
          _enqueue_draft_segment_metadata()
            -> offload_async(layer range)
+           -> submit_after_phase="after_draft_segment"
            -> metadata worker
-           -> observe_draft()
-         on_draft_segment_end()
-           -> submit_segment_prefetch()
+             -> observe_draft()
+             -> _submit_prefetch_after_metadata()
+               -> submit_deferred_draft_segment()
+                 -> submit_segment_prefetch()
 ```
+
+关键变化：`on_draft_segment_start()` 仅调用 `publish_direct_active_ready()`
+发布上一 segment 传输中已完成的 ticket。prefetch submission（含 victim 选择、
+active slot 预留和 H2D 提交）全部由 metadata worker 线程中的
+`submit_deferred_draft_segment()` 异步执行，不阻塞 graph replay。
+
+`on_draft_segment_end()` 返回 0，不执行任何操作。
 
 ### 11.3 Verify
 
@@ -745,40 +809,47 @@ SpeculativeEngine
        arm("verify_kt_hybrid")
        for each segment:
          on_verify_segment_start()
-           -> publish_segment_ready()
-           -> submit DP(next segment)
+           -> publish_direct_active_ready()       [轻量: 仅发布已完成 ticket]
          graph.replay()
          record segment timing
          _enqueue_verify_segment_metadata()
            -> offload_async(layer range)
+           -> submit_after_phase="after_verify_segment"
            -> metadata worker
-           -> observe_verify()
+             -> observe_verify()
+             -> _submit_prefetch_after_metadata()
+               -> submit_deferred_verify_segment()
+                 -> submit_segment_prefetch()
        complete_verify_round()
 ```
 
-### 11.4 Queue selection到传输
+verify 路径同理：`on_verify_segment_start()` 仅做发布，submit 移至
+metadata worker 线程。
+
+### 11.4 Queue selection 到传输（direct_active）
 
 ```text
-submit_segment_prefetch()
+submit_segment_prefetch()              [metadata worker thread]
   -> DualQueueSegmentIndex.ranked_for_range()
-  -> LayerExpertCache.reserve_staging_slot()
-  -> PrefetchRuntime._begin_prefetch_transfer()
-  -> LayerExpertCache.begin_async_put_to_staging()
-  -> PrefetchTicket
+  -> _select_dual_queue_victim()
+  -> LayerExpertCache.reserve_active_slot_for_prefetch_deferred()
+  -> PrefetchRuntime._begin_prefetch_transfer(direct_active=True)
+  -> LayerExpertCache.begin_async_put_to_active()
+  -> PrefetchTicket(direct_active=True)
   -> inflight[(layer, expert)]
 ```
 
-### 11.5 发布
+### 11.5 发布（direct_active）
 
 ```text
-publish_segment_ready()
+publish_direct_active_ready()          [graph replay thread, segment boundary]
   -> ready_event.query()
-  -> LayerExpertCache.mark_staging_ready()
-  -> _select_dual_queue_victim()
-  -> LayerExpertCache.publish_ready_staging_to_active()
-  -> _finalize_publish()
-  -> LayerExpertCache.commit_published_expert()
+  -> LayerExpertCache.commit_deferred_active_prefetch()
+  -> 移除 inflight entry
 ```
+
+不再使用 `mark_staging_ready()`、`publish_ready_staging_to_active()`、
+`_finalize_publish()` 和 publish stream 同步。
 
 ## 12. 与已有模式隔离
 
@@ -795,7 +866,10 @@ dual_queue
 - runtime factory 为 dual_queue 创建独立 `DualQueuePrefetchRuntime`。
 - dual_queue 覆盖 `observe_prefill/observe_draft/observe_verify`。
 - dual_queue 的 draft/verify segment hooks 不调用 predictive API。
-- metadata item 的 `submit_after_phase=None`，避免 metadata worker 再触发旧模式提交。
+- metadata item 使用 `submit_after_phase="after_draft_segment"` 或
+  `"after_verify_segment"`，由 `_submit_prefetch_after_metadata()` 中的
+  dual_queue 分支分发到 `submit_deferred_draft_segment()` 或
+  `submit_deferred_verify_segment()`，不触发旧模式提交。
 - dual_queue 不执行 predictive phase-1。
 - source 名称独立，profile 可按来源拆分。
 - 原有模式的默认配置和行为不变。
@@ -1038,16 +1112,19 @@ conda run -n nano_moe python scripts/bench_dual_queue_prefetch.py \
 ### 16.3 dual_queue 与 predictive 对照
 
 ```bash
-conda run -n nano_moe python scripts/bench_dual_queue_prefetch.py \
-  --output-dir results/dual_queue_vs_predictive \
+conda run -n nano_moe 
+rm -rf results/dual_queue_vs_predictive_mixed
+CUDA_VISIBLE_DEVICES=1 python scripts/bench_dual_queue_prefetch.py \
+  --output-dir results/dual_queue_vs_predictive_mixed \
   --model-path /data1/models/Qwen3-30B-A3B \
   --profile-artifact results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors \
   --runtime-kinds dual_queue,predictive \
-  --output-lens 128,512 \
-  --cache-ratios 0.25,0.3125,0.50 \
-  --max-draft-tokens-values 4,8 \
+  --secondary-index-weight 1 \
+  --output-lens 128,512,1024,2048,4096,8092 \
+  --cache-ratios 0.25,0.3125 \
+  --max-draft-tokens-values 3,8 \
   --segment-sizes 12 \
-  --repeats 3 \
+  --repeats 1 \
   --gpu-memory-utilization 0.99 \
   --kt-num-threads 32
 ```
@@ -1157,8 +1234,347 @@ deadline 内 published
 - 自动预算以单 expert 代表传输和最短 segment 为依据，未显式建模多 stream
   并发后的 PCIe 饱和；因此仍需通过 benchmark 校验。
 - `prefetch_max_inflight` 是全局上限，DP 和 GT 不预留独立配额。
-- staging slot 是 per-layer 资源；某些 layer 候选集中时可能先于全局 inflight
-  上限耗尽。
+- direct_active 模式下 active slot 被预留为 pending 后不可被其他 prefetch
+  选作 victim，某些 layer 高并发 prefetch 时可能受 slot 数限制。
 
 这些限制都是性能退化路径，不改变 verify 的数值语义：未及时完成的 prefetch
 不会被强行发布，miss expert 仍由 `spec_verify_miss_policy=cpu` 执行。
+
+## 19. 性能回归分析与优化（2026-06-12）
+
+### 19.0 问题描述
+
+初始实现在 benchmark 中与 `predictive` 模式对比出现全面倒退：
+
+| 指标 | dual_queue | predictive | 差异 |
+|---|---|---|---|
+| tok/s | 18.9 | 23.0 | -18% |
+| draft_forward_ms | 24.8 | 19.0 | +31% |
+| verify_forward_ms | 85.3 | 72.4 | +18% |
+| hit_rate | 0.818 | 0.865 | -5.4pp |
+| accept_rate | 0.822 | 0.867 | -4.5pp |
+| budget (D/V) | 6/16 | adaptive ~16 | draft 预算严重不足 |
+
+benchmark 使用配置：
+
+```text
+model: Qwen3-30B-A3B
+output_len: 512, cache_ratio: 0.25, max_draft_tokens: 4
+segment_size: 12, budget_safety_ratio: 0.6
+```
+
+### 19.1 根因 A：关键路径开销（~6ms/draft segment）
+
+初始实现中 `on_draft_segment_start()` 和 `on_draft_segment_end()` 在 graph
+replay 循环内、`_prefetch_runtime_lock` 下同步执行以下操作：
+
+**A.1 同步 segment hooks**
+
+每次 segment boundary 调用：
+
+- `publish_segment_ready()`（`prefetcher.py:3145-3209`）：遍历所有 inflight
+  tickets，逐个调用 `ticket.ready_event.query()`（CPU-GPU 同步），选择
+  victim，通过 `publish_ready_staging_to_active()` 执行 staging→active D2D。
+- `submit_segment_prefetch()`（`prefetcher.py:3020-3110`）：调用
+  `ranked_for_range()` 对所有候选按 exponential decay 排序，预留 staging
+  slot，发起 H2D 传输。
+- `_finalize_publish()`（`prefetcher.py:2026-2029`）：调用
+  `torch.cuda.current_stream().wait_stream(self.publish_stream)` — **每个
+  已发布 expert 都触发一次 CUDA stream 同步**。
+
+`predictive` 在 draft replay 循环中跳过全部上述操作。它使用
+`_enqueue_draft_segment_metadata()` 将 segment metadata 异步传递给
+metadata worker thread，由 `submit_draft_segment_indexed_prefetch()` 在
+关键路径之外执行。
+
+**A.2 Staging buffer 架构 vs direct_active**
+
+初始 dual_queue 使用 staging：
+
+```text
+H2D -> staging buffer -> publish_segment_ready() 检查 event
+  -> staging→active D2D -> _finalize_publish() stream 同步
+```
+
+predictive 使用 `direct_active=True`：
+
+```text
+H2D -> active slot (deferred) -> commit 原子更新 LUT
+```
+
+staging 路径每个 expert 多一次 D2D 拷贝和一次 publish stream 同步。
+
+**A.3 per-segment CUDA timing instrumentation**
+
+`_start_dual_queue_segment_timing()`（`model_runner.py:1555-1600`）在每个
+segment 创建 2 个 CUDA event，`_poll_dual_queue_segment_timings(block=False)`
+查询它们。即使标定已完成，这些操作仍在每个 segment 执行（~0.5-1ms 开销）。
+
+**A.4 每 segment 重算预算**
+
+`record_segment_compute_ms()` 在标定完成后每个 segment 都调用
+`_recompute_prefetch_budgets()`，涉及遍历所有 segment 计时并重算预算。
+
+### 19.2 优化方案：关键路径开销消除
+
+**A.1 segment hooks 移至 metadata worker**
+
+移除 graph replay 循环中的同步 `submit_segment_prefetch()` 调用。
+
+- `on_draft_segment_start()`：仅调用 `publish_direct_active_ready()`
+  （轻量：遍历 inflight tickets 执行 commit）。
+- `on_draft_segment_end()`：返回 0，不执行任何操作。
+- `on_verify_segment_start()`：仅调用 `publish_direct_active_ready()`。
+
+prefetch submission 由以下路径异步执行：
+
+```text
+_enqueue_draft_segment_metadata()
+  submit_after_phase="after_draft_segment"
+  -> metadata worker
+    -> _submit_prefetch_after_metadata()
+      -> submit_deferred_draft_segment()
+        -> submit_segment_prefetch()
+```
+
+verify 路径同理使用 `submit_after_phase="after_verify_segment"` 和
+`submit_deferred_verify_segment()`。
+
+新增 `_segment_id_for_frontier()` helper 根据 `frontier_layer_idx` 反查
+segment_id，因为 metadata worker 不持有 segment_id，只知道 frontier layer。
+
+**A.2 切换至 direct_active 模式**
+
+`submit_segment_prefetch()` 改为在提交时执行 victim 选择（非发布时）：
+
+1. 调用 `_select_dual_queue_victim()` 获取 active slot。
+2. 调用 `reserve_active_slot_for_prefetch_deferred()` 将 slot 标记为 pending。
+3. 以 `direct_active=True` 发起 H2D，直接写入 active slot buffer。
+4. ticket 记录 `active_slot_idx`、`active_generation`、`active_slot_prev_expert`。
+
+发布路径使用 `publish_direct_active_ready()`：
+
+- `ready_event.query()` 成功 → `commit_deferred_active_prefetch()` 原子更新 LUT。
+- 不需要 staging slot、D2D 拷贝、publish stream、`_finalize_publish()`。
+
+`_reap_expired_tickets()` 相应更新：direct_active ticket 使用
+`cancel_deferred_active_prefetch()` 取消。
+
+**A.3 timing instrumentation（保留 CUDA event）**
+
+`_start_dual_queue_segment_timing()` 始终使用 CUDA event，不改用
+`perf_counter()`。原因是 `graph.replay()` 异步返回，`perf_counter()` 只能
+测量 CPU enqueue 时间（~0.01ms），无法反映实际 GPU 计算时间（~4ms）。budget
+公式依赖准确的 segment 计算时间，错误的低值会导致 budget 为 0。CUDA event
+的创建/record/query 开销约 40μs/segment，相比 graph replay 本身可忽略。
+
+**A.4 节流预算重算**
+
+`record_segment_compute_ms()`：标定完成后每 8 个 segment 才调用一次
+`_recompute_prefetch_budgets()`，而非每个 segment。通过
+`_budget_recompute_interval` 和 `_budget_recompute_counter` 控制。
+
+### 19.3 Python 微优化
+
+**C.1 缓存配置查找**
+
+`DualQueueSegmentIndex.__init__()` 将 `_decay`、`_count_weight`、`_ttl` 缓存
+为实例属性，替代 `_priority()` 和 `ranked_for_range()` 中的 `getattr()` 调用。
+
+**C.2 预计算 decay 幂表**
+
+```python
+self._decay_table = [self._decay ** i for i in range(self._ttl + 2)]
+```
+
+`_priority()` 使用 `self._decay_table[min(age, self._ttl + 1)]` 替代
+`decay ** age` 实时计算。
+
+**C.3 消除集合构造**
+
+- `submit_segment_prefetch()` 直接传递 `self.inflight` dict 给
+  `ranked_for_range()` 的 `inflight_keys` 参数（`dict` 支持 `in` 操作），
+  替代 `set(self.inflight.keys())` 的复制开销。
+- `_select_dual_queue_victim()` 使用 `frozenset()` 作为空集合哨兵，替代
+  `set()` 的重复构造。
+
+**C.4 EMA alpha 缓存**
+
+`DualQueuePrefetchRuntime.__init__()` 将 `_ema_alpha` 缓存为实例属性，替代
+`record_segment_compute_ms()` 中每次调用时的 `getattr()` 查找。
+
+## 20. 实现变更总结（2026-06-12）
+
+### 20.1 `nanovllm/expert/prefetcher.py`
+
+变更概要：
+
+- `DualQueueSegmentIndex.__init__()`：新增 `_decay`、`_count_weight`、`_ttl`、
+  `_decay_table` 缓存属性。
+- `DualQueueSegmentIndex._priority()`：使用 decay table lookup 和缓存属性替代
+  `getattr()` 和实时幂运算。
+- `DualQueueSegmentIndex.ranked_for_range()`：`inflight_keys` 参数类型扩展为
+  `set | dict`，使用缓存 `_ttl`。
+- `DualQueueSegmentIndex.update()`：使用缓存 `self._decay`。
+- `DualQueuePrefetchRuntime.__init__()`：新增 `_ema_alpha`、
+  `_budget_recompute_interval`、`_budget_recompute_counter`。
+- `record_segment_compute_ms()`：使用缓存 `_ema_alpha`，节流预算重算至每 8 次。
+- `_select_dual_queue_victim()`：使用 `frozenset()` 哨兵。
+- `submit_segment_prefetch()`：改为 direct_active 模式 — 提交时选择 victim、
+  `reserve_active_slot_for_prefetch_deferred()`、`direct_active=True`。不再
+  申请 staging slot。profile counter 从 `staging_prefetch_submit_count` 改为
+  `direct_active_prefetch_submit_count`。
+- `_reap_expired_tickets()`：处理 direct_active ticket 使用
+  `cancel_deferred_active_prefetch()`，兼容 staging ticket。
+- `publish_segment_ready()`：委托给 `publish_direct_active_ready()`。
+- `on_draft_segment_start()`：简化为仅调用 `publish_direct_active_ready()`。
+- `on_draft_segment_end()`：返回 0。
+- `on_verify_segment_start()`：简化为仅调用 `publish_direct_active_ready()`。
+- 新增 `submit_deferred_draft_segment()`：metadata worker 调用，包含完整的
+  first-draft GT/DP 调度和后续 draft DP 调度逻辑。
+- 新增 `submit_deferred_verify_segment()`：metadata worker 调用，执行 verify
+  阶段的 next-segment 调度。segment 1~n-1 使用 DP，最后一个 segment n
+  使用 GT 预取下一轮第一个 draft segment。
+- 新增 `_segment_id_for_frontier()`：根据 frontier_layer_idx 反查 segment_id。
+
+### 20.2 `nanovllm/engine/model_runner.py`
+
+变更概要：
+
+- `_submit_prefetch_after_metadata()`：新增 dual_queue 分支，在 metadata
+  worker thread 中根据 mode 调用 `submit_deferred_draft_segment()` 或
+  `submit_deferred_verify_segment()`。
+- `_enqueue_draft_segment_metadata()`：`submit_after_phase` 从 `None`（dual_queue
+  时）改为无条件使用 `"after_draft_segment"`。
+- `_replay_draft_segment_graph()`：移除 `on_draft_segment_end()` 调用。缓存
+  `dual_queue = self._dual_queue_prefetch_enabled()` 避免重复方法调用。
+- `_start_dual_queue_segment_timing()`：始终使用 CUDA event（`perf_counter()`
+  无法测量异步 graph replay 的 GPU 时间，会导致 budget=0）。
+- `_enqueue_verify_segment_metadata()`：dual_queue 时设置
+  `submit_after_phase="after_verify_segment"` 和 `frontier_layer_idx`。
+
+### 20.3 `tests/test_dual_queue_prefetch.py`
+
+变更概要：
+
+- `test_unready_target_is_discarded_without_cache_mutation` →
+  `test_unready_target_remains_inflight_without_cache_mutation`：
+  改为验证 direct_active 语义 — unready ticket 保留在 inflight（不移至
+  expired），ready 后调用 `publish_direct_active_ready()` 完成发布。
+- `test_same_boundary_does_not_evict_just_published_expert`：
+  断言从 `submitted==2` 改为 `submitted==1`（direct_active 提交时选择 victim
+  并标记 pending，第二个 candidate 无可用 slot）。发布使用
+  `publish_direct_active_ready()`。
+- `test_first_draft_uses_ground_truth_then_draft_predict`：
+  调用 `submit_deferred_draft_segment()` 替代 `on_draft_segment_start()` /
+  `on_draft_segment_end()`，传递 `frontier_layer_idx`。
+- `test_later_draft_and_verify_prefetch_next_segment`：
+  调用 `submit_deferred_draft_segment()` / `submit_deferred_verify_segment()`
+  替代直接调用 segment hooks。验证最后一个 verify segment 使用 GT。
+- 新增 `test_verify_non_last_segment_uses_draft_predict`：
+  验证 verify segment 1~n-1 使用 DP，最后一个 segment 使用 GT。
+
+## 21. 测试验证
+
+### 21.1 单元测试
+
+```bash
+cd /home/linke/nano-vllm-moe
+
+conda run -n nano_moe python -m pytest -q \
+  tests/test_dual_queue_prefetch.py \
+  tests/test_config_predictive_prefetch.py \
+  tests/test_dual_queue_bench.py
+```
+
+当前通过 28 个测试，覆盖：
+
+- direct_active 模式下的提交、发布、取消语义。
+- unready ticket 保留在 inflight 而非移至 expired。
+- submit 时 victim 选择导致 pending slot 不可被后续 candidate 使用。
+- deferred draft/verify segment 调度时序。
+- round-end discard 对 direct_active ticket 的清理。
+- 所有原有覆盖点（decay、TTL、protection、budget 等）。
+
+### 21.2 静态编译检查
+
+```bash
+conda run -n nano_moe python -m py_compile nanovllm/expert/prefetcher.py
+conda run -n nano_moe python -m py_compile nanovllm/engine/model_runner.py
+```
+
+### 21.3 完整测试矩阵
+
+```bash
+conda run -n nano_moe python -m pytest -q \
+  tests/test_dual_queue_prefetch.py \
+  tests/test_config_predictive_prefetch.py \
+  tests/test_spec_verify_expert_count_stats.py \
+  tests/test_dual_queue_bench.py
+```
+
+## 22. 优化后性能测试
+
+### 22.1 Smoke test
+
+```bash
+cd /home/linke/nano-vllm-moe
+
+conda run -n nano_moe python scripts/bench_dual_queue_prefetch.py \
+  --output-dir results/dual_queue_opt_smoke \
+  --model-path /data1/models/Qwen3-30B-A3B \
+  --profile-artifact results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors \
+  --runtime-kinds dual_queue \
+  --output-lens 32 \
+  --cache-ratios 0.25 \
+  --max-draft-tokens-values 4 \
+  --segment-sizes 12 \
+  --repeats 1 \
+  --gpu-memory-utilization 0.99 \
+  --kt-num-threads 32
+```
+
+### 22.2 优化前后 A/B 对照
+
+```bash
+conda run -n nano_moe python scripts/bench_dual_queue_prefetch.py \
+  --output-dir results/dual_queue_opt_vs_predictive \
+  --model-path /data1/models/Qwen3-30B-A3B \
+  --profile-artifact results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors \
+  --runtime-kinds dual_queue,predictive \
+  --output-lens 128,512 \
+  --cache-ratios 0.25,0.3125,0.50 \
+  --max-draft-tokens-values 4,8 \
+  --segment-sizes 12 \
+  --repeats 3 \
+  --gpu-memory-utilization 0.99 \
+  --kt-num-threads 32
+```
+
+### 22.3 预期改善
+
+优化预期效果（需 benchmark 验证）：
+
+| 优化项 | 预期影响 |
+|---|---|
+| segment hooks 移至 metadata worker | draft_forward_ms 下降 ~5-6ms（消除同步 submit + publish） |
+| 切换 direct_active | 消除 staging D2D + publish stream 同步开销 |
+| 节流预算重算（每 8 segment） | 减少 per-segment CPU 开销 |
+| Python 微优化 | 减少 `_priority()` / `ranked_for_range()` 热路径延迟 |
+
+注意：以上优化仅消除关键路径开销（Phase A + C）。hit_rate 改善（Phase B：
+合并双 index 查询、添加 phase-1 cold start、优化 victim 策略、修正 draft
+budget 不足）尚未实施，将根据 benchmark 结果决定是否执行。
+
+### 22.4 关键验证指标
+
+优化后重点检查：
+
+1. `draft_forward_ms`：是否从 ~24.8ms 下降至接近 predictive 的 ~19ms。
+2. `verify_forward_ms`：是否从 ~85.3ms 下降至接近 predictive 的 ~72ms。
+3. `tok/s`：端到端吞吐是否回升。
+4. `hit_rate`：在相同 budget 下命中率是否因传输及时性改善而提升。
+5. `digest_match`：同 seed 同配置下输出应一致。
+6. `dual_queue_draft_budget` / `dual_queue_verify_budget`：自动标定预算是否合理。
+7. `direct_active_prefetch_submit_count`：确认使用 direct_active 路径（不再有
+   `staging_prefetch_submit_count`）。

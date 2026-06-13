@@ -47,6 +47,7 @@ def _config(**overrides):
         dual_queue_ground_truth_count_weight=0.25,
         dual_queue_budget_safety_ratio=0.8,
         dual_queue_segment_time_ema_alpha=0.2,
+        dual_queue_secondary_index_weight=0.5,
     )
     for key, value in overrides.items():
         setattr(cfg, key, value)
@@ -261,7 +262,7 @@ class TestDualQueueBestEffort(unittest.TestCase):
         self.assertEqual(runtime.publish_segment_ready(step_id=1, segment_id=0), 1)
         self.assertTrue(caches[0].is_cached_cpu(2))
 
-    def test_unready_target_is_discarded_without_cache_mutation(self):
+    def test_unready_target_remains_inflight_without_cache_mutation(self):
         runtime, caches = _runtime(num_layers=1)
         cache = caches[0]
         cache.put_to_slot(0, 0, *_weights().values())
@@ -282,15 +283,16 @@ class TestDualQueueBestEffort(unittest.TestCase):
         event = _ManualEvent(ready=False)
         ticket.ready_event = event
 
-        self.assertEqual(runtime.publish_segment_ready(step_id=1, segment_id=0), 0)
+        # With direct_active, unready tickets stay in inflight (not expired).
+        self.assertEqual(runtime.publish_direct_active_ready(step_id=1), 0)
         self.assertEqual(cache.slot_to_expert[0], 0)
-        self.assertIn((0, 2), runtime._expired_tickets)
+        self.assertIn((0, 2), runtime.inflight)
 
+        # Once the transfer finishes, it can be published.
         event.ready = True
-        runtime._reap_expired_tickets()
+        self.assertEqual(runtime.publish_direct_active_ready(step_id=1), 1)
         self.assertNotIn((0, 2), runtime.inflight)
-        self.assertFalse(cache.is_cached_cpu(2))
-        self.assertEqual(cache.staging_slot_state, [0, 0])
+        self.assertTrue(cache.is_cached_cpu(2))
 
     def test_same_boundary_does_not_evict_just_published_expert(self):
         runtime, caches = _runtime(
@@ -313,11 +315,15 @@ class TestDualQueueBestEffort(unittest.TestCase):
             source=runtime.DRAFT_SOURCE,
             phase="draft",
         )
-
-        self.assertEqual(submitted, 2)
-        self.assertEqual(runtime.publish_segment_ready(step_id=1, segment_id=0), 1)
+        # With direct_active, victim selection happens at submit time. The
+        # first candidate evicts the only slot and marks it pending, so the
+        # second candidate cannot be submitted.
+        self.assertEqual(submitted, 1)
+        ticket = runtime.inflight[(0, 2)]
+        ticket.ready_event = _ManualEvent(ready=True)
+        published = runtime.publish_direct_active_ready(step_id=1)
+        self.assertEqual(published, 1)
         self.assertTrue(cache.is_cached_cpu(2))
-        self.assertFalse(cache.is_cached_cpu(3))
 
     def test_round_end_discards_all_remaining_tickets(self):
         runtime, _ = _runtime(num_layers=1)
@@ -382,6 +388,126 @@ class TestDualQueueBestEffort(unittest.TestCase):
         self.assertEqual(draft_budget, 2)
         self.assertEqual(verify_budget, 3)
 
+    def test_merge_indices_primary_preferred_over_secondary(self):
+        runtime, caches = _runtime(
+            num_layers=1,
+            cache_slots=2,
+            draft_prefetch_max_per_boundary=4,
+            prefetch_max_inflight=8,
+            dual_queue_secondary_index_weight=0.5,
+        )
+        cache = caches[0]
+        cache.put_to_slot(0, 0, *_weights().values())
+        cache.put_to_slot(1, 1, *_weights().values())
+        runtime._round_id = 1
+        runtime.draft_predict_index.update(
+            _aggregated_meta(0, [2], [1.0]),
+            round_id=1,
+        )
+        runtime.ground_truth_index.update(
+            _aggregated_meta(0, [3], [2.0]),
+            round_id=1,
+        )
+        submitted = runtime.submit_segment_prefetch(
+            step_id=1,
+            target_layer_start=0,
+            target_layer_end=1,
+            target_segment_id=0,
+            source=runtime.DRAFT_SOURCE,
+            phase="draft",
+        )
+        self.assertEqual(submitted, 2)
+        ticket_primary = runtime.inflight[(0, 2)]
+        ticket_secondary = runtime.inflight[(0, 3)]
+        self.assertEqual(ticket_primary.source, runtime.DRAFT_SOURCE)
+        self.assertEqual(ticket_secondary.source, runtime.GROUND_TRUTH_SOURCE)
+
+    def test_merge_indices_secondary_fills_gaps(self):
+        runtime, caches = _runtime(
+            num_layers=1,
+            cache_slots=2,
+            draft_prefetch_max_per_boundary=4,
+            prefetch_max_inflight=8,
+            dual_queue_secondary_index_weight=0.5,
+        )
+        cache = caches[0]
+        cache.put_to_slot(0, 0, *_weights().values())
+        cache.put_to_slot(1, 1, *_weights().values())
+        runtime._round_id = 1
+        runtime.ground_truth_index.update(
+            _aggregated_meta(0, [2], [3.0]),
+            round_id=1,
+        )
+        submitted = runtime.submit_segment_prefetch(
+            step_id=1,
+            target_layer_start=0,
+            target_layer_end=1,
+            target_segment_id=0,
+            source=runtime.DRAFT_SOURCE,
+            phase="draft",
+        )
+        self.assertEqual(submitted, 1)
+        ticket = runtime.inflight[(0, 2)]
+        self.assertEqual(ticket.source, runtime.GROUND_TRUTH_SOURCE)
+
+    def test_merge_indices_zero_weight_disables_secondary(self):
+        runtime, caches = _runtime(
+            num_layers=1,
+            cache_slots=2,
+            draft_prefetch_max_per_boundary=4,
+            prefetch_max_inflight=8,
+            dual_queue_secondary_index_weight=0.0,
+        )
+        cache = caches[0]
+        cache.put_to_slot(0, 0, *_weights().values())
+        cache.put_to_slot(1, 1, *_weights().values())
+        runtime._round_id = 1
+        runtime.ground_truth_index.update(
+            _aggregated_meta(0, [2], [3.0]),
+            round_id=1,
+        )
+        submitted = runtime.submit_segment_prefetch(
+            step_id=1,
+            target_layer_start=0,
+            target_layer_end=1,
+            target_segment_id=0,
+            source=runtime.DRAFT_SOURCE,
+            phase="draft",
+        )
+        self.assertEqual(submitted, 0)
+
+    def test_merge_primary_wins_when_both_have_same_expert(self):
+        runtime, caches = _runtime(
+            num_layers=1,
+            cache_slots=2,
+            draft_prefetch_max_per_boundary=4,
+            prefetch_max_inflight=8,
+            dual_queue_secondary_index_weight=0.5,
+        )
+        cache = caches[0]
+        cache.put_to_slot(0, 0, *_weights().values())
+        cache.put_to_slot(1, 1, *_weights().values())
+        runtime._round_id = 1
+        runtime.draft_predict_index.update(
+            _aggregated_meta(0, [2], [1.0]),
+            round_id=1,
+        )
+        runtime.ground_truth_index.update(
+            _aggregated_meta(0, [2], [1.5]),
+            round_id=1,
+        )
+        submitted = runtime.submit_segment_prefetch(
+            step_id=1,
+            target_layer_start=0,
+            target_layer_end=1,
+            target_segment_id=0,
+            source=runtime.DRAFT_SOURCE,
+            phase="draft",
+        )
+        self.assertEqual(submitted, 1)
+        ticket = runtime.inflight[(0, 2)]
+        self.assertEqual(ticket.source, runtime.DRAFT_SOURCE)
+
 
 class TestDualQueueMetadata(unittest.TestCase):
     def test_draft_metadata_is_fixed_score_sum_vector(self):
@@ -431,13 +557,22 @@ class TestDualQueueSchedule(unittest.TestCase):
             calls.append((kwargs["target_segment_id"], kwargs["source"]))
             return 0
 
-        with patch.object(runtime, "publish_segment_ready", return_value=0), patch.object(
+        with patch.object(
             runtime, "submit_segment_prefetch", side_effect=record
         ):
-            runtime.on_draft_segment_start(step_id=1, segment_id=0, boundaries=boundaries)
-            runtime.on_draft_segment_end(step_id=1, segment_id=0, boundaries=boundaries)
-            runtime.on_draft_segment_end(step_id=1, segment_id=1, boundaries=boundaries)
-            runtime.on_draft_segment_end(step_id=1, segment_id=2, boundaries=boundaries)
+            # Deferred calls from metadata worker for first draft forward.
+            # Segment 0 metadata arrives -> prefetch seg 1 (GT) + seg 2 (GT)
+            runtime.submit_deferred_draft_segment(
+                step_id=1, frontier_layer_idx=1, boundaries=boundaries,
+            )
+            # Segment 1 metadata arrives -> prefetch seg 0 (DP)
+            runtime.submit_deferred_draft_segment(
+                step_id=1, frontier_layer_idx=3, boundaries=boundaries,
+            )
+            # Segment 2 metadata arrives -> prefetch seg 1 (DP)
+            runtime.submit_deferred_draft_segment(
+                step_id=1, frontier_layer_idx=5, boundaries=boundaries,
+            )
 
         self.assertEqual(calls, [
             (1, runtime.GROUND_TRUTH_SOURCE),
@@ -457,15 +592,48 @@ class TestDualQueueSchedule(unittest.TestCase):
             calls.append((kwargs["phase"], kwargs["target_segment_id"], kwargs["source"]))
             return 0
 
-        with patch.object(runtime, "publish_segment_ready", return_value=0), patch.object(
+        with patch.object(
             runtime, "submit_segment_prefetch", side_effect=record
         ):
-            runtime.on_draft_segment_start(step_id=2, segment_id=2, boundaries=boundaries)
-            runtime.on_verify_segment_start(step_id=2, segment_id=2, boundaries=boundaries)
+            runtime.submit_deferred_draft_segment(
+                step_id=2, frontier_layer_idx=5, boundaries=boundaries,
+            )
+            runtime.submit_deferred_verify_segment(
+                step_id=2, frontier_layer_idx=5, boundaries=boundaries,
+            )
 
         self.assertEqual(calls, [
             ("draft", 0, runtime.DRAFT_SOURCE),
-            ("verify", 0, runtime.DRAFT_SOURCE),
+            ("verify", 0, runtime.GROUND_TRUTH_SOURCE),
+        ])
+
+    def test_verify_non_last_segment_uses_draft_predict(self):
+        runtime, _ = _runtime()
+        runtime.begin_draft_iteration(step_id=1)
+        boundaries = [(0, 2), (2, 4), (4, 6)]
+        calls = []
+
+        def record(**kwargs):
+            calls.append((kwargs["target_segment_id"], kwargs["source"]))
+            return 0
+
+        with patch.object(
+            runtime, "submit_segment_prefetch", side_effect=record
+        ):
+            runtime.submit_deferred_verify_segment(
+                step_id=1, frontier_layer_idx=1, boundaries=boundaries,
+            )
+            runtime.submit_deferred_verify_segment(
+                step_id=1, frontier_layer_idx=3, boundaries=boundaries,
+            )
+            runtime.submit_deferred_verify_segment(
+                step_id=1, frontier_layer_idx=5, boundaries=boundaries,
+            )
+
+        self.assertEqual(calls, [
+            (1, runtime.DRAFT_SOURCE),
+            (2, runtime.DRAFT_SOURCE),
+            (0, runtime.GROUND_TRUTH_SOURCE),
         ])
 
 

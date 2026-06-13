@@ -424,6 +424,12 @@ def _summarize_case(raw: dict[str, Any], layer_events: list[dict[str, Any]]) -> 
             "stale_draft_metadata_count": int(
                 ep.get("model_dual_queue_stale_draft_metadata_count", 0) or 0
             ),
+            "draft_phase_submit_count": int(
+                ep.get("model_dual_queue_draft_phase_submit_count", 0) or 0
+            ),
+            "verify_phase_submit_count": int(
+                ep.get("model_dual_queue_verify_phase_submit_count", 0) or 0
+            ),
             "round_clear_count": int(ep.get("model_dual_queue_round_clear_count", 0) or 0),
             "all_slots_protected_count": int(
                 ep.get("model_dual_queue_all_slots_protected_count", 0) or 0
@@ -521,6 +527,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         "dual_queue_ground_truth_count_weight": float(args.dual_queue_ground_truth_count_weight),
         "dual_queue_budget_safety_ratio": float(args.dual_queue_budget_safety_ratio),
         "dual_queue_segment_time_ema_alpha": float(args.dual_queue_segment_time_ema_alpha),
+        "dual_queue_secondary_index_weight": float(args.dual_queue_secondary_index_weight),
         "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
         "predictive_phase1_budget": int(args.predictive_phase1_budget),
         "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
@@ -579,6 +586,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         dual_queue_ground_truth_count_weight=args.dual_queue_ground_truth_count_weight,
         dual_queue_budget_safety_ratio=args.dual_queue_budget_safety_ratio,
         dual_queue_segment_time_ema_alpha=args.dual_queue_segment_time_ema_alpha,
+        dual_queue_secondary_index_weight=args.dual_queue_secondary_index_weight,
         prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
         predictive_phase1_budget=args.predictive_phase1_budget,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
@@ -1099,6 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dual-queue-ground-truth-count-weight", type=float, default=0.1)
     p.add_argument("--dual-queue-budget-safety-ratio", type=float, default=0.8)
     p.add_argument("--dual-queue-segment-time-ema-alpha", type=float, default=0.2)
+    p.add_argument("--dual-queue-secondary-index-weight", type=float, default=0.5)
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=0.3)
     p.add_argument("--predictive-phase1-budget", type=int, default=4)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)

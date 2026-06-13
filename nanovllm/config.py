@@ -74,6 +74,7 @@ class Config:
     dual_queue_ground_truth_count_weight: float = 0.1
     dual_queue_budget_safety_ratio: float = 0.8
     dual_queue_segment_time_ema_alpha: float = 0.2
+    dual_queue_secondary_index_weight: float = 0.5
     draft_prefetch_frontier_granularity: str = "segment"
     draft_prefetch_segment_size: int = 12
     draft_prefetch_segment_host_buffer_pool_size: int = 0
@@ -185,6 +186,7 @@ class Config:
         assert self.dual_queue_ground_truth_count_weight >= 0.0
         assert 0.0 < self.dual_queue_budget_safety_ratio <= 1.0
         assert 0.0 < self.dual_queue_segment_time_ema_alpha <= 1.0
+        assert 0.0 <= self.dual_queue_secondary_index_weight <= 1.0
         if self.prefetch_runtime_kind in {"predictive", "dual_queue"}:
             # The predictive prefetcher reuses the segment-indexed integration
             # gates in model_runner; force the mode so those gates fire.

@@ -127,6 +127,33 @@ def _row_from_raw(
     dual_submit = draft_submit + gt_submit
     dual_published = draft_published + gt_published
 
+    # Graph replay counts — used to compute per-forward averages.
+    segment_size = int(case.get("segment_size", 12) or 12)
+    draft_seg_replays = int(
+        engine_profile.get("model_draft_segment_graph_replay_count", 0) or 0
+    )
+    verify_calls = int(cuda_graph.get("verify_call_count", 0) or 0)
+    num_segments = max(1, 48 // segment_size) if segment_size > 0 else 1
+    draft_forward_count = max(1, draft_seg_replays // num_segments) if draft_seg_replays else 1
+
+    # Per-phase prefetch submit for dual_queue.
+    dq_draft_phase_submit = int(dual_queue.get("draft_phase_submit_count", 0) or 0)
+    dq_verify_phase_submit = int(dual_queue.get("verify_phase_submit_count", 0) or 0)
+
+    # Per-phase prefetch submit for predictive.
+    pred_draft_seg_submit = int(prefetch.get("draft_segment_indexed_submit_count", 0) or 0)
+    pred_draft_live_submit = int(
+        engine_profile.get("model_draft_live_prefetch_submit_count", 0) or 0
+    )
+    pred_phase1_submit = int(prefetch.get("predictive_phase1_submit_count", 0) or 0)
+    pred_verify_seg_submit = int(prefetch.get("verify_segment_prefetch_submit_count", 0) or 0)
+
+    is_dual_queue = str(case.get("runtime_kind", "")) == "dual_queue"
+    draft_phase_submit = dq_draft_phase_submit if is_dual_queue else (
+        pred_draft_seg_submit + pred_draft_live_submit + pred_phase1_submit
+    )
+    verify_phase_submit = dq_verify_phase_submit if is_dual_queue else pred_verify_seg_submit
+
     return {
         "name": _case_name(case),
         "runtime_kind": str(case["runtime_kind"]),
@@ -146,23 +173,32 @@ def _row_from_raw(
             cache.get("true_route_hit_rate", cache.get("route_hit_rate", 0.0)) or 0.0
         ),
         "avg_miss_routes_per_layer": float(cache.get("avg_miss_per_layer", 0.0) or 0.0),
-        "verify_calls": int(cuda_graph.get("verify_call_count", 0) or 0),
+        "avg_active_per_layer": float(cache.get("avg_active_per_layer", 0.0) or 0.0),
+        "draft_forward_count": draft_forward_count,
+        "verify_calls": verify_calls,
         "verify_segment_graph_replays": int(
             cuda_graph.get("verify_kt_hybrid_segment_graph_replay_count", 0) or 0
         ),
-        "verify_segment_metadata_enqueue_count": int(
-            cuda_graph.get("verify_segment_metadata_enqueue_count", 0) or 0
+        # -- per-phase prefetch (works for both modes) --
+        "draft_phase_submit": draft_phase_submit,
+        "verify_phase_submit": verify_phase_submit,
+        "draft_prefetch_per_forward": float(draft_phase_submit / draft_forward_count),
+        "verify_prefetch_per_forward": (
+            float(verify_phase_submit / verify_calls) if verify_calls else 0.0
         ),
+        # -- total prefetch (mode-agnostic) --
         "prefetch_submit_count": int(prefetch.get("submit_count", 0) or 0),
         "prefetch_completed_count": int(prefetch.get("completed_count", 0) or 0),
         "prefetch_late_count": int(engine_profile.get("model_prefetch_late_count", 0) or 0),
         "prefetch_publish_count": int(engine_profile.get("model_publish_count", 0) or 0),
         "prefetch_consumed_count": int(prefetch.get("consumed_count", 0) or 0),
+        # -- dual_queue budget / queue --
         "draft_budget": int(dual_queue.get("draft_budget", 0) or 0),
         "verify_budget": int(dual_queue.get("verify_budget", 0) or 0),
         "expert_transfer_ms": float(dual_queue.get("expert_transfer_ms", 0.0) or 0.0),
         "draft_predict_size": int(dual_queue.get("draft_predict_size", 0) or 0),
         "ground_truth_size": int(dual_queue.get("ground_truth_size", 0) or 0),
+        # -- dual_queue by-source breakdown --
         "dual_submit_count": dual_submit,
         "dual_completed_count": (
             _mapping_int(completed_by_source, DUAL_DRAFT_SOURCE)
@@ -178,6 +214,7 @@ def _row_from_raw(
         "draft_published_count": draft_published,
         "ground_truth_published_count": gt_published,
         "dual_publish_ratio": float(dual_published / dual_submit) if dual_submit else 0.0,
+        # -- dual_queue health --
         "target_miss_count": int(dual_queue.get("target_miss_count", 0) or 0),
         "round_end_discard_count": int(dual_queue.get("round_end_discard_count", 0) or 0),
         "expired_transfer_count": int(dual_queue.get("expired_transfer_count", 0) or 0),
@@ -197,6 +234,11 @@ def _row_from_raw(
         "metadata_buffer_reuse_wait_ms": float(
             engine_profile.get("model_prefetch_async_buffer_reuse_wait_ms", 0.0) or 0.0
         ),
+        # -- predictive-specific breakdown --
+        "pred_draft_seg_submit": pred_draft_seg_submit,
+        "pred_draft_live_submit": pred_draft_live_submit,
+        "pred_phase1_submit": pred_phase1_submit,
+        "pred_verify_seg_submit": pred_verify_seg_submit,
         "outputs_digest": str(raw.get("outputs_digest", "")),
     }
 
@@ -248,9 +290,17 @@ def _comparison_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "route_hit_delta": (
                     float(dual["route_hit_rate"]) - float(predictive["route_hit_rate"])
                 ),
+                "miss_per_layer_delta": (
+                    float(dual["avg_miss_routes_per_layer"])
+                    - float(predictive["avg_miss_routes_per_layer"])
+                ),
                 "acceptance_delta": (
                     float(dual["acceptance_rate"]) - float(predictive["acceptance_rate"])
                 ),
+                "dual_draft_per_fwd": float(dual["draft_prefetch_per_forward"]),
+                "pred_draft_per_fwd": float(predictive["draft_prefetch_per_forward"]),
+                "dual_verify_per_fwd": float(dual["verify_prefetch_per_forward"]),
+                "pred_verify_per_fwd": float(predictive["verify_prefetch_per_forward"]),
                 "dual_publish_ratio": float(dual["dual_publish_ratio"]),
                 "dual_target_miss_count": int(dual["target_miss_count"]),
                 "dual_round_end_discard_count": int(dual["round_end_discard_count"]),
@@ -325,6 +375,8 @@ def _command(
         str(args.budget_safety_ratio),
         "--dual-queue-segment-time-ema-alpha",
         str(args.segment_time_ema_alpha),
+        "--dual-queue-secondary-index-weight",
+        str(args.secondary_index_weight),
         "--prefetch-strategy",
         "history_window",
         "--prefetch-staging-slots-per-layer",
@@ -467,15 +519,35 @@ def run_case(
     row = _row_from_raw(case, raw, wall_elapsed)
     print(
         f"  tok/s={row['throughput_output_tok_s']:.3f} "
+        f"decode_tok/s={row['decode_phase_output_tok_s']:.3f} "
         f"draft_ms={row['draft_forward_ms_avg']:.3f} "
         f"verify_ms={row['verify_forward_ms_avg']:.3f} "
         f"hit={row['route_hit_rate']:.4f} accept={row['acceptance_rate']:.4f} "
-        f"budget={row['draft_budget']}/{row['verify_budget']} "
-        f"dual_submit/publish/late={row['dual_submit_count']}/"
-        f"{row['dual_published_count']}/{row['dual_late_count']} "
-        f"target_miss={row['target_miss_count']}",
+        f"miss/L={row['avg_miss_routes_per_layer']:.2f} "
+        f"active/L={row['avg_active_per_layer']:.2f}",
         flush=True,
     )
+    print(
+        f"  prefetch: submit={row['prefetch_submit_count']} "
+        f"publish={row['prefetch_publish_count']} "
+        f"late={row['prefetch_late_count']} "
+        f"consumed={row['prefetch_consumed_count']} "
+        f"draft_phase={row['draft_phase_submit']} "
+        f"verify_phase={row['verify_phase_submit']} "
+        f"draft/fwd={row['draft_prefetch_per_forward']:.1f} "
+        f"verify/fwd={row['verify_prefetch_per_forward']:.1f}",
+        flush=True,
+    )
+    if str(row["runtime_kind"]) == "dual_queue":
+        print(
+            f"  dual_queue: budget={row['draft_budget']}/{row['verify_budget']} "
+            f"submit={row['dual_submit_count']} publish={row['dual_published_count']} "
+            f"late={row['dual_late_count']} "
+            f"target_miss={row['target_miss_count']} "
+            f"discard={row['round_end_discard_count']} "
+            f"meta_drop={row['metadata_host_buffer_drop_count']}",
+            flush=True,
+        )
     return row
 
 
@@ -494,10 +566,15 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         "",
         "## Cases",
         "",
-        "| runtime | seg | out | ratio | K | rep | tok/s | draft ms | verify ms | hit | accept | budget D/V | submit | publish | late | target miss | round discard | metadata drop |",
-        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|",
+        "| runtime | seg | out | ratio | K | rep | tok/s | draft ms | verify ms | hit | accept | miss/L | active/L | submit | publish | late | draft/fwd | verify/fwd | budget D/V |",
+        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
+        budget_str = (
+            f"{row['draft_budget']}/{row['verify_budget']}"
+            if row.get("draft_budget") or row.get("verify_budget")
+            else "-"
+        )
         lines.append(
             "| "
             f"{row['runtime_kind']} | {row['segment_size']} | {row['output_len']} | "
@@ -505,10 +582,13 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             f"{row['throughput_output_tok_s']:.3f} | "
             f"{row['draft_forward_ms_avg']:.3f} | {row['verify_forward_ms_avg']:.3f} | "
             f"{row['route_hit_rate']:.4f} | {row['acceptance_rate']:.4f} | "
-            f"{row['draft_budget']}/{row['verify_budget']} | "
-            f"{row['dual_submit_count']} | {row['dual_published_count']} | "
-            f"{row['dual_late_count']} | {row['target_miss_count']} | "
-            f"{row['round_end_discard_count']} | {row['metadata_host_buffer_drop_count']} |"
+            f"{row['avg_miss_routes_per_layer']:.2f} | "
+            f"{row['avg_active_per_layer']:.2f} | "
+            f"{row['prefetch_submit_count']} | {row['prefetch_publish_count']} | "
+            f"{row['prefetch_late_count']} | "
+            f"{row['draft_prefetch_per_forward']:.1f} | "
+            f"{row['verify_prefetch_per_forward']:.1f} | "
+            f"{budget_str} |"
         )
 
     lines.extend(
@@ -516,8 +596,8 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             "",
             "## Dual Queue vs Predictive",
             "",
-            "| seg | out | ratio | K | rep | digest | tok/s delta | speed ratio | draft ms delta | verify ms delta | hit delta | accept delta | publish ratio | target miss | round discard |",
-            "|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| seg | out | ratio | K | rep | digest | tok/s delta | ratio | draft ms delta | verify ms delta | hit delta | miss/L delta | accept delta | draft/fwd D | draft/fwd P | verify/fwd D | verify/fwd P |",
+            "|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in comparisons:
@@ -528,9 +608,11 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             f"{'match' if row['digest_match'] else 'DIFF'} | "
             f"{row['throughput_delta']:+.3f} | {row['throughput_ratio']:.3f} | "
             f"{row['draft_ms_delta']:+.3f} | {row['verify_ms_delta']:+.3f} | "
-            f"{row['route_hit_delta']:+.4f} | {row['acceptance_delta']:+.4f} | "
-            f"{row['dual_publish_ratio']:.3f} | {row['dual_target_miss_count']} | "
-            f"{row['dual_round_end_discard_count']} |"
+            f"{row['route_hit_delta']:+.4f} | "
+            f"{row['miss_per_layer_delta']:+.2f} | "
+            f"{row['acceptance_delta']:+.4f} | "
+            f"{row['dual_draft_per_fwd']:.1f} | {row['pred_draft_per_fwd']:.1f} | "
+            f"{row['dual_verify_per_fwd']:.1f} | {row['pred_verify_per_fwd']:.1f} |"
         )
 
     lines.extend(
@@ -538,11 +620,12 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             "",
             "## Interpretation",
             "",
-            "- `submit/publish/late` count only dual-queue sources. Predictive rows therefore show zero.",
-            "- `target miss` means H2D was not ready when the target segment started; the transfer was expired.",
+            "- `submit/publish/late` are mode-agnostic totals from the prefetch runtime.",
+            "- `draft/fwd` and `verify/fwd` show average prefetch submissions per forward call for each phase.",
+            "- `miss/L` is the average number of cache-miss routes per MoE layer (before CPU fallback).",
+            "- `target miss` (dual_queue) means the H2D was still inflight when the next publish check ran.",
             "- `round discard` counts transfers still unfinished when verify ended.",
             "- `metadata drop` counts samples skipped because every host metadata buffer was busy.",
-            "- A non-zero metadata drain wait for dual queue indicates a regression in best-effort behavior.",
             "",
         ]
     )
@@ -626,6 +709,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ground-truth-count-weight", type=float, default=0.1)
     parser.add_argument("--budget-safety-ratio", type=float, default=0.8)
     parser.add_argument("--segment-time-ema-alpha", type=float, default=0.2)
+    parser.add_argument("--secondary-index-weight", type=float, default=0.5)
 
     parser.add_argument("--prefetch-step-budget", type=int, default=16)
     parser.add_argument("--prefetch-max-inflight", type=int, default=16)

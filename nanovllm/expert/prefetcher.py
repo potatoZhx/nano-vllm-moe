@@ -460,6 +460,10 @@ class DualQueueSegmentIndex:
         self.segment_size = max(1, int(segment_size))
         self.history = bool(history)
         self.config = config
+        self._decay = float(getattr(config, "dual_queue_ground_truth_decay", 0.9))
+        self._count_weight = float(getattr(config, "dual_queue_ground_truth_count_weight", 0.1))
+        self._ttl = int(getattr(config, "dual_queue_ground_truth_ttl_rounds", 64))
+        self._decay_table = [self._decay ** i for i in range(self._ttl + 2)]
         self.entries_by_segment: dict[int, dict[tuple[int, int], DualQueueEntry]] = defaultdict(dict)
 
     def clear(self) -> None:
@@ -504,7 +508,7 @@ class DualQueueSegmentIndex:
         activated: set[tuple[int, int]] = set()
         if not runtime_meta:
             return activated
-        decay = float(getattr(self.config, "dual_queue_ground_truth_decay", 0.9))
+        decay = self._decay
         for layer_idx, meta in runtime_meta.items():
             aggregated = self._aggregated(meta)
             if aggregated is None:
@@ -546,9 +550,8 @@ class DualQueueSegmentIndex:
         if not self.history:
             return float(entry.score_sum)
         age = max(0, int(round_id) - int(entry.last_seen_round))
-        decay = float(getattr(self.config, "dual_queue_ground_truth_decay", 0.9)) ** age
-        count_weight = float(getattr(self.config, "dual_queue_ground_truth_count_weight", 0.1))
-        return decay * (float(entry.score_sum) + count_weight * float(entry.activation_count))
+        decay = self._decay_table[min(age, self._ttl + 1)]
+        return decay * (float(entry.score_sum) + self._count_weight * float(entry.activation_count))
 
     def ranked_for_range(
         self,
@@ -557,14 +560,14 @@ class DualQueueSegmentIndex:
         layer_end: int,
         round_id: int,
         layer_caches: dict[int, LayerExpertCache],
-        inflight_keys: set[tuple[int, int]],
+        inflight_keys: set[tuple[int, int]] | dict,
         source: str,
     ) -> list[PrefetchCandidate]:
         start = int(layer_start)
         end = int(layer_end)
         if start >= end:
             return []
-        ttl = int(getattr(self.config, "dual_queue_ground_truth_ttl_rounds", 64))
+        ttl = self._ttl
         first_segment = self._segment_id(start)
         last_segment = self._segment_id(end - 1)
         ranked: list[PrefetchCandidate] = []
@@ -612,6 +615,13 @@ class DualQueueSegmentIndex:
             return 0.0
         entry = entries.get((int(layer_idx), int(expert_idx)))
         return 0.0 if entry is None else self._priority(entry, int(round_id))
+
+
+_NON_DEFERRED_SOURCES = frozenset({
+    "draft_direct_active",
+    "verify_layer_predict",
+    "predictive_phase1",
+})
 
 
 class PrefetchRuntime:
@@ -1965,13 +1975,14 @@ class PrefetchRuntime:
                 generation=ticket.active_generation,
                 prev_expert=ticket.active_slot_prev_expert,
             )
-            if ticket.source == "draft_segment_indexed":
-                published_item = cache.commit_deferred_active_prefetch(reservation)
-            else:
+            _non_deferred = ticket.source in _NON_DEFERRED_SOURCES
+            if _non_deferred:
                 published_item = cache.commit_active_prefetch(reservation)
+            else:
+                published_item = cache.commit_deferred_active_prefetch(reservation)
             self.inflight.pop(key, None)
             if published_item is None:
-                if ticket.source == "draft_segment_indexed":
+                if not _non_deferred:
                     cache.cancel_deferred_active_prefetch(reservation)
                 self._profile["prefetch_late_count"] += 1
                 self._record_prefetch_late(ticket)
@@ -2815,6 +2826,9 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         }
         self._expired_tickets: set[tuple[int, int]] = set()
         self._expert_transfer_ms = self._estimated_representative_transfer_ms()
+        self._ema_alpha = float(getattr(self.config, "dual_queue_segment_time_ema_alpha", 0.2))
+        self._budget_recompute_interval = 8
+        self._budget_recompute_counter = 0
 
     def _segment_indexed_enabled(self) -> bool:
         return True
@@ -2942,14 +2956,17 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             return
         values = self._segment_compute_ms[phase_key]
         previous = values.get(int(segment_id))
-        alpha = float(getattr(self.config, "dual_queue_segment_time_ema_alpha", 0.2))
+        alpha = self._ema_alpha
         values[int(segment_id)] = (
             float(compute_ms)
             if previous is None
             else (1.0 - alpha) * float(previous) + alpha * float(compute_ms)
         )
         if self._calibrated and not self._calibrating:
-            self._recompute_prefetch_budgets()
+            self._budget_recompute_counter += 1
+            if self._budget_recompute_counter >= self._budget_recompute_interval:
+                self._budget_recompute_counter = 0
+                self._recompute_prefetch_budgets()
 
     def _recompute_prefetch_budgets(self) -> tuple[int, int]:
         safety = float(getattr(self.config, "dual_queue_budget_safety_ratio", 0.8))
@@ -2999,8 +3016,8 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             if int(slot_expert) < 0 and not cache.is_active_slot_pending(slot_idx):
                 return slot_idx
 
-        protected = self._round_protected.get(int(layer_idx), set())
-        protected_this_boundary = boundary_protected or set()
+        protected = self._round_protected.get(int(layer_idx), frozenset())
+        protected_this_boundary = boundary_protected or frozenset()
         best: tuple[float, int, int] | None = None
         for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
             if cache.is_active_slot_pending(slot_idx):
@@ -3030,9 +3047,13 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         if self._calibrating:
             return 0
         if source == self.GROUND_TRUTH_SOURCE:
-            index = self.ground_truth_index
+            primary_index = self.ground_truth_index
+            secondary_index = self.draft_predict_index
+            secondary_source = self.DRAFT_SOURCE
         elif source == self.DRAFT_SOURCE:
-            index = self.draft_predict_index
+            primary_index = self.draft_predict_index
+            secondary_index = self.ground_truth_index
+            secondary_source = self.GROUND_TRUTH_SOURCE
         else:
             raise ValueError(f"unsupported dual-queue source: {source}")
 
@@ -3050,15 +3071,36 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         if dispatch_budget <= 0:
             return 0
 
-        inflight_keys = set(self.inflight.keys())
-        ranked = index.ranked_for_range(
+        range_kwargs = dict(
             layer_start=int(target_layer_start),
             layer_end=int(target_layer_end),
             round_id=self._round_id,
             layer_caches=self.layer_caches,
-            inflight_keys=inflight_keys,
-            source=source,
+            inflight_keys=self.inflight,
         )
+        ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
+        for c in primary_index.ranked_for_range(**range_kwargs, source=source):
+            ranked_by_key[(c.layer_idx, c.expert_idx)] = c
+
+        secondary_weight = float(self.config.dual_queue_secondary_index_weight)
+        if secondary_weight > 0.0:
+            for c in secondary_index.ranked_for_range(**range_kwargs, source=secondary_source):
+                key = (c.layer_idx, c.expert_idx)
+                penalized_priority = c.priority * secondary_weight
+                prev = ranked_by_key.get(key)
+                if prev is None or penalized_priority > prev.priority:
+                    ranked_by_key[key] = PrefetchCandidate(
+                        layer_idx=c.layer_idx,
+                        expert_idx=c.expert_idx,
+                        source=secondary_source,
+                        score_sum=c.score_sum,
+                        activation_count=c.activation_count,
+                        first_seen_step=c.first_seen_step,
+                        last_seen_step=c.last_seen_step,
+                        priority=penalized_priority,
+                    )
+
+        ranked = sorted(ranked_by_key.values(), key=lambda c: (-c.priority, c.layer_idx, c.expert_idx))
         submitted = 0
         for candidate in ranked:
             if submitted >= dispatch_budget:
@@ -3074,27 +3116,38 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
             if not weights or "gate_up" not in weights or "down" not in weights:
                 continue
-            reservation = cache.reserve_staging_slot(expert_idx)
+            victim_slot = self._select_dual_queue_victim(
+                cache, layer_idx=layer_idx, source=source,
+            )
+            if victim_slot is None:
+                self._profile["dual_queue_all_slots_protected_count"] += 1
+                continue
+            reservation = cache.reserve_active_slot_for_prefetch_deferred(
+                layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
+            )
             if reservation is None:
                 continue
-            reservation.layer_idx = layer_idx
+            candidate_source = candidate.source
             ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
                 cache=cache,
                 reservation=reservation,
                 weights=weights,
-                source=source,
-                direct_active=False,
+                source=candidate_source,
+                direct_active=True,
             )
             ticket = PrefetchTicket(
                 step_id=int(step_id),
                 layer_idx=layer_idx,
                 expert_idx=expert_idx,
-                source=source,
-                staging_slot_idx=reservation.staging_slot_idx,
-                staging_generation=reservation.generation,
+                source=candidate_source,
+                staging_slot_idx=-1,
+                staging_generation=-1,
                 submit_ts_ms=submit_ts_ms,
                 ready_event=ready_event,
-                direct_active=False,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
                 segment_id=int(target_segment_id),
                 num_bytes=num_bytes,
                 transfer_enqueue_ms=enqueue_ms,
@@ -3103,10 +3156,9 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             self.inflight[key] = ticket
             self._record_prefetch_submitted(ticket)
             submitted += 1
-            inflight_keys.add(key)
             self._profile["prefetch_submit_count"] += 1
-            self._profile["staging_prefetch_submit_count"] += 1
-            self._profile[f"{source}_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile[f"{candidate_source}_submit_count"] += 1
         return submitted
 
     def _reap_expired_tickets(self) -> None:
@@ -3119,14 +3171,25 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
                 continue
             cache = self.layer_caches.get(ticket.layer_idx)
             if cache is not None:
-                cache.cancel_staging_reservation(
-                    StagingReservation(
-                        layer_idx=ticket.layer_idx,
-                        staging_slot_idx=ticket.staging_slot_idx,
-                        expert_idx=ticket.expert_idx,
-                        generation=ticket.staging_generation,
+                if ticket.direct_active:
+                    cache.cancel_deferred_active_prefetch(
+                        ActiveReservation(
+                            layer_idx=ticket.layer_idx,
+                            active_slot_idx=ticket.active_slot_idx,
+                            expert_idx=ticket.expert_idx,
+                            generation=ticket.active_generation,
+                            prev_expert=ticket.active_slot_prev_expert,
+                        )
                     )
-                )
+                else:
+                    cache.cancel_staging_reservation(
+                        StagingReservation(
+                            layer_idx=ticket.layer_idx,
+                            staging_slot_idx=ticket.staging_slot_idx,
+                            expert_idx=ticket.expert_idx,
+                            generation=ticket.staging_generation,
+                        )
+                    )
             self.inflight.pop(key, None)
             self._expired_tickets.discard(key)
             self._profile["dual_queue_expired_transfer_count"] += 1
@@ -3143,70 +3206,10 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             self._profile["dual_queue_round_end_discard_count"] += 1
 
     def publish_segment_ready(self, *, step_id: int, segment_id: int) -> int:
-        self._reap_expired_tickets()
-        published = 0
-        boundary_protected: dict[int, set[int]] = defaultdict(set)
-        for key, ticket in list(self.inflight.items()):
-            if (
-                ticket.direct_active
-                or ticket.source not in {self.DRAFT_SOURCE, self.GROUND_TRUTH_SOURCE}
-                or int(ticket.segment_id) != int(segment_id)
-                or key in self._expired_tickets
-            ):
-                continue
-            if not bool(ticket.ready_event.query()):
-                self._expired_tickets.add(key)
-                self._profile["dual_queue_target_miss_count"] += 1
-                continue
-            cache = self.layer_caches.get(ticket.layer_idx)
-            reservation = StagingReservation(
-                layer_idx=ticket.layer_idx,
-                staging_slot_idx=ticket.staging_slot_idx,
-                expert_idx=ticket.expert_idx,
-                generation=ticket.staging_generation,
-            )
-            if cache is None or not cache.mark_staging_ready(reservation):
-                self.inflight.pop(key, None)
-                self._profile["prefetch_late_count"] += 1
-                self._record_prefetch_late(ticket)
-                continue
-            self._profile["prefetch_completed_count"] += 1
-            self._record_prefetch_completed(ticket)
-            victim_slot = self._select_dual_queue_victim(
-                cache,
-                layer_idx=ticket.layer_idx,
-                source=ticket.source,
-                boundary_protected=boundary_protected[ticket.layer_idx],
-            )
-            if victim_slot is None:
-                cache.cancel_staging_reservation(reservation)
-                self.inflight.pop(key, None)
-                self._profile["dual_queue_all_slots_protected_count"] += 1
-                self._profile["prefetch_late_count"] += 1
-                self._record_prefetch_late(ticket)
-                continue
-            published_item = cache.publish_ready_staging_to_active(
-                reservation=reservation,
-                active_slot_idx=victim_slot,
-                stream=self.publish_stream,
-            )
-            if published_item is None:
-                cache.cancel_staging_reservation(reservation)
-                self.inflight.pop(key, None)
-                self._profile["prefetch_late_count"] += 1
-                self._record_prefetch_late(ticket)
-                continue
-            self._finalize_publish(cache, published_item)
-            self.inflight.pop(key, None)
-            self._recent_published[key] = int(step_id)
-            self._recent_published_source[key] = str(ticket.source)
-            boundary_protected[ticket.layer_idx].add(ticket.expert_idx)
-            published += 1
-            self._profile["publish_count"] += 1
-            self._profile["staging_prefetch_publish_count"] += 1
-            self._profile[f"{ticket.source}_publish_count"] += 1
-            self._record_prefetch_published(ticket)
-        return published
+        return self.publish_direct_active_ready(
+            step_id=step_id,
+            source=None,
+        )
 
     def on_draft_segment_start(
         self,
@@ -3215,27 +3218,7 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         segment_id: int,
         boundaries: list[tuple[int, int]],
     ) -> int:
-        published = self.publish_segment_ready(step_id=step_id, segment_id=segment_id)
-        num_segments = len(boundaries)
-        if num_segments <= 1 or self._calibrating:
-            return published
-        if self.is_first_draft_forward():
-            if segment_id != 0:
-                return published
-            target = 1
-            source = self.GROUND_TRUTH_SOURCE
-        else:
-            target = (int(segment_id) + 1) % num_segments
-            source = self.DRAFT_SOURCE
-        start, end = boundaries[target]
-        return published + self.submit_segment_prefetch(
-            step_id=step_id,
-            target_layer_start=start,
-            target_layer_end=end,
-            target_segment_id=target,
-            source=source,
-            phase="draft",
-        )
+        return self.publish_direct_active_ready(step_id=step_id)
 
     def on_draft_segment_end(
         self,
@@ -3244,29 +3227,7 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         segment_id: int,
         boundaries: list[tuple[int, int]],
     ) -> int:
-        if not self.is_first_draft_forward() or self._calibrating:
-            return 0
-        num_segments = len(boundaries)
-        if num_segments <= 1:
-            return 0
-        if segment_id <= num_segments - 3:
-            target = int(segment_id) + 2
-            source = self.GROUND_TRUTH_SOURCE
-        elif segment_id == num_segments - 2:
-            target = 0
-            source = self.DRAFT_SOURCE
-        else:
-            target = 1
-            source = self.DRAFT_SOURCE
-        start, end = boundaries[target]
-        return self.submit_segment_prefetch(
-            step_id=step_id,
-            target_layer_start=start,
-            target_layer_end=end,
-            target_segment_id=target,
-            source=source,
-            phase="draft",
-        )
+        return 0
 
     def on_verify_segment_start(
         self,
@@ -3275,19 +3236,195 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         segment_id: int,
         boundaries: list[tuple[int, int]],
     ) -> int:
-        published = self.publish_segment_ready(step_id=step_id, segment_id=segment_id)
-        if len(boundaries) <= 1 or self._calibrating:
-            return published
-        target = (int(segment_id) + 1) % len(boundaries)
+        return self.publish_direct_active_ready(step_id=step_id)
+
+    def submit_deferred_draft_segment(
+        self,
+        *,
+        step_id: int,
+        frontier_layer_idx: int,
+        boundaries: list[tuple[int, int]],
+    ) -> int:
+        if self._calibrating:
+            return 0
+        num_segments = len(boundaries)
+        if num_segments <= 1:
+            return 0
+        segment_id = self._segment_id_for_frontier(frontier_layer_idx, boundaries)
+        submitted = 0
+        if self.is_first_draft_forward():
+            if segment_id == 0:
+                target = 1
+                start, end = boundaries[target]
+                submitted += self.submit_segment_prefetch(
+                    step_id=step_id, target_layer_start=start, target_layer_end=end,
+                    target_segment_id=target, source=self.GROUND_TRUTH_SOURCE, phase="draft",
+                )
+            if segment_id <= num_segments - 3:
+                target = segment_id + 2
+                start, end = boundaries[target]
+                submitted += self.submit_segment_prefetch(
+                    step_id=step_id, target_layer_start=start, target_layer_end=end,
+                    target_segment_id=target, source=self.GROUND_TRUTH_SOURCE, phase="draft",
+                )
+            elif segment_id == num_segments - 2:
+                start, end = boundaries[0]
+                submitted += self.submit_segment_prefetch(
+                    step_id=step_id, target_layer_start=start, target_layer_end=end,
+                    target_segment_id=0, source=self.DRAFT_SOURCE, phase="draft",
+                )
+            elif segment_id == num_segments - 1:
+                start, end = boundaries[1]
+                submitted += self.submit_segment_prefetch(
+                    step_id=step_id, target_layer_start=start, target_layer_end=end,
+                    target_segment_id=1, source=self.DRAFT_SOURCE, phase="draft",
+                )
+        else:
+            target = (segment_id + 1) % num_segments
+            start, end = boundaries[target]
+            submitted += self.submit_segment_prefetch(
+                step_id=step_id, target_layer_start=start, target_layer_end=end,
+                target_segment_id=target, source=self.DRAFT_SOURCE, phase="draft",
+            )
+        self._profile["dual_queue_draft_phase_submit_count"] += submitted
+        return submitted
+
+    def submit_deferred_verify_segment(
+        self,
+        *,
+        step_id: int,
+        frontier_layer_idx: int,
+        boundaries: list[tuple[int, int]],
+    ) -> int:
+        if self._calibrating or len(boundaries) <= 1:
+            return 0
+        num_segments = len(boundaries)
+        segment_id = self._segment_id_for_frontier(frontier_layer_idx, boundaries)
+        target = (segment_id + 1) % num_segments
         start, end = boundaries[target]
-        return published + self.submit_segment_prefetch(
-            step_id=step_id,
-            target_layer_start=start,
-            target_layer_end=end,
-            target_segment_id=target,
-            source=self.DRAFT_SOURCE,
-            phase="verify",
+        source = (
+            self.GROUND_TRUTH_SOURCE
+            if segment_id == num_segments - 1
+            else self.DRAFT_SOURCE
         )
+        submitted = self.submit_segment_prefetch(
+            step_id=step_id, target_layer_start=start, target_layer_end=end,
+            target_segment_id=target, source=source, phase="verify",
+        )
+        self._profile["dual_queue_verify_phase_submit_count"] += submitted
+        return submitted
+
+    def submit_verify_segment_prefetch(
+        self,
+        *,
+        step_id: int,
+        target_layer_start: int,
+        target_layer_end: int,
+        target_segment_id: int,
+        visible_budget_ms: float | None = None,
+    ) -> int:
+        """Synchronous verify prefetch merging both draft-predict and ground-truth indices."""
+        if self._calibrating:
+            return 0
+        budget = max(0, int(getattr(self.config, "verify_prefetch_max_per_boundary", 16)))
+        inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
+        dispatch_budget = min(budget, inflight_budget)
+        if dispatch_budget <= 0:
+            return 0
+
+        transfer_budget_ms = float(
+            visible_budget_ms
+            if visible_budget_ms is not None
+            else getattr(self.config, "verify_prefetch_visible_budget_ms", 12.0)
+        )
+
+        range_kwargs = dict(
+            layer_start=int(target_layer_start),
+            layer_end=int(target_layer_end),
+            round_id=self._round_id,
+            layer_caches=self.layer_caches,
+            inflight_keys=self.inflight,
+        )
+
+        ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
+        for c in self.draft_predict_index.ranked_for_range(**range_kwargs, source=self.DRAFT_SOURCE):
+            ranked_by_key[(c.layer_idx, c.expert_idx)] = c
+        for c in self.ground_truth_index.ranked_for_range(**range_kwargs, source=self.GROUND_TRUTH_SOURCE):
+            key = (c.layer_idx, c.expert_idx)
+            prev = ranked_by_key.get(key)
+            if prev is None or c.priority > prev.priority:
+                ranked_by_key[key] = c
+
+        ranked = sorted(ranked_by_key.values(), key=lambda c: (-c.priority, c.layer_idx, c.expert_idx))
+
+        submitted = 0
+        used_transfer_ms = 0.0
+        for candidate in ranked:
+            if submitted >= dispatch_budget:
+                break
+            layer_idx = int(candidate.layer_idx)
+            expert_idx = int(candidate.expert_idx)
+            key = (layer_idx, expert_idx)
+            cache = self.layer_caches.get(layer_idx)
+            if cache is None or key in self.inflight:
+                continue
+            if cache.is_cached_cpu(expert_idx) or cache.is_pending_cpu(expert_idx):
+                continue
+            weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
+            if not weights or "gate_up" not in weights or "down" not in weights:
+                continue
+            transfer_ms = self._estimated_expert_transfer_ms(weights)
+            if isfinite(transfer_ms) and transfer_budget_ms > 0.0 and used_transfer_ms + transfer_ms > transfer_budget_ms:
+                break
+            victim_slot = self._select_dual_queue_victim(
+                cache, layer_idx=layer_idx, source=candidate.source,
+            )
+            if victim_slot is None:
+                self._profile["dual_queue_all_slots_protected_count"] += 1
+                continue
+            reservation = cache.reserve_active_slot_for_prefetch_deferred(
+                layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
+            )
+            if reservation is None:
+                continue
+            ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
+                cache=cache, reservation=reservation, weights=weights,
+                source=candidate.source, direct_active=True,
+            )
+            ticket = PrefetchTicket(
+                step_id=int(step_id),
+                layer_idx=layer_idx,
+                expert_idx=expert_idx,
+                source=candidate.source,
+                staging_slot_idx=-1,
+                staging_generation=-1,
+                submit_ts_ms=submit_ts_ms,
+                ready_event=ready_event,
+                direct_active=True,
+                active_slot_idx=reservation.active_slot_idx,
+                active_generation=reservation.generation,
+                active_slot_prev_expert=int(getattr(reservation, "prev_expert", -1)),
+                segment_id=int(target_segment_id),
+                num_bytes=num_bytes,
+                transfer_enqueue_ms=enqueue_ms,
+                transfer_stream_idx=stream_idx,
+            )
+            self.inflight[key] = ticket
+            self._record_prefetch_submitted(ticket)
+            submitted += 1
+            if isfinite(transfer_ms):
+                used_transfer_ms += transfer_ms
+            self._profile["prefetch_submit_count"] += 1
+            self._profile["direct_active_prefetch_submit_count"] += 1
+            self._profile[f"{candidate.source}_submit_count"] += 1
+        self._profile["dual_queue_verify_phase_submit_count"] += submitted
+        return submitted
+
+    def _segment_id_for_frontier(self, frontier_layer_idx: int, boundaries: list[tuple[int, int]]) -> int:
+        for seg_id, (start, end) in enumerate(boundaries):
+            if start <= frontier_layer_idx < end:
+                return seg_id
+        return len(boundaries) - 1
 
     def complete_verify_round(self, *, step_id: int) -> None:
         # The final verify segment is the last overlap window for segment 0.
@@ -3331,6 +3468,12 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             ),
             "dual_queue_all_slots_protected_count": int(
                 self._profile.get("dual_queue_all_slots_protected_count", 0.0)
+            ),
+            "dual_queue_draft_phase_submit_count": int(
+                self._profile.get("dual_queue_draft_phase_submit_count", 0.0)
+            ),
+            "dual_queue_verify_phase_submit_count": int(
+                self._profile.get("dual_queue_verify_phase_submit_count", 0.0)
             ),
             "dual_queue_draft_predict_size": sum(
                 len(entries) for entries in self.draft_predict_index.entries_by_segment.values()
