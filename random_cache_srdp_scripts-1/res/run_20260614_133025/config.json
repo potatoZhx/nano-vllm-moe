@@ -1,0 +1,23 @@
+{
+  "args": {
+    "data_file": "/data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260614.pt",
+    "output_dir": "/data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_20260614",
+    "batch_size": 512,
+    "epochs": 50,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "val_ratio": 0.1,
+    "log_lambda": 0.25,
+    "seed": 42
+  },
+  "meta": {
+    "num_layers": 48,
+    "top_k": 8,
+    "route_raw_dim": 768,
+    "route_summary_dim": 45,
+    "token_feature_dim": 10,
+    "hidden_dim": 2048,
+    "history_dim": 11,
+    "target": "theoretical_acceptance_alpha=sum(min(p,q))"
+  }
+}
