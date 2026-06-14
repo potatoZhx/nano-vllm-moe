@@ -26,6 +26,7 @@ class SpeculativeEngine:
         self.acceptance_strategy_name = str(strategy_name).strip().lower()
         threshold = getattr(config, "acceptance_threshold", 0.7)
         self.acceptance_strategy = create_acceptance_strategy(strategy_name, threshold=threshold)
+        self.draft_alpha_stop_threshold = float(getattr(config, "draft_alpha_stop_threshold", -1.0))
         self.profile_enabled = getattr(config, "spec_profile", False)
         self._profile = defaultdict(float)
         self._draft_steps_per_step: list[int] = []
@@ -119,6 +120,7 @@ class SpeculativeEngine:
         draft_logits_map = {seq.seq_id: [] for seq in seqs}
         draft_alpha_map = {seq.seq_id: [] for seq in seqs}
         draft_prefetch_state = None
+        draft_steps_actual = 0
         t0 = perf_counter()
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
@@ -145,6 +147,13 @@ class SpeculativeEngine:
                     draft_logits_map[seq.seq_id].append(draft_logits[row_idx])
                 if step_alpha is not None and row_idx < len(step_alpha):
                     draft_alpha_map[seq.seq_id].append(float(step_alpha[row_idx]))
+            draft_steps_actual = step_idx + 1
+
+            if (self.draft_alpha_stop_threshold >= 0
+                    and step_alpha is not None
+                    and all(a < self.draft_alpha_stop_threshold for a in step_alpha)):
+                self._profile["draft_alpha_early_stop_count"] += 1
+                break
 
             # schedule() already reserved the first decode append slot.
             # For multi-draft decoding, reserve the next slot between iterations.
@@ -152,7 +161,7 @@ class SpeculativeEngine:
                 for seq in seqs:
                     self.scheduler.append_draft_kv(seq)
         self._profile["draft_loop_ms"] += (perf_counter() - t0) * 1000.0
-        self._profile["run_draft_calls"] += draft_steps
+        self._profile["run_draft_calls"] += draft_steps_actual
 
         t0 = perf_counter()
         for seq in seqs:
@@ -283,6 +292,7 @@ class SpeculativeEngine:
         step_dt_ms = (perf_counter() - step_t0) * 1000.0
         self._profile["spec_step_ms"] += step_dt_ms
         step_trace["step_ms"] = step_dt_ms
+        step_trace["draft_steps_actual"] = int(draft_steps_actual)
         self._step_traces.append(step_trace)
 
         return final_token_ids

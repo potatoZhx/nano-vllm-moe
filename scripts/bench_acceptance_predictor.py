@@ -18,13 +18,14 @@ Example:
     conda activate nano_moe
     cd /home/linke/nano-vllm-moe
     rm -rf results/acc_predictor_bench
-    python scripts/bench_acceptance_predictor.py \
+    CUDA_VISIBLE_DEVICES=2 python scripts/bench_acceptance_predictor.py \
         --output-dir results/acc_predictor_bench \
         --acceptance-predictor-path random_cache_srdp_scripts-1/res/run_20260614_133025 \
         --gpu-memory-utilization 0.99 \
         --cache-ratios 0.3125 \
         --output-lens 512,4096 \
-        --max-draft-tokens-values 6 \
+        --draft-alpha-stop-threshold 0.89 \
+        --max-draft-tokens-values 10 \
         --segment-sizes 12 \
         --predictor-modes on,off \
         --kt-num-threads 32
@@ -302,6 +303,8 @@ def _command(
         args.acceptance_predictor_path,
         "--acceptance-predictor-step-horizon",
         str(args.acceptance_predictor_step_horizon),
+        "--draft-alpha-stop-threshold",
+        str(args.draft_alpha_stop_threshold),
         # -- predictive segment-indexed prefetch (required for the draft tail graph) --
         "--prefetch-enabled",
         "true",
@@ -632,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predictor-modes", default="on,off")
     parser.add_argument("--acceptance-predictor-path", default=DEFAULT_PREDICTOR_PATH)
     parser.add_argument("--acceptance-predictor-step-horizon", type=int, default=32)
+    parser.add_argument("--draft-alpha-stop-threshold", type=float, default=-1.0)
     parser.add_argument("--output-lens", default="128,512")
     parser.add_argument("--cache-ratios", default="0.25,0.3125,0.50")
     parser.add_argument("--max-draft-tokens-values", default="4,8")
@@ -673,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     parser.add_argument("--verify-cuda-graph-bucket-steps", default="3,5,8,12")
     parser.add_argument("--dist-port-base", type=int, default=30700)
     parser.add_argument("--seed", type=int, default=0)

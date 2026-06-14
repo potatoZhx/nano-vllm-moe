@@ -14,7 +14,7 @@ Example:
     python scripts/bench_dual_queue_prefetch.py \
         --output-dir results/dual_queue_bench_613 \
         --gpu-memory-utilization 0.99 \
-        --cache-ratios 0.3125 \
+        --cache-ratios 0.25 \
         --output-lens 512,4096 \
         --budget-safety-ratio 0.8 \
         --max-draft-tokens-values 6 \

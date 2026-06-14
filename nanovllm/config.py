@@ -122,6 +122,7 @@ class Config:
     acceptance_predictor_enabled: bool = False
     acceptance_predictor_path: str = ""
     acceptance_predictor_step_horizon: int = 32
+    draft_alpha_stop_threshold: float = 0.85
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

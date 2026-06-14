@@ -642,6 +642,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         acceptance_predictor_enabled=args.acceptance_predictor_enabled,
         acceptance_predictor_path=args.acceptance_predictor_path,
         acceptance_predictor_step_horizon=args.acceptance_predictor_step_horizon,
+        draft_alpha_stop_threshold=args.draft_alpha_stop_threshold,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_pin_memory=args.cpu_expert_pin_memory,
         cpu_expert_backend=args.cpu_expert_backend,
@@ -1148,6 +1149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acceptance-predictor-enabled", type=str2bool, default=False)
     p.add_argument("--acceptance-predictor-path", default="")
     p.add_argument("--acceptance-predictor-step-horizon", type=int, default=32)
+    p.add_argument("--draft-alpha-stop-threshold", type=float, default=-1.0)
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=True)
     p.add_argument(

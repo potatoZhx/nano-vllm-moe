@@ -63,7 +63,7 @@ class TestAcceptancePredictorIntegration(unittest.TestCase):
         cls.profile_artifact = os.getenv("NANOVLLM_ACC_PRED_PROFILE_ARTIFACT", "")
         cls.output_len = os.getenv("NANOVLLM_ACC_PRED_OUTPUT_LEN", "16")
         cls.kt_num_threads = os.getenv("NANOVLLM_ACC_PRED_KT_THREADS", "8")
-        cls.gpu_mem = os.getenv("NANOVLLM_ACC_PRED_GPU_MEM", "0.9")
+        cls.gpu_mem = os.getenv("NANOVLLM_ACC_PRED_GPU_MEM", "0.99")
         cls.timeout = int(os.getenv("NANOVLLM_ACC_PRED_TIMEOUT_SEC", "3600"))
 
         cls.tmpdir = tempfile.mkdtemp(prefix="acc_pred_bench_")
