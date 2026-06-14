@@ -218,28 +218,47 @@ class TestDualQueueVictims(unittest.TestCase):
         cache.put_to_slot(1, 1, *_weights().values())
         runtime._round_protected[0].update({0, 1})
 
-        self.assertIsNone(
-            runtime._select_dual_queue_victim(
-                cache,
-                layer_idx=0,
-                source=runtime.DRAFT_SOURCE,
-            )
+        before = int(runtime._profile.get("dual_queue_protection_safety_valve_count", 0))
+        victim = runtime._select_dual_queue_victim(
+            cache,
+            layer_idx=0,
+            source=runtime.DRAFT_SOURCE,
         )
+        after = int(runtime._profile.get("dual_queue_protection_safety_valve_count", 0))
+        self.assertIn(victim, {0, 1})
+        self.assertEqual(after - before, 1)
 
-    def test_ground_truth_source_ignores_draft_protection(self):
+    def test_ground_truth_source_respects_round_protection(self):
         runtime, caches = _runtime(num_layers=1)
         cache = caches[0]
         cache.put_to_slot(0, 0, *_weights().values())
         cache.put_to_slot(1, 1, *_weights().values())
         runtime._round_protected[0].update({0, 1})
 
+        before = int(runtime._profile.get("dual_queue_protection_safety_valve_count", 0))
         victim = runtime._select_dual_queue_victim(
             cache,
             layer_idx=0,
             source=runtime.GROUND_TRUTH_SOURCE,
         )
+        after = int(runtime._profile.get("dual_queue_protection_safety_valve_count", 0))
         self.assertIn(victim, {0, 1})
+        self.assertEqual(after - before, 1)
         self.assertEqual(runtime._round_protected[0], {0, 1})
+
+    def test_round_loaded_protection(self):
+        runtime, caches = _runtime(num_layers=1)
+        cache = caches[0]
+        cache.put_to_slot(0, 0, *_weights().values())
+        cache.put_to_slot(1, 1, *_weights().values())
+        runtime._round_loaded[0].add(0)
+
+        victim = runtime._select_dual_queue_victim(
+            cache,
+            layer_idx=0,
+            source=runtime.DRAFT_SOURCE,
+        )
+        self.assertEqual(victim, 1)
 
 
 class TestDualQueueBestEffort(unittest.TestCase):

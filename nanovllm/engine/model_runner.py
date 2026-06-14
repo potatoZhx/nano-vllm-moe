@@ -2993,7 +2993,7 @@ class ModelRunner:
                 token_capacity=max_bucket,
                 layer_start_idx=int(layer_start),
                 layer_end_idx=int(layer_end),
-                is_last_segment=is_last,
+                is_last_segment=True,
             )
             if prefetch_runtime is not None and not self._dual_queue_prefetch_enabled():
                 next_seg = (seg_idx + 1) % num_segments

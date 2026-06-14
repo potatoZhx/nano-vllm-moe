@@ -2108,6 +2108,10 @@ class PrefetchRuntime:
                         ] += 1
                     elif source == "verify_layer_predict":
                         self._profile["verify_layer_prefetch_consumed_count"] += 1
+                    elif source == "dual_queue_draft_predict":
+                        self._profile["dual_queue_draft_predict_consumed_count"] += 1
+                    elif source == "dual_queue_ground_truth":
+                        self._profile["dual_queue_ground_truth_consumed_count"] += 1
         self._profile["prefetch_consumed_count"] += consumed
 
         stale = []
@@ -2818,6 +2822,7 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
         self._round_active = False
         self._draft_forward_index = -1
         self._round_protected: dict[int, set[int]] = defaultdict(set)
+        self._round_loaded: dict[int, set[int]] = defaultdict(set)
         self._calibrating = False
         self._calibrated = False
         self._segment_compute_ms: dict[str, dict[int, float]] = {
@@ -2856,11 +2861,17 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
     def finish_verify_round(self) -> None:
         self.draft_predict_index.clear()
         self._round_protected.clear()
+        self._round_loaded.clear()
         self._active_draft_iteration_steps.clear()
         self._draft_iteration_open = False
         self._round_active = False
         self._draft_forward_index = -1
         self._profile["dual_queue_round_clear_count"] += 1
+
+    def _record_prefetch_published(self, ticket: PrefetchTicket) -> None:
+        super()._record_prefetch_published(ticket)
+        if ticket.source in (self.DRAFT_SOURCE, self.GROUND_TRUTH_SOURCE):
+            self._round_loaded[int(ticket.layer_idx)].add(int(ticket.expert_idx))
 
     def set_calibrating(self, enabled: bool) -> None:
         self._calibrating = bool(enabled)
@@ -3049,22 +3060,33 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
                 return slot_idx
 
         protected = self._round_protected.get(int(layer_idx), frozenset())
+        round_loaded = self._round_loaded.get(int(layer_idx), frozenset())
         protected_this_boundary = boundary_protected or frozenset()
         best: tuple[float, int, int] | None = None
+        fallback: tuple[float, int, int] | None = None
         for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
             if cache.is_active_slot_pending(slot_idx):
                 continue
             expert_idx = int(slot_expert)
-            if expert_idx in protected_this_boundary:
-                continue
-            if source == self.DRAFT_SOURCE and expert_idx in protected:
-                continue
             score = self.ground_truth_index.priority_for(layer_idx, expert_idx, self._round_id)
             last_access = int(cache.last_access_step[expert_idx]) if expert_idx >= 0 else -1
             candidate = (float(score), last_access, int(slot_idx))
+            if fallback is None or candidate < fallback:
+                fallback = candidate
+            if expert_idx in protected_this_boundary:
+                continue
+            if expert_idx in round_loaded:
+                continue
+            if expert_idx in protected:
+                continue
             if best is None or candidate < best:
                 best = candidate
-        return None if best is None else int(best[2])
+        if best is not None:
+            return int(best[2])
+        if fallback is not None:
+            self._profile["dual_queue_protection_safety_valve_count"] += 1
+            return int(fallback[2])
+        return None
 
     def submit_segment_prefetch(
         self,
@@ -3509,6 +3531,15 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             ),
             "dual_queue_ground_truth_size": sum(
                 len(entries) for entries in self.ground_truth_index.entries_by_segment.values()
+            ),
+            "dual_queue_draft_predict_consumed_count": int(
+                self._profile.get("dual_queue_draft_predict_consumed_count", 0.0)
+            ),
+            "dual_queue_ground_truth_consumed_count": int(
+                self._profile.get("dual_queue_ground_truth_consumed_count", 0.0)
+            ),
+            "dual_queue_protection_safety_valve_count": int(
+                self._profile.get("dual_queue_protection_safety_valve_count", 0.0)
             ),
         }
         if self._verify_segment_budgets:

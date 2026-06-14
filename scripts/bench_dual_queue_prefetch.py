@@ -17,9 +17,10 @@ Example:
         --cache-ratios 0.3125 \
         --output-lens 512,4096 \
         --budget-safety-ratio 0.8 \
-        --max-draft-tokens-values 4 \
+        --max-draft-tokens-values 6 \
         --segment-sizes 12 \
         --runtime-kinds dual_queue,predictive \
+        --secondary-index-weight 0.8 \
         --kt-num-threads 32
 """
 from __future__ import annotations
@@ -236,6 +237,16 @@ def _row_from_raw(
         ),
         "metadata_buffer_reuse_wait_ms": float(
             engine_profile.get("model_prefetch_async_buffer_reuse_wait_ms", 0.0) or 0.0
+        ),
+        "protection_safety_valve_count": int(
+            dual_queue.get("protection_safety_valve_count", 0) or 0
+        ),
+        # -- dual_queue consumed by source --
+        "dual_draft_predict_consumed": int(
+            dual_queue.get("draft_predict_consumed_count", 0) or 0
+        ),
+        "dual_ground_truth_consumed": int(
+            dual_queue.get("ground_truth_consumed_count", 0) or 0
         ),
         # -- predictive-specific breakdown --
         "pred_draft_seg_submit": pred_draft_seg_submit,
@@ -559,7 +570,13 @@ def run_case(
             f"late={row['dual_late_count']} "
             f"target_miss={row['target_miss_count']} "
             f"discard={row['round_end_discard_count']} "
-            f"meta_drop={row['metadata_host_buffer_drop_count']}",
+            f"meta_drop={row['metadata_host_buffer_drop_count']} "
+            f"safety_valve={row['protection_safety_valve_count']}",
+            flush=True,
+        )
+        print(
+            f"  consumed_by_src: draft_predict={row['dual_draft_predict_consumed']} "
+            f"ground_truth={row['dual_ground_truth_consumed']}",
             flush=True,
         )
     return row
