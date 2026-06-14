@@ -236,6 +236,8 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
     position_accepted: Counter[int] = Counter()
     rejection_count = 0
     step_count = 0
+    predicted_alpha_values: list[float] = []
+    predicted_alpha_by_position: dict[int, list[float]] = {}
     for step in traces:
         for seq in step.get("sequences", []):
             d = int(seq.get("drafted_tokens", 0) or 0)
@@ -251,6 +253,10 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
                 position_accepted[position] += 1
             rejection_count += int(bool(seq.get("rejected", False)))
             step_count += 1
+            # Predicted acceptance alpha (one value per draft sub-step).
+            for pos, alpha in enumerate(seq.get("predicted_alpha", []) or [], start=1):
+                predicted_alpha_values.append(float(alpha))
+                predicted_alpha_by_position.setdefault(pos, []).append(float(alpha))
     draft_position_acceptance = []
     for position in sorted(position_drafted):
         drafted_count = int(position_drafted[position])
@@ -263,6 +269,26 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
                 "acceptance_rate": float(accepted_count / drafted_count) if drafted_count else 0.0,
             }
         )
+    predicted_alpha_count = len(predicted_alpha_values)
+    predicted_alpha_avg = (
+        float(sum(predicted_alpha_values) / predicted_alpha_count) if predicted_alpha_count else 0.0
+    )
+    predicted_alpha_position = [
+        {
+            "position": int(pos),
+            "count": len(vals),
+            "predicted_alpha_avg": float(sum(vals) / len(vals)) if vals else 0.0,
+            "measured_acceptance_rate": next(
+                (
+                    row["acceptance_rate"]
+                    for row in draft_position_acceptance
+                    if row["position"] == pos
+                ),
+                0.0,
+            ),
+        }
+        for pos, vals in sorted(predicted_alpha_by_position.items())
+    ]
     return {
         "step_sequence_count": step_count,
         "drafted_tokens_total": drafted,
@@ -273,6 +299,12 @@ def _acceptance_stats(engine_profile: dict[str, Any]) -> dict[str, Any]:
         "accepted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(accepted_dist.items())},
         "drafted_tokens_per_step_frequency": {str(k): int(v) for k, v in sorted(drafted_dist.items())},
         "draft_position_acceptance": draft_position_acceptance,
+        # Acceptance-predictor outputs (present only when the predictor is enabled).
+        "predicted_alpha_count": int(predicted_alpha_count),
+        "predicted_alpha_avg": predicted_alpha_avg,
+        "predicted_alpha_min": float(min(predicted_alpha_values)) if predicted_alpha_count else 0.0,
+        "predicted_alpha_max": float(max(predicted_alpha_values)) if predicted_alpha_count else 0.0,
+        "predicted_alpha_position": predicted_alpha_position,
     }
 
 
@@ -607,6 +639,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         draft_reroute_artifact=args.draft_reroute_artifact,
         acceptance_strategy=args.acceptance_strategy,
         acceptance_threshold=args.acceptance_threshold,
+        acceptance_predictor_enabled=args.acceptance_predictor_enabled,
+        acceptance_predictor_path=args.acceptance_predictor_path,
+        acceptance_predictor_step_horizon=args.acceptance_predictor_step_horizon,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_pin_memory=args.cpu_expert_pin_memory,
         cpu_expert_backend=args.cpu_expert_backend,
@@ -1110,6 +1145,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--acceptance-strategy", default="standard_sampling")
     p.add_argument("--acceptance-threshold", type=float, default=0.7)
+    p.add_argument("--acceptance-predictor-enabled", type=str2bool, default=False)
+    p.add_argument("--acceptance-predictor-path", default="")
+    p.add_argument("--acceptance-predictor-step-horizon", type=int, default=32)
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=True)
     p.add_argument(

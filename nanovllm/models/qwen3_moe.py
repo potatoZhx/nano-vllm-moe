@@ -335,6 +335,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
+        self.draft_feature_recorder = None
         self.gpu_fallback_workspace: GpuFallbackWorkspace | None = None
         self.draft_reroute_policy: DraftReroutePolicy | None = None
 
@@ -470,6 +471,9 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
     ) -> None:
         self.runtime_meta_recorder = recorder
 
+    def set_draft_feature_recorder(self, recorder) -> None:
+        self.draft_feature_recorder = recorder
+
     def set_draft_cpu_graph_mode(self, enabled: bool) -> None:
         self.draft_cpu_graph_mode = bool(enabled)
 
@@ -520,6 +524,16 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                     selected_experts,
                     selected_weights,
                     hidden_states.dtype,
+                )
+            if self.draft_feature_recorder is not None:
+                # Capture-safe per-layer routing for the acceptance predictor:
+                # original (target) vs draft-modified (reroute) top-k experts/weights.
+                self.draft_feature_recorder.record_layer(
+                    self.layer_idx,
+                    selected_experts,
+                    routing_weights,
+                    execution_experts,
+                    execution_weights,
                 )
             graph_safe_cpu = (
                 self.draft_cpu_graph_mode
@@ -1256,6 +1270,19 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_runtime_meta_recorder(recorder)
+
+    def set_draft_feature_recorder(self, recorder) -> int:
+        """Attach the acceptance-predictor feature recorder to every MoE block.
+
+        Returns the number of MoE blocks wired (used to assert the predictor's
+        num_layers matches the model's MoE-layer count).
+        """
+        count = 0
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                layer.mlp.set_draft_feature_recorder(recorder)
+                count += 1
+        return count
 
     def get_and_reset_heterogeneous_profile(self) -> dict[str, float]:
         agg: dict[str, float] = {}

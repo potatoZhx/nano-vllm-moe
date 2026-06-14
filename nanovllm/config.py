@@ -116,6 +116,12 @@ class Config:
     verify_prefetch_min_per_boundary: int = 0
     verify_prefetch_max_per_boundary: int = 16
     perf_profile_level: str = "basic"
+    # On-GPU theoretical-acceptance predictor for the draft path. When enabled, a
+    # lightweight MLP (trained by random_cache_srdp_scripts-1) predicts per-step
+    # acceptance alpha inside the draft segment-graph tail. Off by default.
+    acceptance_predictor_enabled: bool = False
+    acceptance_predictor_path: str = ""
+    acceptance_predictor_step_horizon: int = 32
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -243,6 +249,11 @@ class Config:
         ):
             self.verify_cuda_graph_kt_hybrid = True
             self.prefetch_verify_layer_enabled = False
+
+        assert self.acceptance_predictor_step_horizon >= 1
+        if self.acceptance_predictor_enabled:
+            assert self.inference_mode == "spec", "acceptance predictor requires spec mode"
+            assert self.acceptance_predictor_path, "acceptance_predictor_enabled requires acceptance_predictor_path"
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.prefetch_runtime_kind == "dual_queue":

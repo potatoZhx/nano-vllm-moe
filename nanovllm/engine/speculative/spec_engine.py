@@ -117,6 +117,7 @@ class SpeculativeEngine:
 
         draft_tokens_map = {seq.seq_id: [] for seq in seqs}
         draft_logits_map = {seq.seq_id: [] for seq in seqs}
+        draft_alpha_map = {seq.seq_id: [] for seq in seqs}
         draft_prefetch_state = None
         t0 = perf_counter()
         for step_idx in range(draft_steps):
@@ -124,10 +125,12 @@ class SpeculativeEngine:
             draft_result = self.model_runner.call("run_draft", seqs, return_logits)
             self._profile["run_draft_infer_ms_total"] += (perf_counter() - infer_t0) * 1000.0
             draft_logits = None
+            step_alpha = None
             if isinstance(draft_result, tuple):
                 token_ids = draft_result[0]
                 if len(draft_result) > 1 and isinstance(draft_result[1], dict):
                     draft_prefetch_state = draft_result[1]
+                    step_alpha = draft_prefetch_state.get("acceptance_alpha")
                 elif len(draft_result) > 1 and isinstance(draft_result[1], torch.Tensor):
                     draft_logits = draft_result[1]
                 if len(draft_result) > 2 and isinstance(draft_result[2], torch.Tensor):
@@ -140,6 +143,8 @@ class SpeculativeEngine:
                 draft_tokens_map[seq.seq_id].append(token_id)
                 if draft_logits is not None:
                     draft_logits_map[seq.seq_id].append(draft_logits[row_idx])
+                if step_alpha is not None and row_idx < len(step_alpha):
+                    draft_alpha_map[seq.seq_id].append(float(step_alpha[row_idx]))
 
             # schedule() already reserved the first decode append slot.
             # For multi-draft decoding, reserve the next slot between iterations.
@@ -250,6 +255,9 @@ class SpeculativeEngine:
                     seq_trace["rejected"] = bool(accept_result.get("rejected", keep_after_start < len(draft_tokens)))
                     reject_position = accept_result.get("reject_position")
                     seq_trace["reject_position"] = int(reject_position) if reject_position is not None else None
+                    predicted_alpha = draft_alpha_map.get(seq.seq_id)
+                    if predicted_alpha:
+                        seq_trace["predicted_alpha"] = list(predicted_alpha)
                     break
 
             self.scheduler.accept_draft_kv(seq, keep_after_start)
@@ -267,6 +275,11 @@ class SpeculativeEngine:
             self._profile["draft_tokens_total"] += len(draft_tokens)
 
         self._profile["accept_ms"] += (perf_counter() - t0) * 1000.0
+
+        finished_ids = [int(seq.seq_id) for seq in seqs if seq.status == SequenceStatus.FINISHED]
+        if finished_ids:
+            self.model_runner.call("forget_acceptance_state", finished_ids)
+
         step_dt_ms = (perf_counter() - step_t0) * 1000.0
         self._profile["spec_step_ms"] += step_dt_ms
         step_trace["step_ms"] = step_dt_ms

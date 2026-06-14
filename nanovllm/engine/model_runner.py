@@ -239,6 +239,44 @@ class ModelRunner:
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None
+
+        # On-GPU acceptance predictor for the draft segment-graph path (rank 0 only;
+        # sampling/acceptance happen on rank 0). Off unless explicitly enabled.
+        self._acceptance_extractor = None
+        self._pending_acceptance = False
+        if getattr(config, "acceptance_predictor_enabled", False) and self.rank == 0:
+            from nanovllm.engine.speculative.acceptance_predictor import (
+                DraftAcceptanceFeatureExtractor,
+                load_acceptance_predictor,
+            )
+            device = torch.device("cuda")
+            predictor, pmeta = load_acceptance_predictor(config.acceptance_predictor_path, device)
+            if pmeta.num_layers != int(hf_config.num_hidden_layers):
+                raise ValueError(
+                    f"acceptance predictor num_layers={pmeta.num_layers} != model "
+                    f"num_hidden_layers={hf_config.num_hidden_layers}"
+                )
+            if pmeta.top_k != int(getattr(hf_config, "num_experts_per_tok", -1)):
+                raise ValueError(
+                    f"acceptance predictor top_k={pmeta.top_k} != model "
+                    f"num_experts_per_tok={getattr(hf_config, 'num_experts_per_tok', None)}"
+                )
+            if pmeta.hidden_dim != int(hf_config.hidden_size):
+                raise ValueError(
+                    f"acceptance predictor hidden_dim={pmeta.hidden_dim} != model "
+                    f"hidden_size={hf_config.hidden_size}"
+                )
+            pred_max_bs = min(config.max_num_seqs, getattr(config, "draft_cuda_graph_max_bs", 512))
+            self._acceptance_extractor = DraftAcceptanceFeatureExtractor(
+                predictor,
+                pmeta,
+                max_bs=pred_max_bs,
+                hidden_size=int(hf_config.hidden_size),
+                device=device,
+                step_horizon=int(getattr(config, "acceptance_predictor_step_horizon", 32)),
+            )
+            self._acceptance_extractor.attach(self.model)
+
         self._decode_graph_policy = "standard"
         self.sampler = Sampler()
         self.warmup_model()
@@ -1275,7 +1313,20 @@ class ModelRunner:
             self._profile["draft_graph_replay_count"] += 1
             self._profile["draft_graph_replay_ms"] += replay_ms
             self._profile["draft_segment_graph_replay_ms"] += replay_ms
-        return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+        final_hidden = graph_vars["outputs"][:bs]
+        extractor = getattr(self, "_acceptance_extractor", None)
+        if extractor is not None:
+            tail_graph = getattr(self, "draft_tail_graphs", {}).get(bucket)
+            if tail_graph is not None:
+                # Eager LM head -> eager token_features (stays on GPU) -> replay the
+                # captured tail graph (route/history/predictor) -> alpha_buf/state_out.
+                logits = self.model.compute_logits(final_hidden)
+                extractor.set_token_features_from_logits(logits)
+                tail_graph.replay()
+                self._pending_acceptance = True
+                return logits
+        return self.model.compute_logits(final_hidden)
 
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
         if not getattr(self.config, "draft_cuda_graph_enabled", True):
@@ -1385,6 +1436,12 @@ class ModelRunner:
             return token_ids, logits
         return token_ids
 
+    def forget_acceptance_state(self, seq_ids) -> None:
+        """Drop per-sequence acceptance-predictor history for finished sequences."""
+        extractor = getattr(self, "_acceptance_extractor", None)
+        if extractor is not None and seq_ids:
+            extractor.forget(seq_ids)
+
     def _set_speculative_execution_mode(self, mode: str):
         if hasattr(self.model, "set_speculative_execution_mode"):
             draft_top_c = getattr(self.config, "draft_top_c", 0)
@@ -1454,6 +1511,13 @@ class ModelRunner:
                         tid="main",
                     )
 
+            acceptance_extractor = getattr(self, "_acceptance_extractor", None)
+            if acceptance_extractor is not None:
+                # Stage per-sequence history state into the static input buffer
+                # before the draft forward; the tail graph consumes it on-GPU.
+                self._pending_acceptance = False
+                acceptance_extractor.write_state_in(seqs)
+
             core_run_t0 = perf_counter()
             run_result = self.run(seqs, False, return_logits=return_logits)
             if return_logits and self.rank == 0:
@@ -1461,6 +1525,13 @@ class ModelRunner:
             else:
                 token_ids = run_result
                 draft_logits = None
+
+            acceptance_alpha = None
+            if acceptance_extractor is not None and getattr(self, "_pending_acceptance", False):
+                # Reads alpha + updated history state (one D2H, after the sampler
+                # sync already forced by self.run) and advances host history state.
+                acceptance_alpha = acceptance_extractor.read_outputs(seqs)
+                self._pending_acceptance = False
             core_run_ms = (perf_counter() - core_run_t0) * 1000.0
             if self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
@@ -1500,9 +1571,12 @@ class ModelRunner:
                         )
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
+            prefetch_state = {"prefetch_step_id": step_id}
+            if acceptance_alpha is not None:
+                prefetch_state["acceptance_alpha"] = acceptance_alpha
             if return_logits and self.rank == 0:
-                return token_ids, {"prefetch_step_id": step_id}, draft_logits
-            return token_ids, {"prefetch_step_id": step_id}
+                return token_ids, prefetch_state, draft_logits
+            return token_ids, prefetch_state
         finally:
             self._decode_graph_policy = "standard"
             self._active_draft_prefetch_step_id = -1
@@ -1952,6 +2026,7 @@ class ModelRunner:
         self.draft_segment_graphs = {}
         self.draft_segment_boundaries = {}
         self.draft_segment_graph_vars = {}
+        self.draft_tail_graphs = {}
         self.draft_graph_pool = None
         self.draft_graph_bs = []
 
@@ -2131,6 +2206,22 @@ class ModelRunner:
                 torch.cuda.synchronize()
                 if hasattr(self.model, "check_draft_cpu_graph_errors"):
                     self.model.check_draft_cpu_graph_errors()
+                # Acceptance-predictor tail graph: LM head stays eager, but the
+                # route/token/history feature math + predictor MLP are captured.
+                # The per-layer routing buffers were just filled by the (captured)
+                # segment forward above, so they hold valid contents to record over.
+                extractor = getattr(self, "_acceptance_extractor", None)
+                if extractor is not None:
+                    final_hidden = segment_outputs[-1][:bs]
+                    logits = self.model.compute_logits(final_hidden)
+                    extractor.set_token_features_from_logits(logits)
+                    extractor.run_predictor(bs, final_hidden)  # eager warmup
+                    torch.cuda.synchronize()
+                    tail_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(tail_graph, self.draft_graph_pool):
+                        extractor.run_predictor(bs, final_hidden)
+                    self.draft_tail_graphs[bs] = tail_graph
+                    torch.cuda.synchronize()
                 if runtime_meta_recorder is not None:
                     runtime_meta_recorder.reset()
                 reset_context()
