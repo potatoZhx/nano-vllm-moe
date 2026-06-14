@@ -20,24 +20,16 @@ Experiment:
   where d = 1..k.
 
 Examples:
-  python test_moe_segment_history_overlap.py \
-      --model_name /workspace/wyt/ktransformers1/Qwen--Qwen3-30B-A3B-Base \
-      --segment_size 3 --target_segment 64 --history_k 10 \
-      --load_in_4bit --output segment_history_overlap.json
-
-  python test_moe_segment_history_overlap.py \
-      --segment_size 3 --target_segments 32 64 128 --history_k 10
-
-CUDA_VISIBLE_DEVICES=2 python test_moe_segment_history_overlap.py \
+  python test_moe_segment_history_overlap_with_text.py \
   --prompts_file long_reasoning_prompts_en.json \
   --model_name /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
   --segment_size 3 \
-  --target_segments 64 \
-  --history_k 50 \
+  --target_segments 8 16 32 64 128 256 512 1024 1536 2048 3072 4096 \
+  --history_k 3 \
   --dtype bfloat16 \
-  --output segment_history_overlap_results_history_k50.json
-
-  --target_segments 16 32 64 128 256 512 1024 2048 4096 8092
+  --save_generated_text \
+  --generated_text_max_chars 50000 \
+  --output segment_history_overlap_with_text_n.json
 
 Requirements:
   pip install torch transformers accelerate bitsandbytes numpy
@@ -110,6 +102,22 @@ def parse_args():
     )
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--disable_thinking", action="store_true")
+    p.add_argument(
+        "--ignore_eos",
+        action="store_true",
+        help="Continue decoding even if EOS is produced. Useful for fixed-length routing measurements, but text may become degenerate."
+    )
+    p.add_argument(
+        "--save_generated_text",
+        action="store_true",
+        help="Save generated text into the result JSON for repetition/debug inspection."
+    )
+    p.add_argument(
+        "--generated_text_max_chars",
+        type=int,
+        default=20000,
+        help="Maximum generated-text characters to save per prompt when --save_generated_text is enabled. Use -1 for full text."
+    )
     p.add_argument("--output", type=str, default="segment_history_overlap_results.json")
     return p.parse_args()
 
@@ -220,6 +228,57 @@ def build_segment_unions(expert_records: list[set[int]], segment_size: int) -> l
             union_set |= token_experts
         segment_sets.append(union_set)
     return segment_sets
+
+
+def compute_generation_repetition_diagnostics(token_ids: list[int]) -> dict[str, Any]:
+    """Lightweight diagnostics to help identify degenerate/repetitive long generations."""
+    out: dict[str, Any] = {
+        "num_generated_token_ids": len(token_ids),
+    }
+    if not token_ids:
+        out.update({
+            "unique_token_ratio": 0.0,
+            "last_128_unique_token_ratio": 0.0,
+            "last_512_unique_token_ratio": 0.0,
+            "max_consecutive_same_token_run": 0,
+        })
+        return out
+
+    out["unique_token_ratio"] = round(len(set(token_ids)) / len(token_ids), 6)
+
+    for window in (128, 512, 2048):
+        tail = token_ids[-window:]
+        out[f"last_{window}_unique_token_ratio"] = round(len(set(tail)) / len(tail), 6)
+
+    max_run = 1
+    cur_run = 1
+    for i in range(1, len(token_ids)):
+        if token_ids[i] == token_ids[i - 1]:
+            cur_run += 1
+            max_run = max(max_run, cur_run)
+        else:
+            cur_run = 1
+    out["max_consecutive_same_token_run"] = max_run
+
+    # Repeated n-gram fraction over token ids. High values in the tail are a useful warning.
+    for n in (2, 3, 4, 8, 16):
+        total = max(0, len(token_ids) - n + 1)
+        if total == 0:
+            out[f"repeated_{n}gram_fraction"] = 0.0
+            out[f"last_512_repeated_{n}gram_fraction"] = 0.0
+            continue
+        grams = [tuple(token_ids[i:i+n]) for i in range(total)]
+        out[f"repeated_{n}gram_fraction"] = round(1.0 - len(set(grams)) / total, 6)
+
+        tail = token_ids[-512:]
+        tail_total = max(0, len(tail) - n + 1)
+        if tail_total == 0:
+            out[f"last_512_repeated_{n}gram_fraction"] = 0.0
+        else:
+            tail_grams = [tuple(tail[i:i+n]) for i in range(tail_total)]
+            out[f"last_512_repeated_{n}gram_fraction"] = round(1.0 - len(set(tail_grams)) / tail_total, 6)
+
+    return out
 
 
 def compute_target_history_metrics(
@@ -350,7 +409,8 @@ def decode_and_track(
     total_decode_tokens: int,
     temperature: float = 0.0,
     disable_thinking: bool = False,
-) -> str:
+    ignore_eos: bool = False,
+) -> dict[str, Any]:
     prompt_text = prompt + " /no_think" if disable_thinking else prompt
 
     try:
@@ -378,8 +438,9 @@ def decode_and_track(
         probs = F.softmax(outputs.logits[:, -1, :] / temperature, dim=-1)
         next_token_id = torch.multinomial(probs, num_samples=1)
 
-    generated_ids = []
+    generated_ids: list[int] = []
     eos_token_id = tokenizer.eos_token_id
+    stopped_by_eos = False
 
     # Decode: track exactly one router decision per generated decode token.
     tracker.start()
@@ -395,13 +456,26 @@ def decode_and_track(
             probs = F.softmax(outputs.logits[:, -1, :] / temperature, dim=-1)
             next_token_id = torch.multinomial(probs, num_samples=1)
 
-        if eos_token_id is not None and int(next_token_id.item()) == eos_token_id:
+        if (
+            eos_token_id is not None
+            and int(next_token_id.item()) == eos_token_id
+            and not ignore_eos
+        ):
             # Continue is sometimes useful for fixed-length measurements, but by default
             # stop to avoid routing on padding/degenerate EOS continuation.
+            stopped_by_eos = True
             break
 
     tracker.stop()
-    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return {
+        "generated_text": generated_text,
+        "generated_token_ids": generated_ids,
+        "num_generated_token_ids": len(generated_ids),
+        "stopped_by_eos": stopped_by_eos,
+        "eos_token_id": eos_token_id,
+        "repetition_diagnostics": compute_generation_repetition_diagnostics(generated_ids),
+    }
 
 
 def run_analysis(args):
@@ -466,6 +540,9 @@ def run_analysis(args):
             "total_decode_tokens": total_decode_tokens,
             "num_prompts": len(prompts),
             "temperature": args.temperature,
+            "ignore_eos": args.ignore_eos,
+            "save_generated_text": args.save_generated_text,
+            "generated_text_max_chars": args.generated_text_max_chars,
             "metric_definitions": {
                 "hit_ratio": "|S_target ∩ S_previous| / |S_target|",
                 "reverse_hit_ratio": "|S_target ∩ S_previous| / |S_previous|",
@@ -493,7 +570,7 @@ def run_analysis(args):
 
             tracker.clear()
             t0 = time.time()
-            generated_text = decode_and_track(
+            generation_info = decode_and_track(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
@@ -501,16 +578,37 @@ def run_analysis(args):
                 total_decode_tokens=total_decode_tokens,
                 temperature=args.temperature,
                 disable_thinking=args.disable_thinking,
+                ignore_eos=args.ignore_eos,
             )
+            generated_text = generation_info["generated_text"]
             elapsed = time.time() - t0
             actual_tokens = len(next(iter(tracker.records.values()))) if tracker.records else 0
             actual_segments = actual_tokens // args.segment_size
             print(f"  Decoded/tracked {actual_tokens} tokens = {actual_segments} full segments in {elapsed:.1f}s")
 
+            text_limit = args.generated_text_max_chars
+            if args.save_generated_text:
+                if text_limit is None or text_limit < 0:
+                    saved_generated_text = generated_text
+                    generated_text_truncated = False
+                else:
+                    saved_generated_text = generated_text[:text_limit]
+                    generated_text_truncated = len(generated_text) > text_limit
+            else:
+                saved_generated_text = None
+                generated_text_truncated = False
+
             prompt_result: dict[str, Any] = {
                 "prompt_index": pi,
                 "prompt": prompt,
-                "generated_text": generated_text,
+                "generated_preview": generated_text[:500],
+                "generated_text": saved_generated_text,
+                "generated_text_saved": bool(args.save_generated_text),
+                "generated_text_truncated": generated_text_truncated,
+                "generated_text_num_chars": len(generated_text),
+                "generation_stopped_by_eos": generation_info["stopped_by_eos"],
+                "generation_eos_token_id": generation_info["eos_token_id"],
+                "generation_repetition_diagnostics": generation_info["repetition_diagnostics"],
                 "tokens_tracked": actual_tokens,
                 "segments_available": actual_segments,
                 "time_seconds": round(elapsed, 2),

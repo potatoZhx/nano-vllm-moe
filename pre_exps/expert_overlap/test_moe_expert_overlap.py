@@ -25,6 +25,15 @@ Usage:
   python test_moe_expert_overlap.py --segment_lengths 256 --num_segments 4
   python test_moe_expert_overlap.py --load_in_4bit                    # 4-bit (~15GB)
   python test_moe_expert_overlap.py --load_in_8bit                    # 8-bit (~30GB)
+  python test_moe_expert_overlap.py \
+      --intermediate_file ../exp_and_figs/unique/results_routing_trace.pt
+
+When --intermediate_file is omitted, routing data is collected once and saved
+next to --output as "<output-stem>_routing_trace.pt". The file uses the same
+moe_routing_trace v1 format as
+test_moe_segment_unique_expert_counts_optimized.py.
+Each completed prompt is atomically checkpointed. Rerunning the same command
+continues from the first unfinished prompt.
 
 Requirements:
   pip install torch transformers accelerate bitsandbytes numpy
@@ -36,6 +45,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -160,7 +170,124 @@ def parse_args():
         "--disable_thinking", action="store_true",
         help="Add /no_think tag to disable Qwen3 thinking mode"
     )
+    p.add_argument(
+        "--intermediate_file", type=str, default=None,
+        help=(
+            "Existing moe_routing_trace v1 .pt file. When provided, skip "
+            "model loading/inference and compute overlap metrics from it."
+        )
+    )
     return p.parse_args()
+
+
+def default_intermediate_path(output: str) -> Path:
+    output_path = Path(output)
+    stem = output_path.stem if output_path.suffix else output_path.name
+    return output_path.with_name(f"{stem}_routing_trace.pt")
+
+
+def save_routing_checkpoint(
+    routing_data: dict[str, Any],
+    intermediate_path: Path,
+) -> None:
+    """Atomically replace the trace after appending one completed prompt."""
+    intermediate_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = intermediate_path.with_name(
+        f".{intermediate_path.name}.tmp-{os.getpid()}"
+    )
+    try:
+        torch.save(routing_data, temporary_path)
+        os.replace(temporary_path, intermediate_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def load_routing_data(intermediate_path: Path) -> dict[str, Any]:
+    if not intermediate_path.is_file():
+        raise FileNotFoundError(
+            f"Intermediate routing file does not exist: {intermediate_path}"
+        )
+    try:
+        data = torch.load(
+            intermediate_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError:
+        data = torch.load(intermediate_path, map_location="cpu")
+
+    if not isinstance(data, dict):
+        raise ValueError("Intermediate file must contain a dictionary")
+    if data.get("format") != "moe_routing_trace":
+        raise ValueError(
+            "Unsupported intermediate file: missing moe_routing_trace format"
+        )
+    if data.get("format_version") != 1:
+        raise ValueError(
+            "Unsupported intermediate format version: "
+            f"{data.get('format_version')!r}"
+        )
+    if "collection_config" not in data or "per_prompt" not in data:
+        raise ValueError(
+            "Intermediate file is missing collection_config or per_prompt"
+        )
+    return data
+
+
+def validate_resume_data(
+    routing_data: dict[str, Any],
+    args,
+    prompts: list[str],
+    total_decode: int,
+) -> None:
+    config = routing_data["collection_config"]
+    expected_quantization = (
+        "4bit" if args.load_in_4bit
+        else "8bit" if args.load_in_8bit
+        else None
+    )
+    expected_dtype = None if expected_quantization else args.dtype
+    expected = {
+        "model_name": args.model_name,
+        "max_decode_tokens_requested": total_decode,
+        "dtype": expected_dtype,
+        "quantization": expected_quantization,
+        "temperature": args.temperature,
+        "disable_thinking": args.disable_thinking,
+    }
+    mismatches = {
+        key: (config.get(key), value)
+        for key, value in expected.items()
+        if config.get(key) != value
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: file={actual!r}, requested={requested!r}"
+            for key, (actual, requested) in mismatches.items()
+        )
+        raise ValueError(
+            "Existing routing trace is incompatible with this collection "
+            f"request ({details}). Use a different output path or remove "
+            "the old trace."
+        )
+
+    completed = routing_data["per_prompt"]
+    if len(completed) > len(prompts):
+        raise ValueError(
+            "Existing routing trace contains more prompts than requested"
+        )
+    for expected_idx, prompt_data in enumerate(completed):
+        prompt_idx = int(prompt_data.get("prompt_index", -1))
+        if prompt_idx != expected_idx:
+            raise ValueError(
+                "Existing routing trace prompt indices must be contiguous "
+                f"from zero; expected {expected_idx}, got {prompt_idx}"
+            )
+        if prompt_data.get("prompt") != prompts[expected_idx]:
+            raise ValueError(
+                f"Existing routing trace prompt {expected_idx} does not "
+                "match the current prompt list"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -195,12 +322,31 @@ class ExpertTracker:
         def hook_fn(module, inp, output):
             if not tracker.tracking:
                 return
-            # output = (router_logits, router_scores, router_indices)
-            # router_indices shape: (seq_len, top_k)
-            router_indices = output[2]
-            # During decode w/ KV cache, seq_len == 1; take last token
-            experts = router_indices[-1].cpu().tolist()
-            tracker.records[layer_idx].append(set(experts))
+            if isinstance(output, (tuple, list)) and len(output) >= 3:
+                router_indices = output[2]
+                if router_indices.dim() == 3:
+                    selected = router_indices.reshape(
+                        -1, router_indices.size(-1)
+                    )[-1]
+                elif router_indices.dim() == 2:
+                    selected = router_indices[-1]
+                else:
+                    selected = router_indices.reshape(-1)[-tracker.top_k:]
+            else:
+                logits = (
+                    output[0]
+                    if isinstance(output, (tuple, list))
+                    else output
+                )
+                if not isinstance(logits, torch.Tensor):
+                    return
+                if logits.dim() == 3:
+                    logits = logits.reshape(-1, logits.size(-1))
+                selected = torch.topk(
+                    logits, k=tracker.top_k, dim=-1
+                ).indices[-1]
+            experts = selected.detach().cpu().tolist()
+            tracker.records[layer_idx].append(set(int(x) for x in experts))
 
         return hook_fn
 
@@ -217,8 +363,8 @@ class ExpertTracker:
                 logits = logits.view(-1, logits.size(-1))
             # top-k on raw logits (monotonic ↔ softmax, same indices)
             _, selected = torch.topk(logits, k=tracker.top_k, dim=-1)
-            experts = selected[-1].cpu().tolist()
-            tracker.records[layer_idx].append(set(experts))
+            experts = selected[-1].detach().cpu().tolist()
+            tracker.records[layer_idx].append(set(int(x) for x in experts))
 
         return hook_fn
 
@@ -265,6 +411,8 @@ class ExpertTracker:
             self._hooks.append(h)
             moe_layer_indices.append(idx)
 
+        if not moe_layer_indices:
+            raise RuntimeError("No MoE gate/router modules were found.")
         return moe_layer_indices
 
     # ---- control ----
@@ -461,12 +609,13 @@ def decode_and_track(
     total_decode_tokens: int,
     temperature: float = 0.0,
     disable_thinking: bool = False,
-) -> str:
+) -> dict[str, Any]:
     """
     Run autoregressive decoding with KV cache, tracking expert activations
     for each generated token.
 
-    Returns the generated text.
+    Returns generated text and token ids. Each returned token id corresponds
+    to exactly one recorded routing row per MoE layer.
     """
     # Format prompt for chat-style models
     if disable_thinking:
@@ -502,13 +651,16 @@ def decode_and_track(
         probs = F.softmax(outputs.logits[:, -1, :] / temperature, dim=-1)
         next_token_id = torch.multinomial(probs, num_samples=1)
 
-    generated_ids = [next_token_id.item()]
+    generated_ids: list[int] = []
 
     # === Decode with tracking ===
     tracker.start()
     eos_token_id = tokenizer.eos_token_id
 
-    for step in range(total_decode_tokens):
+    for _ in range(total_decode_tokens):
+        routed_token_id = int(next_token_id.item())
+        generated_ids.append(routed_token_id)
+
         outputs = model(
             next_token_id,
             past_key_values=past_key_values,
@@ -522,55 +674,93 @@ def decode_and_track(
             probs = F.softmax(outputs.logits[:, -1, :] / temperature, dim=-1)
             next_token_id = torch.multinomial(probs, num_samples=1)
 
-        token_id = next_token_id.item()
-        generated_ids.append(token_id)
-
-        if token_id == eos_token_id:
+        if eos_token_id is not None and routed_token_id == eos_token_id:
             break
 
     tracker.stop()
 
-    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return generated_text
+    return {
+        "generated_text": tokenizer.decode(
+            generated_ids, skip_special_tokens=True
+        ),
+        "generated_token_ids": generated_ids,
+    }
 
 
 # ---------------------------------------------------------------------------
 # 6. Main Analysis Pipeline
 # ---------------------------------------------------------------------------
 
-def run_analysis(args):
-    # --- Load prompts ---
+def load_prompts(args) -> list[str]:
     if args.prompts_file:
-        with open(args.prompts_file, "r") as f:
+        with open(args.prompts_file, "r", encoding="utf-8") as f:
             prompts = json.load(f)
-        assert isinstance(prompts, list), "prompts_file must contain a JSON list of strings"
+        if not isinstance(prompts, list) or not all(
+            isinstance(prompt, str) for prompt in prompts
+        ):
+            raise ValueError(
+                "prompts_file must contain a JSON list of strings"
+            )
     else:
         prompts = DEFAULT_PROMPTS
 
     if args.num_prompts is not None:
         prompts = prompts[: args.num_prompts]
+    if not prompts:
+        raise ValueError("No prompts to run")
+    return prompts
 
-    segment_lengths = sorted(set(args.segment_lengths))
-    assert all(n > 0 for n in segment_lengths), "All segment lengths must be > 0"
 
-    max_seg_len = max(segment_lengths)
-    total_decode = max_seg_len * args.num_segments
+def expert_sets_to_tensor(expert_records: list[set[int]]) -> torch.Tensor:
+    if not expert_records:
+        return torch.empty((0, 0), dtype=torch.int32)
+    widths = {len(experts) for experts in expert_records}
+    if len(widths) != 1:
+        raise ValueError(
+            f"Inconsistent routed-expert widths in one layer: {sorted(widths)}"
+        )
+    return torch.tensor(
+        [
+            sorted(int(expert) for expert in experts)
+            for experts in expert_records
+        ],
+        dtype=torch.int32,
+    )
+
+
+def collect_routing_data(
+    args,
+    intermediate_path: Path,
+    total_decode: int,
+) -> dict[str, Any]:
+    prompts = load_prompts(args)
+    routing_data: dict[str, Any] | None = None
+    completed_prompts = 0
+    if intermediate_path.is_file():
+        routing_data = load_routing_data(intermediate_path)
+        validate_resume_data(
+            routing_data=routing_data,
+            args=args,
+            prompts=prompts,
+            total_decode=total_decode,
+        )
+        completed_prompts = len(routing_data["per_prompt"])
 
     print("=" * 70)
-    print("  MoE Expert Activation Overlap Analyzer")
+    print("  MoE Routing Data Collection")
     print("=" * 70)
-    print(f"  Model           : {args.model_name}")
-    print(f"  Segment lengths : {segment_lengths}")
-    print(f"  Num segments    : {args.num_segments} (for max seg_len={max_seg_len})")
-    print(f"  Decode tokens   : {total_decode} per prompt")
-    print(f"  Num prompts     : {len(prompts)}")
-    print(f"  Temperature     : {args.temperature}")
+    print(f"  Model         : {args.model_name}")
+    print(f"  Decode tokens : {total_decode} per prompt")
+    print(f"  Num prompts   : {len(prompts)}")
+    print(f"  Intermediate  : {intermediate_path}")
+    print(f"  Completed     : {completed_prompts}/{len(prompts)} prompts")
     print("=" * 70)
 
-    # --- Load model ---
+    if completed_prompts == len(prompts):
+        print("[*] Routing trace is already complete; skipping inference.")
+        return routing_data
+
     model, tokenizer = load_model_and_tokenizer(args)
-
-    # --- Read config ---
     config = model.config
     top_k = getattr(config, "num_experts_per_tok", None)
     if top_k is None:
@@ -579,18 +769,198 @@ def run_analysis(args):
     if num_experts is None:
         num_experts = getattr(config, "num_local_experts", 128)
 
-    print(f"\n[*] MoE config: {num_experts} experts, top-{top_k} routing")
-
-    # --- Set up tracker ---
-    tracker = ExpertTracker(top_k=top_k)
+    tracker = ExpertTracker(top_k=int(top_k))
     moe_layers = tracker.register(model)
-    print(f"[*] Registered hooks on {len(moe_layers)} MoE layers: "
-          f"[{moe_layers[0]}..{moe_layers[-1]}]")
+    print(f"[*] MoE config: {num_experts} experts, top-{top_k} routing")
+    print(
+        f"[*] Registered hooks on {len(moe_layers)} MoE layers: "
+        f"[{moe_layers[0]}..{moe_layers[-1]}]"
+    )
+
+    if routing_data is None:
+        routing_data = {
+            "format": "moe_routing_trace",
+            "format_version": 1,
+            "collection_config": {
+                "model_name": args.model_name,
+                "max_decode_tokens_requested": total_decode,
+                "dtype": (
+                    None if (args.load_in_4bit or args.load_in_8bit)
+                    else args.dtype
+                ),
+                "quantization": (
+                    "4bit" if args.load_in_4bit
+                    else "8bit" if args.load_in_8bit
+                    else None
+                ),
+                "temperature": args.temperature,
+                "disable_thinking": args.disable_thinking,
+                "num_experts": num_experts,
+                "top_k": int(top_k),
+                "moe_layer_indices": moe_layers,
+                "indexing": (
+                    "routing rows are 0-based decoded-token positions"
+                ),
+            },
+            "per_prompt": [],
+        }
+    else:
+        saved_config = routing_data["collection_config"]
+        if (
+            int(saved_config["top_k"]) != int(top_k)
+            or [int(idx) for idx in saved_config["moe_layer_indices"]]
+            != moe_layers
+        ):
+            raise ValueError(
+                "Existing routing trace MoE metadata does not match the "
+                "loaded model"
+            )
+
+    try:
+        for prompt_idx in range(completed_prompts, len(prompts)):
+            prompt = prompts[prompt_idx]
+            prompt_short = prompt[:60].replace("\n", "\\n")
+            if len(prompt) > 60:
+                prompt_short += "..."
+            print(
+                f"\nPrompt {prompt_idx + 1}/{len(prompts)}: "
+                f"\"{prompt_short}\""
+            )
+
+            tracker.clear()
+            started = time.time()
+            decode_info = decode_and_track(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                tracker=tracker,
+                total_decode_tokens=total_decode,
+                temperature=args.temperature,
+                disable_thinking=args.disable_thinking,
+            )
+            elapsed = time.time() - started
+            decoded_per_layer = [
+                len(tracker.records[layer_idx])
+                for layer_idx in moe_layers
+            ]
+            actual_decoded = min(decoded_per_layer) if decoded_per_layer else 0
+            routed_experts = {
+                str(layer_idx): expert_sets_to_tensor(
+                    tracker.records[layer_idx]
+                )
+                for layer_idx in moe_layers
+            }
+            routing_data["per_prompt"].append(
+                {
+                    "prompt_index": prompt_idx,
+                    "prompt": prompt,
+                    "tokens_decoded": actual_decoded,
+                    "time_seconds": round(elapsed, 3),
+                    "generated_text_preview": decode_info[
+                        "generated_text"
+                    ][:500],
+                    "generated_token_ids": torch.tensor(
+                        decode_info["generated_token_ids"],
+                        dtype=torch.int64,
+                    ),
+                    "routed_experts": routed_experts,
+                }
+            )
+            save_routing_checkpoint(routing_data, intermediate_path)
+            rate = actual_decoded / elapsed if elapsed > 0 else 0.0
+            print(
+                f"  Decoded/routed {actual_decoded} tokens in "
+                f"{elapsed:.1f}s ({rate:.1f} tok/s); checkpointed "
+                f"{prompt_idx + 1}/{len(prompts)} prompts"
+            )
+    finally:
+        tracker.remove_hooks()
+
+    print(f"\n[*] Routing data complete: {intermediate_path}")
+    return routing_data
+
+
+def tensor_to_expert_records(
+    expert_rows: torch.Tensor,
+    token_limit: int,
+) -> list[set[int]]:
+    if not isinstance(expert_rows, torch.Tensor):
+        raise ValueError("routed_experts entries must be torch tensors")
+    if expert_rows.dim() != 2:
+        raise ValueError(
+            "routed_experts tensors must have shape "
+            "(decoded_tokens, top_k)"
+        )
+    return [
+        set(int(expert) for expert in row.tolist())
+        for row in expert_rows[:token_limit]
+    ]
+
+
+def run_analysis(args):
+    segment_lengths = sorted(set(args.segment_lengths))
+    if not segment_lengths or any(n <= 0 for n in segment_lengths):
+        raise ValueError("All segment lengths must be > 0")
+    if args.num_segments <= 0:
+        raise ValueError("num_segments must be > 0")
+
+    max_seg_len = max(segment_lengths)
+    total_decode = max_seg_len * args.num_segments
+
+    if args.intermediate_file:
+        intermediate_path = Path(args.intermediate_file)
+        print(
+            "[*] Post-processing only; reading intermediate file: "
+            f"{intermediate_path}"
+        )
+        routing_data = load_routing_data(intermediate_path)
+    else:
+        intermediate_path = default_intermediate_path(args.output)
+        routing_data = collect_routing_data(
+            args=args,
+            intermediate_path=intermediate_path,
+            total_decode=total_decode,
+        )
+        routing_data = load_routing_data(intermediate_path)
+
+    collection_config = routing_data["collection_config"]
+    try:
+        moe_layers = [
+            int(layer_idx)
+            for layer_idx in collection_config["moe_layer_indices"]
+        ]
+        top_k = int(collection_config["top_k"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Intermediate file has invalid MoE collection metadata"
+        ) from exc
+    if not moe_layers:
+        raise ValueError("Intermediate file contains no MoE layer indices")
+
+    prompt_data_list = routing_data["per_prompt"]
+    if args.num_prompts is not None:
+        prompt_data_list = prompt_data_list[: args.num_prompts]
+    if not prompt_data_list:
+        raise ValueError("Intermediate file contains no prompts to analyze")
+
+    num_experts = collection_config.get("num_experts")
+    model_name = collection_config.get("model_name", args.model_name)
+
+    print("=" * 70)
+    print("  MoE Expert Activation Overlap Analyzer")
+    print("=" * 70)
+    print(f"  Model           : {model_name}")
+    print(f"  Segment lengths : {segment_lengths}")
+    print(f"  Num segments    : {args.num_segments} (for max seg_len={max_seg_len})")
+    print(f"  Routed tokens   : first {total_decode} per prompt")
+    print(f"  Num prompts     : {len(prompt_data_list)}")
+    print(f"  Routing trace   : {intermediate_path}")
+    print("=" * 70)
 
     # --- Run experiments ---
     all_results: dict[str, Any] = {
         "config": {
-            "model": args.model_name,
+            "model": model_name,
             "num_experts": num_experts,
             "top_k": top_k,
             "num_moe_layers": len(moe_layers),
@@ -598,8 +968,9 @@ def run_analysis(args):
             "segment_lengths": segment_lengths,
             "num_segments": args.num_segments,
             "total_decode_tokens": total_decode,
-            "temperature": args.temperature,
-            "num_prompts": len(prompts),
+            "temperature": collection_config.get("temperature"),
+            "num_prompts": len(prompt_data_list),
+            "routing_trace": str(intermediate_path),
         },
         "per_prompt": [],
     }
@@ -613,26 +984,50 @@ def run_analysis(args):
     }
     global_token_persist: dict[int, list[float]] = defaultdict(list)
 
-    for pi, prompt in enumerate(prompts):
+    for pi, prompt_data in enumerate(prompt_data_list):
+        prompt = prompt_data["prompt"]
         prompt_short = prompt[:60].replace("\n", "\\n") + ("..." if len(prompt) > 60 else "")
         print(f"\n{'─'*70}")
-        print(f"  Prompt {pi+1}/{len(prompts)}: \"{prompt_short}\"")
+        print(f"  Prompt {pi+1}/{len(prompt_data_list)}: \"{prompt_short}\"")
         print(f"{'─'*70}")
 
-        tracker.clear()
-        t0 = time.time()
-
-        generated_text = decode_and_track(
-            model, tokenizer, prompt, tracker,
-            total_decode_tokens=total_decode,
-            temperature=args.temperature,
-            disable_thinking=args.disable_thinking,
+        routed_experts = prompt_data.get("routed_experts", {})
+        missing = [
+            layer_idx for layer_idx in moe_layers
+            if str(layer_idx) not in routed_experts
+        ]
+        if missing:
+            raise ValueError(
+                f"Prompt {pi} is missing routed experts for layers: {missing}"
+            )
+        available_per_layer = []
+        for layer_idx in moe_layers:
+            expert_rows = routed_experts[str(layer_idx)]
+            if not isinstance(expert_rows, torch.Tensor):
+                raise ValueError(
+                    f"Prompt {pi}, layer {layer_idx}: routed experts "
+                    "must be a torch tensor"
+                )
+            if expert_rows.dim() != 2:
+                raise ValueError(
+                    f"Prompt {pi}, layer {layer_idx}: expected a 2D "
+                    "routed-expert tensor"
+                )
+            if expert_rows.shape[0] and expert_rows.shape[1] != top_k:
+                raise ValueError(
+                    f"Prompt {pi}, layer {layer_idx}: trace has "
+                    f"top_k={expert_rows.shape[1]}, metadata says {top_k}"
+                )
+            available_per_layer.append(int(expert_rows.shape[0]))
+        actual_decoded = min(
+            int(prompt_data.get("tokens_decoded", 0)),
+            total_decode,
+            *available_per_layer,
         )
-
-        elapsed = time.time() - t0
-        actual_decoded = len(next(iter(tracker.records.values()))) if tracker.records else 0
-        print(f"  Decoded {actual_decoded} tokens in {elapsed:.1f}s "
-              f"({actual_decoded/elapsed:.1f} tok/s)")
+        print(
+            f"  Using {actual_decoded} routed tokens "
+            f"(trace has {prompt_data.get('tokens_decoded', 0)})"
+        )
 
         if actual_decoded < segment_lengths[0] * 2:
             print(f"  ⚠ Too few tokens decoded ({actual_decoded}), skipping.")
@@ -641,7 +1036,7 @@ def run_analysis(args):
         prompt_result: dict[str, Any] = {
             "prompt": prompt,
             "tokens_decoded": actual_decoded,
-            "time_seconds": round(elapsed, 2),
+            "time_seconds": prompt_data.get("time_seconds"),
             "segment_analyses": {},
         }
 
@@ -654,7 +1049,10 @@ def run_analysis(args):
             print(f"\n  ── Segment length = {seg_len} ──")
 
             for layer_idx in moe_layers:
-                records = tracker.records[layer_idx]
+                records = tensor_to_expert_records(
+                    routed_experts[str(layer_idx)],
+                    actual_decoded,
+                )
                 metrics = compute_segment_metrics(records, seg_len)
 
                 if "error" in metrics:
@@ -784,12 +1182,11 @@ def run_analysis(args):
     all_results["global_summary"] = global_summary
 
     # --- Save results ---
-    with open(args.output, "w") as f:
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
     print(f"\n[*] Detailed results saved to: {args.output}")
-
-    # --- Cleanup ---
-    tracker.remove_hooks()
 
     print(f"\n{'='*70}")
     print("  INTERPRETATION GUIDE")

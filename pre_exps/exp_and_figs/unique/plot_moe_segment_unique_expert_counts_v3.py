@@ -15,26 +15,27 @@ Visualization:
     where top_k defaults to 8 for Qwen3 MoE top-8 routing
 
 Examples:
-  python plot_moe_segment_unique_expert_counts_v3.py \
-      --csv segment_unique_expert_counts.csv \
-      --start_token 64 \
-      --segment_sizes 3 5 8 \
-      --out unique_count_by_layer_n64.png
+    python plot_moe_segment_unique_expert_counts_v3.py \
+        --csv segment_unique_expert_counts.csv \
+        --start_token 256 \
+        --avg \
+        --segment_sizes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
+        --out unique_count_by_layer_avg_614.png
 
   python plot_moe_segment_unique_expert_counts_v3.py \
       --json segment_unique_expert_counts.json \
-      --start_token 1024 \
+      --start_tokens 1024 \
       --segment_sizes 3 5 8 \
       --top_k 8 \
       --aggregate mean \
       --summary_out unique_count_plot_summary_n1024.csv \
-      --out unique_count_by_layer_n1024.pdf
+      --out unique_count_by_layer_starts.pdf
 
   python plot_moe_segment_unique_expert_counts_v3.py \
-    --csv segment_unique_expert_counts.csv \
-    --start_token 1024 \
-    --segment_sizes 3 5 8 12 16 \
-    --out unique_count_by_layer_n1024.png
+    --json segment_unique_expert_counts.json \
+    --start_tokens 64 1024 4096 \
+    --segment_sizes 3 8 16 \
+    --out unique_count_by_starts.png
 
 Requirements:
   pip install pandas numpy matplotlib
@@ -64,9 +65,9 @@ REQUIRED_CSV_COLUMNS = {
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Plot layer-wise unique routed expert counts for exactly one start token n "
-            "and multiple segment sizes c. Solid lines are measured counts; dashed "
-            "same-color horizontal lines are y = c * top_k."
+            "Plot layer-wise unique routed expert counts for one or multiple "
+            "start tokens n and multiple segment sizes c. Same-c curves share "
+            "a color; multi-start curves use different line styles."
         )
     )
     p.add_argument("--csv", type=str, default=None, help="CSV output from the experiment script.")
@@ -77,8 +78,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--start_token",
         type=int,
-        required=True,
-        help="Exactly one 1-based decode start token n, e.g. --start_token 64.",
+        default=None,
+        help=(
+            "Exactly one 1-based decode start token n, e.g. --start_token 64. "
+            "Required unless --start_tokens or --avg is enabled."
+        ),
+    )
+    p.add_argument(
+        "--start_tokens",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Plot multiple 1-based start tokens together. Curves with the "
+            "same segment size use the same color, while start tokens use "
+            "different line styles."
+        ),
+    )
+    p.add_argument(
+        "--avg",
+        action="store_true",
+        help=(
+            "Average across all available start tokens. When enabled, "
+            "--start_token and --start_tokens are ignored."
+        ),
     )
     p.add_argument(
         "--segment_sizes",
@@ -210,10 +233,27 @@ def load_data(args: argparse.Namespace) -> pd.DataFrame:
 
 def filter_raw_df(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     requested_c = [int(x) for x in args.segment_sizes]
-    out = df[
-        (df["start_token_n_1based"] == int(args.start_token))
-        & (df["segment_size_c"].isin(requested_c))
-    ].copy()
+    if args.avg:
+        out = df[df["segment_size_c"].isin(requested_c)].copy()
+    elif args.start_tokens is not None:
+        if args.start_token is not None:
+            raise ValueError(
+                "Use either --start_token or --start_tokens, not both."
+            )
+        requested_n = [int(x) for x in args.start_tokens]
+        out = df[
+            (df["start_token_n_1based"].isin(requested_n))
+            & (df["segment_size_c"].isin(requested_c))
+        ].copy()
+    else:
+        if args.start_token is None:
+            raise ValueError(
+                "Provide --start_token, --start_tokens, or --avg."
+            )
+        out = df[
+            (df["start_token_n_1based"] == int(args.start_token))
+            & (df["segment_size_c"].isin(requested_c))
+        ].copy()
 
     if args.layers is not None:
         requested_layers = set(int(x) for x in args.layers)
@@ -223,9 +263,15 @@ def filter_raw_df(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
         available_n = sorted(df["start_token_n_1based"].unique().tolist())
         available_c = sorted(df["segment_size_c"].unique().tolist())
         available_layers = sorted(df["layer_idx"].unique().tolist())
+        if args.avg:
+            requested_start = "all (--avg)"
+        elif args.start_tokens is not None:
+            requested_start = args.start_tokens
+        else:
+            requested_start = args.start_token
         raise ValueError(
             "No rows left after filtering.\n"
-            f"Requested start_token={args.start_token}, segment_sizes={requested_c}, layers={args.layers}.\n"
+            f"Requested start_token={requested_start}, segment_sizes={requested_c}, layers={args.layers}.\n"
             f"Available start tokens: {available_n}\n"
             f"Available segment sizes: {available_c}\n"
             f"Available layer range: {available_layers[:5]} ... {available_layers[-5:]}"
@@ -235,11 +281,33 @@ def filter_raw_df(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     if missing_c:
         print(f"[warning] Requested segment sizes not found after filtering: {missing_c}")
 
+    if not args.avg and args.start_tokens is not None:
+        available_requested_n = set(
+            out["start_token_n_1based"].unique().tolist()
+        )
+        missing_n = sorted(set(args.start_tokens) - available_requested_n)
+        if missing_n:
+            print(
+                "[warning] Requested start tokens not found after filtering: "
+                f"{missing_n}"
+            )
+
     return out
 
 
-def aggregate_for_plot(df: pd.DataFrame, aggregate: str) -> pd.DataFrame:
-    group_cols = ["start_token_n_1based", "segment_size_c", "layer_idx"]
+def aggregate_for_plot(
+    df: pd.DataFrame,
+    aggregate: str,
+    average_start_tokens: bool = False,
+) -> pd.DataFrame:
+    if average_start_tokens:
+        group_cols = ["segment_size_c", "layer_idx"]
+    else:
+        group_cols = [
+            "start_token_n_1based",
+            "segment_size_c",
+            "layer_idx",
+        ]
     if aggregate == "mean":
         center = df.groupby(group_cols, as_index=False)["unique_expert_count"].mean()
     elif aggregate == "median":
@@ -254,6 +322,8 @@ def aggregate_for_plot(df: pd.DataFrame, aggregate: str) -> pd.DataFrame:
         .reset_index()
     )
     out = center.merge(spread, on=group_cols, how="left")
+    if average_start_tokens:
+        out.insert(0, "start_token_n_1based", -1)
     return out.sort_values(["segment_size_c", "layer_idx"])
 
 
@@ -265,38 +335,65 @@ def _color_map(values: list[int]) -> dict[int, str]:
     return {v: prop_cycle[i % len(prop_cycle)] for i, v in enumerate(values)}
 
 
+def _linestyle_map(values: list[int]) -> dict[int, Any]:
+    values = sorted(set(int(v) for v in values))
+    standard_styles: list[Any] = ["-", "--", "-.", ":"]
+    result: dict[int, Any] = {}
+    for index, value in enumerate(values):
+        if index < len(standard_styles):
+            result[value] = standard_styles[index]
+        else:
+            result[value] = (0, (index + 2, 1, 1, 1))
+    return result
+
+
 def plot_layer_lines_one_n(plot_df: pd.DataFrame, args: argparse.Namespace) -> None:
     value_col = f"unique_expert_count_{args.aggregate}"
     n_values = sorted(plot_df["start_token_n_1based"].unique())
-    if len(n_values) != 1:
+    multi_start_mode = not args.avg and args.start_tokens is not None
+    if not args.avg and not multi_start_mode and len(n_values) != 1:
         raise ValueError(f"Expected exactly one start token after filtering, got {n_values}")
-    n = int(n_values[0])
+    n = int(n_values[0]) if n_values else None
 
     cs = sorted(plot_df["segment_size_c"].unique())
     c_to_color = _color_map(cs)
+    n_to_linestyle = _linestyle_map(n_values)
 
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
 
     max_measured = float(plot_df[value_col].max()) if not plot_df.empty else 0.0
-    max_baseline = max(c * args.top_k for c in cs)
+    max_baseline = max(min(int(c) * int(args.top_k), 128) for c in cs)
 
     for c in cs:
         color = c_to_color[int(c)]
-        sub = plot_df[plot_df["segment_size_c"] == c].sort_values("layer_idx")
-        ax.plot(
-            sub["layer_idx"],
-            sub[value_col],
-            marker="o",
-            markersize=3,
-            linewidth=1.7,
-            color=color,
-            label=f"c={int(c)} measured",
-        )
+        c_sub = plot_df[plot_df["segment_size_c"] == c]
+        for start_token in n_values:
+            sub = c_sub[
+                c_sub["start_token_n_1based"] == start_token
+            ].sort_values("layer_idx")
+            if sub.empty:
+                continue
+            if multi_start_mode:
+                label = f"c={int(c)}, n={int(start_token)}"
+                linestyle = n_to_linestyle[int(start_token)]
+            else:
+                label = f"c={int(c)} measured"
+                linestyle = "-"
+            ax.plot(
+                sub["layer_idx"],
+                sub[value_col],
+                marker="o",
+                markersize=3,
+                linewidth=1.7,
+                linestyle=linestyle,
+                color=color,
+                label=label,
+            )
 
-        baseline = int(c) * int(args.top_k)
+        baseline = min(int(c) * int(args.top_k), 128)
         ax.axhline(
             baseline,
-            linestyle="--",
+            linestyle=(0, (2, 2)),
             linewidth=1.2,
             color=color,
             alpha=0.8,
@@ -304,7 +401,11 @@ def plot_layer_lines_one_n(plot_df: pd.DataFrame, args: argparse.Namespace) -> N
         )
 
         if args.show_baseline_labels:
-            x_right = float(sub["layer_idx"].max()) if not sub.empty else 0.0
+            x_right = (
+                float(c_sub["layer_idx"].max())
+                if not c_sub.empty
+                else 0.0
+            )
             ax.text(
                 x_right,
                 baseline,
@@ -315,10 +416,23 @@ def plot_layer_lines_one_n(plot_df: pd.DataFrame, args: argparse.Namespace) -> N
                 fontsize=8,
             )
 
-    title = args.title or (
-        f"Unique routed expert count by layer at n={n} "
-        f"({args.aggregate} across prompts and segments)"
-    )
+    if args.title:
+        title = args.title
+    elif args.avg:
+        title = (
+            "Average unique routed expert count by layer "
+            f"({args.aggregate} across start tokens, prompts, and segments)"
+        )
+    elif multi_start_mode:
+        title = (
+            "Unique routed expert count by layer for "
+            f"n={n_values} ({args.aggregate} across prompts and segments)"
+        )
+    else:
+        title = (
+            f"Unique routed expert count by layer at n={n} "
+            f"({args.aggregate} across prompts and segments)"
+        )
     ax.set_title(title)
     ax.set_xlabel("MoE layer index")
     ax.set_ylabel(f"{args.aggregate} unique expert count")
@@ -334,7 +448,12 @@ def plot_layer_lines_one_n(plot_df: pd.DataFrame, args: argparse.Namespace) -> N
     y_top = max(max_measured, float(max_baseline)) * 1.08
     ax.set_ylim(bottom=0, top=y_top)
 
-    ax.legend(title="Segment size c", ncols=2, fontsize=8)
+    legend_title = (
+        "Segment size c and start token n"
+        if multi_start_mode
+        else "Segment size c"
+    )
+    ax.legend(title=legend_title, ncols=2, fontsize=8)
     fig.tight_layout()
     fig.savefig(args.out, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig)
@@ -344,7 +463,11 @@ def main() -> None:
     args = parse_args()
     raw_df = load_data(args)
     raw_df = filter_raw_df(raw_df, args)
-    plot_df = aggregate_for_plot(raw_df, args.aggregate)
+    plot_df = aggregate_for_plot(
+        raw_df,
+        args.aggregate,
+        average_start_tokens=args.avg,
+    )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,7 +480,21 @@ def main() -> None:
     plot_layer_lines_one_n(plot_df, args)
 
     print(f"Loaded {len(raw_df)} raw rows")
-    print(f"Start token n: {args.start_token}")
+    if args.avg:
+        available_starts = sorted(
+            raw_df["start_token_n_1based"].unique().tolist()
+        )
+        print(
+            "Start token n: ignored (--avg); averaged values: "
+            f"{available_starts}"
+        )
+    elif args.start_tokens is not None:
+        plotted_starts = sorted(
+            plot_df["start_token_n_1based"].unique().tolist()
+        )
+        print(f"Start tokens n: {plotted_starts}")
+    else:
+        print(f"Start token n: {args.start_token}")
     print(f"Segment sizes c: {sorted(plot_df['segment_size_c'].unique().tolist())}")
     print(f"Layers plotted: {plot_df['layer_idx'].nunique()}")
     print(f"Dashed reference lines: y = c * top_k, top_k={args.top_k}")

@@ -28,12 +28,13 @@ Primary output:
 Usage examples:
   # No quantization, BF16 weights
   python test_moe_segment_unique_expert_counts.py \
-     --model_name /workspace/wyt/ktransformers1/Qwen--Qwen3-30B-A3B-Base \
-      --start_tokens 64 1024 \
-      --segment_sizes 3 5 8 \
-      --num_segments 16 \
+      --model_name /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
+      --prompts_file /home/mumura/moe_spec/nano-vllm-moe/pre_exps/exp_and_figs/overlap/long_reasoning_prompts_en.json \
+      --start_tokens 64 128 256 512 1024 2048 4096 8192 \
+      --segment_sizes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
+      --num_segments 10 \
       --dtype bfloat16 \
-      --output_json segment_unique_expert_counts.json
+      --output_json segment_unique_expert_counts_614.json
 
   # Quick smoke test
   python test_moe_segment_unique_expert_counts.py \
@@ -45,10 +46,20 @@ Usage examples:
 
 TS=$(date +%Y%m%d_%H%M%S)
 LOG=/home/mumura/moe_spec/logs/unique_counts_${TS}.log
-srun --jobid=30818 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
+srun --jobid=32819 --ntasks=1 bash -s <<EOS 2>&1 | tee "$LOG"
 source /opt/Software/Anaconda3/etc/profile.d/conda.sh
-conda activate nano_moe
+conda activate nano_vllm_env
 cd /home/mumura/moe_spec/nano-vllm-moe/pre_exps/exp_and_figs/unique
+python test_moe_segment_unique_expert_counts.py \
+      --model_name /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
+      --prompts_file /home/mumura/moe_spec/nano-vllm-moe/pre_exps/exp_and_figs/overlap/long_reasoning_prompts_en.json \
+      --start_tokens 64 128 256 512 1024 2048 4096 8192 \
+      --segment_sizes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
+      --num_segments 10 \
+      --dtype bfloat16 \
+      --output_json segment_unique_expert_counts_614.json
+EOS
+
 python test_moe_segment_unique_expert_counts.py \
   --model_name /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
   --prompts_file /home/mumura/moe_spec/nano-vllm-moe/pre_exps/exp_and_figs/overlap/long_reasoning_prompts_en.json \
@@ -58,7 +69,6 @@ python test_moe_segment_unique_expert_counts.py \
   --dtype bfloat16 \
   --output_json segment_unique_expert_counts.json \
   --output_csv segment_unique_expert_counts.csv
-EOS
 
 Requirements:
   pip install torch transformers accelerate numpy
