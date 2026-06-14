@@ -19,14 +19,18 @@ python -u collect_random_cache_acceptance.py \
   --dataset mtbench \
   --model-path /data1/group_谈海生/mumura/models/Qwen--Qwen3-30B-A3B \
   --wiki-jsonl /data2/group_谈海生/mumura/dynamick/predictor/filtered_wikitext/train_articles_qwen3.jsonl \
-  --output-dir /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs_smoke \
+  --output-dir /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs \
   --cache-policy lru \
-  --cache-ratio 0.5 \
-  --cache-topc-ratio 0.5 \
+  --cache-ratio 0.1 0.125 0.25 0.31 0.375 0.5 \
+  --cache-ratio-weights 1 1 2 3 2 1 \
+  --cache-topc-ratio 0.7 \
   --decode-steps 15 \
-  --min-prefill-n 8 \
+  --min-prefill-n 3 \
   --max-prefill-n 1024 \
-  --max-samples 30
+  --max-samples 200
+
+Done. Successful samples: 2000. Output: /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/wiki_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260613_225251.jsonl  
+Done. Successful samples: 200. Output: /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/mtbench_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260614_125411.jsonl
 
 Successful samples: 611. Output:
 /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs_smoke/wiki_random_cache_lru_ratio0.5_topc0.5/acceptance_summary_20260613_204930.jsonl
@@ -39,6 +43,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import random
 import time
 import traceback
@@ -76,6 +81,65 @@ def set_seed(seed: int) -> None:
 
 def generate_request_id() -> int:
     return int(time.time() * 1_000_000) + random.randint(0, 1000)
+
+
+def normalize_cache_ratio_config(
+    cache_ratios: List[float],
+    cache_ratio_weights: List[float] | None,
+) -> tuple[List[float], List[float]]:
+    ratios = [float(value) for value in cache_ratios]
+    if not ratios:
+        raise ValueError("--cache-ratio requires at least one value")
+    if any(not math.isfinite(value) or not (0.0 < value <= 1.0) for value in ratios):
+        raise ValueError(
+            f"--cache-ratio values must be finite cache ratios in (0, 1], got {ratios}"
+        )
+
+    if cache_ratio_weights is None:
+        return ratios, [1.0] * len(ratios)
+
+    weights = [float(value) for value in cache_ratio_weights]
+    if len(weights) != len(ratios):
+        raise ValueError(
+            "--cache-ratio-weights must have the same length as --cache-ratio"
+        )
+    if any(not math.isfinite(value) or value <= 0.0 for value in weights):
+        raise ValueError(
+            "--cache-ratio-weights values must be finite positive weights, "
+            f"got {weights}"
+        )
+    return ratios, weights
+
+
+def choose_cache_ratio(
+    cache_ratios: List[float],
+    cache_ratio_weights: List[float],
+    rng: random.Random,
+) -> float:
+    return float(rng.choices(cache_ratios, weights=cache_ratio_weights, k=1)[0])
+
+
+def _compact_number(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return repr(value)
+
+
+def cache_ratio_output_name(
+    dataset: str,
+    cache_policy: str,
+    cache_ratios: List[float],
+    cache_ratio_weights: List[float],
+    cache_topc_ratio: float,
+) -> str:
+    prefix = f"{dataset}_random_cache_{cache_policy}"
+    topc = _compact_number(cache_topc_ratio)
+    if len(cache_ratios) == 1:
+        return f"{prefix}_ratio{_compact_number(cache_ratios[0])}_topc{topc}"
+
+    ratios = "-".join(_compact_number(value) for value in cache_ratios)
+    weights = "-".join(_compact_number(value) for value in cache_ratio_weights)
+    return f"{prefix}_ratios{ratios}_weights{weights}_topc{topc}"
 
 
 def sample_prefill_len(
@@ -338,6 +402,7 @@ def collect_one_sample(
     model,
     sample_input: torch.Tensor,
     args,
+    cache_ratio: float,
     sample_metadata: dict | None = None,
 ) -> dict:
     req_id = generate_request_id()
@@ -358,7 +423,7 @@ def collect_one_sample(
     # B. Build cache from prefill activations.
     build_all_expert_caches(
         model,
-        cache_ratio=args.cache_ratio,
+        cache_ratio=cache_ratio,
         cache_policy=args.cache_policy,
         cache_topc_ratio=args.cache_topc_ratio,
     )
@@ -412,7 +477,7 @@ def collect_one_sample(
         "prefill_len": int(sample_input.size(1)),
         "model_path": args.model_path,
         "task_mode": "random_cache",
-        "cache_ratio": args.cache_ratio,
+        "cache_ratio": cache_ratio,
         "cache_policy": args.cache_policy,
         "cache_topc_ratio": args.cache_topc_ratio,
         "decode_steps": args.decode_steps,
@@ -462,7 +527,23 @@ def parse_args():
         help="Context tokens reserved in addition to decode_steps.",
     )
     parser.add_argument("--decode-steps", type=int, default=20)
-    parser.add_argument("--cache-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--cache-ratio",
+        type=float,
+        nargs="+",
+        default=[0.5],
+        help="One or more cache ratios in (0, 1].",
+    )
+    parser.add_argument(
+        "--cache-ratio-weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional positive sampling weight for each --cache-ratio value. "
+            "Defaults to equal weights."
+        ),
+    )
     parser.add_argument("--cache-policy", choices=["lfu", "lru"], default="lfu")
     parser.add_argument("--cache-topc-ratio", type=float, default=0.5)
     parser.add_argument("--logit-topk", type=int, default=32)
@@ -472,6 +553,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    cache_ratios, cache_ratio_weights = normalize_cache_ratio_config(
+        args.cache_ratio,
+        args.cache_ratio_weights,
+    )
     if args.min_prefill_n < 1:
         raise ValueError("--min-prefill-n must be at least 1")
     if args.max_prefill_n < args.min_prefill_n:
@@ -489,8 +574,16 @@ def main():
             "configured prefill/decode limits"
         )
     set_seed(args.seed)
+    cache_ratio_rng = random.Random(args.seed)
 
-    out_dir = Path(args.output_dir) / f"{args.dataset}_random_cache_{args.cache_policy}_ratio{args.cache_ratio}_topc{args.cache_topc_ratio}"
+    run_name = cache_ratio_output_name(
+        dataset=args.dataset,
+        cache_policy=args.cache_policy,
+        cache_ratios=cache_ratios,
+        cache_ratio_weights=cache_ratio_weights,
+        cache_topc_ratio=args.cache_topc_ratio,
+    )
+    out_dir = Path(args.output_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"acceptance_summary_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
     print(f"Writing JSONL to: {out_path}")
@@ -507,7 +600,7 @@ def main():
     model = apply_random_cache_wrapper_to_qwen(
         model,
         mode="standard",
-        cache_ratio=args.cache_ratio,
+        cache_ratio=cache_ratios[0],
         cache_policy=args.cache_policy,
         cache_topc_ratio=args.cache_topc_ratio,
     )
@@ -547,6 +640,11 @@ def main():
                                 model,
                                 sample_input,
                                 args,
+                                cache_ratio=choose_cache_ratio(
+                                    cache_ratios,
+                                    cache_ratio_weights,
+                                    cache_ratio_rng,
+                                ),
                                 sample_metadata=sample_meta,
                             )
                             f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -578,7 +676,16 @@ def main():
                     if prefill_len < 4 * args.min_prefill_n:
                         continue
                     sample_input = raw[:, :prefill_len]
-                    record = collect_one_sample(model, sample_input, args)
+                    record = collect_one_sample(
+                        model,
+                        sample_input,
+                        args,
+                        cache_ratio=choose_cache_ratio(
+                            cache_ratios,
+                            cache_ratio_weights,
+                            cache_ratio_rng,
+                        ),
+                    )
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     ok += 1
                     if ok % 5 == 0:

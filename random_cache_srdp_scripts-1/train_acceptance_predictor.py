@@ -1,9 +1,9 @@
 """
 Train a tiny theoretical-acceptance predictor for random_cache MoE decoding.
 python -u train_acceptance_predictor.py \
-  --data-file /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260613.pt \
-  --output-dir /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_20260613 \
-  --epochs 5 \
+  --data-file /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260614.pt \
+  --output-dir /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_20260614 \
+  --epochs 50 \
   --batch-size 512
 
 """

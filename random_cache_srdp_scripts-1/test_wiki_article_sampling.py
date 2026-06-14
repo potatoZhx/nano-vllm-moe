@@ -1,8 +1,10 @@
 import importlib.util
+import math
 import random
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -138,3 +140,101 @@ def test_sample_article_window_respects_article_specific_limits():
             metadata["window_start"] : metadata["window_start"] + sample.size(1),
         ],
     )
+
+
+def test_normalize_cache_ratio_config_preserves_single_ratio_compatibility():
+    mod = _load_module(
+        "collect_random_cache_acceptance_single_ratio_test",
+        "collect_random_cache_acceptance.py",
+    )
+
+    ratios, weights = mod.normalize_cache_ratio_config([0.5], None)
+
+    assert ratios == [0.5]
+    assert weights == [1.0]
+
+
+def test_normalize_cache_ratio_config_defaults_multiple_ratios_to_equal_weights():
+    mod = _load_module(
+        "collect_random_cache_acceptance_equal_weights_test",
+        "collect_random_cache_acceptance.py",
+    )
+
+    ratios, weights = mod.normalize_cache_ratio_config([0.25, 0.5, 0.75], None)
+
+    assert ratios == [0.25, 0.5, 0.75]
+    assert weights == [1.0, 1.0, 1.0]
+
+
+def test_choose_cache_ratio_uses_explicit_weights_deterministically():
+    mod = _load_module(
+        "collect_random_cache_acceptance_weighted_choice_test",
+        "collect_random_cache_acceptance.py",
+    )
+    rng = random.Random(42)
+
+    selected = [
+        mod.choose_cache_ratio(
+            [0.25, 0.5, 0.75],
+            [1.0, 2.0, 1.0],
+            rng,
+        )
+        for _ in range(8)
+    ]
+
+    assert selected == [0.5, 0.25, 0.5, 0.25, 0.5, 0.5, 0.75, 0.25]
+
+
+@pytest.mark.parametrize(
+    ("ratios", "weights", "message"),
+    [
+        ([], None, "at least one"),
+        ([0.0], None, "cache ratios"),
+        ([1.1], None, "cache ratios"),
+        ([math.inf], None, "cache ratios"),
+        ([0.25, 0.5], [1.0], "same length"),
+        ([0.25], [0.0], "weights"),
+        ([0.25], [math.nan], "weights"),
+    ],
+)
+def test_normalize_cache_ratio_config_rejects_invalid_values(
+    ratios,
+    weights,
+    message,
+):
+    mod = _load_module(
+        f"collect_random_cache_acceptance_invalid_{len(ratios)}_{message}",
+        "collect_random_cache_acceptance.py",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        mod.normalize_cache_ratio_config(ratios, weights)
+
+
+def test_cache_ratio_output_name_keeps_single_ratio_format_and_labels_mixed_runs():
+    mod = _load_module(
+        "collect_random_cache_acceptance_output_name_test",
+        "collect_random_cache_acceptance.py",
+    )
+
+    assert mod.cache_ratio_output_name(
+        dataset="wiki",
+        cache_policy="lfu",
+        cache_ratios=[0.5],
+        cache_ratio_weights=[1.0],
+        cache_topc_ratio=0.5,
+    ) == "wiki_random_cache_lfu_ratio0.5_topc0.5"
+    assert mod.cache_ratio_output_name(
+        dataset="wiki",
+        cache_policy="lfu",
+        cache_ratios=[0.25, 0.5, 0.75],
+        cache_ratio_weights=[1.0, 2.0, 1.0],
+        cache_topc_ratio=0.5,
+    ) == "wiki_random_cache_lfu_ratios0.25-0.5-0.75_weights1-2-1_topc0.5"
+    assert mod.cache_ratio_output_name(
+        dataset="wiki",
+        cache_policy="lfu",
+        cache_ratios=[0.123456789],
+        cache_ratio_weights=[1.0],
+        cache_topc_ratio=0.5,
+    ) == "wiki_random_cache_lfu_ratio0.123456789_topc0.5"

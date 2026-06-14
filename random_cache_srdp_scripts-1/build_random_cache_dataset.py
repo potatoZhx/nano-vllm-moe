@@ -12,9 +12,21 @@ that the predictor can keep lightweight branch encoders:
   y:              [N, 1] theoretical acceptance alpha
 
 python -u build_random_cache_dataset.py \
-  --train /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs_smoke/wiki_random_cache_lru_ratio0.5_topc0.5/acceptance_summary_20260613_204930.jsonl \
-  --test /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs_smoke/mtbench_random_cache_lru_ratio0.5_topc0.5/acceptance_summary_20260613_221149.jsonl \
-  --output /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260613.pt
+  --train /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/wiki_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260613_225251.jsonl \
+  --test /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/mtbench_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260614_125411.jsonl \
+  --output /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260614.pt
+
+  
+=== Building train split ===
+Files:
+  - /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/wiki_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260613_225251.jsonl
+Parsing acceptance_summary_20260613_225251.jsonl: 2000it [01:17, 25.80it/s]
+=== Building test split ===
+Files:
+  - /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/mtbench_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260614_125411.jsonl
+Parsing acceptance_summary_20260614_125411.jsonl: 200it [00:07, 27.85it/s]
+Saved dataset to /data2/group_谈海生/mumura/dynamick/predictor/random_cache_acceptance_dataset_20260614.pt  
+  
 """
 
 from __future__ import annotations
