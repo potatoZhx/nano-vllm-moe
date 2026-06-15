@@ -15,7 +15,8 @@ This folder contains a fresh implementation for Qwen/Qwen3-30B-A3B random-cache 
 - `collect_random_cache_acceptance.py`  
   Data collector. For WikiText, it gives every filtered article at least one
   sample, distributes additional samples by article length, and draws uniform
-  random windows within each article. It runs standard prefill, builds cache,
+  random prefill lengths from the beginning of each article. It runs standard
+  prefill, builds cache,
   decodes under `random_cache`, and teacher-forces the target/standard model on
   the same draft prefix.
 
@@ -107,7 +108,8 @@ prefill_len = 4 * n
 `n` is controlled by `--min-prefill-n` and `--max-prefill-n`. For example,
 `--min-prefill-n 8 --max-prefill-n 1024` samples prefill lengths from 32 to
 4096 tokens, clipped by the article and model-context limits. The collector
-samples `n` uniformly and then chooses a uniform random start within the article.
+samples `n` uniformly and takes `input_ids[:, :prefill_len]` from the beginning
+of the article.
 
 ## 4. Build train/test dataset
 
@@ -133,6 +135,10 @@ python -u random_cache_srdp/train_acceptance_predictor.py \
 ## Notes
 
 - The collector does not save full vocabulary logits. It computes theoretical acceptance online and saves the scalar label.
+- Each decode step stores `router` for the random-cache draft forward and
+  `target_router` for the standard target forward. The target model's routed
+  expert IDs and weights are in `target_router[*].original_ids` and
+  `target_router[*].original_weights`.
 - The target logits are computed by standard-mode teacher forcing on the same draft prefix, avoiding the prefix-divergence issue in baseline greedy decoding.
 - The dataset includes cumulative/EMA/max history features for RSD, REP mass, and draft-logit entropy. It does not use previous ground-truth alpha as a feature, avoiding train/deploy leakage.
 - I have not run these scripts on the actual A800/Qwen3 environment here. If your installed Qwen3 implementation exposes different MoE field names, adjust `expert_subset_random_cache.py` around `gate`, `experts`, and shared expert attributes.

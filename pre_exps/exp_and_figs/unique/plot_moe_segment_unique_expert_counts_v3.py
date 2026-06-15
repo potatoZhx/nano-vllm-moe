@@ -16,11 +16,10 @@ Visualization:
 
 Examples:
     python plot_moe_segment_unique_expert_counts_v3.py \
-        --csv segment_unique_expert_counts.csv \
-        --start_token 256 \
+        --csv /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg1024.csv \
         --avg \
         --segment_sizes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
-        --out unique_count_by_layer_avg_614.png
+        --out res/unique_count_by_layer_avg1024.png
 
   python plot_moe_segment_unique_expert_counts_v3.py \
       --json segment_unique_expert_counts.json \

@@ -12,8 +12,8 @@ For each sample:
   - Store per-step features and the theoretical acceptance label
         alpha = sum_v min(p_target(v), q_draft(v)).
 
-This script stores compact top-k logits, route metadata, final hidden embedding,
-and alpha. It does not store full vocabulary logits.
+This script stores compact top-k logits, draft and target route metadata, final
+hidden embedding, and alpha. It does not store full vocabulary logits.
 
 python -u collect_random_cache_acceptance.py \
   --dataset mtbench \
@@ -21,13 +21,18 @@ python -u collect_random_cache_acceptance.py \
   --wiki-jsonl /data2/group_谈海生/mumura/dynamick/predictor/filtered_wikitext/train_articles_qwen3.jsonl \
   --output-dir /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs \
   --cache-policy lru \
-  --cache-ratio 0.1 0.125 0.25 0.31 0.375 0.5 \
-  --cache-ratio-weights 1 1 2 3 2 1 \
+  --cache-ratio 0.25 \
+  --cache-ratio-weights 1 \
   --cache-topc-ratio 0.7 \
   --decode-steps 15 \
   --min-prefill-n 3 \
   --max-prefill-n 1024 \
-  --max-samples 200
+  --max-samples 50
+
+  0.1 0.125 0.25 0.31 0.375 0.5
+  1 1 2 3 2 1
+
+Done. Successful samples: 50. Output: /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/mtbench_random_cache_lru_ratio0.25_topc0.7/acceptance_summary_20260615_190647.jsonl
 
 Done. Successful samples: 2000. Output: /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/wiki_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260613_225251.jsonl  
 Done. Successful samples: 200. Output: /data2/group_谈海生/mumura/dynamick/predictor/random_cache_runs/mtbench_random_cache_lru_ratios0.1-0.125-0.25-0.31-0.375-0.5_weights1-1-2-3-2-1_topc0.7/acceptance_summary_20260614_125411.jsonl
@@ -246,8 +251,8 @@ def sample_article_window(
 
     sampled_n = rng.randint(min_prefill_n, article_max_n)
     prefill_len = 4 * sampled_n
-    window_start = rng.randint(0, token_length - prefill_len)
-    sample = input_ids[:, window_start : window_start + prefill_len]
+    window_start = 0
+    sample = input_ids[:, :prefill_len]
     return sample, {
         "window_start": window_start,
         "sampled_prefill_n": sampled_n,
@@ -447,6 +452,7 @@ def collect_one_sample(
         # Target/standard distribution p on the same prefix.
         set_moe_mode(model, "standard")
         p_logits, _, p_new_kv = decode_step(model, curr_input, curr_mask, p_kv)
+        target_route_meta = collect_moe_metadata(model, first_token_only=True)
 
         alpha = theoretical_acceptance(q_logits, p_logits)
         draft_token_id = int(draft_token.item())
@@ -461,6 +467,7 @@ def collect_one_sample(
                 "q_topk_logits": topk_logit_payload(q_logits, k=args.logit_topk),
                 "final_embedding": q_embedding[0].float().detach().cpu().tolist(),
                 "router": route_meta,
+                "target_router": target_route_meta,
             }
         )
         draft_tokens.append(draft_token_id)

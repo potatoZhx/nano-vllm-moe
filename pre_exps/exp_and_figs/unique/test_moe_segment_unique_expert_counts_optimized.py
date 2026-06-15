@@ -28,13 +28,14 @@ python test_moe_segment_unique_expert_counts_optimized.py \
       --prompts_file /home/mumura/moe_spec/nano-vllm-moe/pre_exps/exp_and_figs/unique/diverse_prompts_en_no_output_format_list.json \
       --start_tokens -1 \
       --start_from 1 \
-      --end_pos 8192 \
+      --end_pos 1024 \
       --segment_sizes 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
       --dtype bfloat16 \
-      --intermediate_output /data2/group_谈海生/mumura/nano_moe/motivaion \
-      --output_json /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg8192.json \
-      --output_csv /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg8192.csv
+      --intermediate_file /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg8192_routing_trace.pt \
+      --output_json /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg1024.json \
+      --output_csv /data2/group_谈海生/mumura/nano_moe/motivaion/segment_unique_expert_counts_optimized_avg1024.csv
       
+      --intermediate_output /data2/group_谈海生/mumura/nano_moe/motivaion \
 /data2/group_谈海生/mumura/nano_moe/motivaion/
  64 128 256 512 1024 2048 4096 8192
       --num_prompts 3 \
