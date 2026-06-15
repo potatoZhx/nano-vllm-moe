@@ -643,6 +643,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         acceptance_predictor_path=args.acceptance_predictor_path,
         acceptance_predictor_step_horizon=args.acceptance_predictor_step_horizon,
         draft_alpha_stop_threshold=args.draft_alpha_stop_threshold,
+        draft_stop_policy=args.draft_stop_policy,
+        draft_tpot_td_ms=args.draft_tpot_td_ms,
+        draft_tpot_tv_ms=args.draft_tpot_tv_ms,
         cpu_expert_execution_enabled=args.cpu_expert_execution_enabled,
         cpu_expert_pin_memory=args.cpu_expert_pin_memory,
         cpu_expert_backend=args.cpu_expert_backend,
@@ -1150,6 +1153,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acceptance-predictor-path", default="")
     p.add_argument("--acceptance-predictor-step-horizon", type=int, default=32)
     p.add_argument("--draft-alpha-stop-threshold", type=float, default=-1.0)
+    p.add_argument("--draft-stop-policy", choices=["none", "alpha_threshold", "tpot"], default="none")
+    p.add_argument("--draft-tpot-td-ms", type=float, default=19.0)
+    p.add_argument("--draft-tpot-tv-ms", type=float, default=80.0)
     p.add_argument("--cpu-expert-backend", default="fused")
     p.add_argument("--cpu-expert-execution-enabled", type=str2bool, default=True)
     p.add_argument(

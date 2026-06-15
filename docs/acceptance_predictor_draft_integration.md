@@ -37,8 +37,8 @@ The predictor was trained for a Qwen3-MoE-30B-A3B-shaped model
   spec engine, with negligible latency overhead and zero change to generated tokens.
 - **Goal**: keep everything gated; when disabled the draft path is byte-for-byte
   unchanged.
-- **Non-goal (this change)**: the actual adaptive-draft-length stop policy (toks/s
-  from alpha) — alpha is now available per step; the policy is future work.
+- **Adaptive-draft-length stop policy** (toks/s from alpha): implemented as the
+  cost-aware `tpot` policy — see §9.1.
 - **Known caveat**: the predictor was trained on the SRDP `random_cache` replacement
   mechanism, which is *not identical* to nano-vllm's reroute/cache-substitution
   draft. Predictions are only as good as that distributional match — calibrate
@@ -215,9 +215,30 @@ actual end-to-end throughput delta (predictor-off baseline).
 | `acceptance_predictor_enabled` | `False` | master gate (requires `inference_mode="spec"`) |
 | `acceptance_predictor_path` | `""` | dir with `config.json` + `best_model.pth` |
 | `acceptance_predictor_step_horizon` | `32` | denominator for `history[0]` |
+| `draft_stop_policy` | `"tpot"` | dynamic draft-length stop: `none` / `alpha_threshold` / `tpot` |
+| `draft_alpha_stop_threshold` | `0.85` | legacy `alpha_threshold` policy cutoff |
+| `draft_tpot_td_ms` | `19.0` | fixed per-draft-step time used by the `tpot` policy |
+| `draft_tpot_tv_ms` | `80.0` | fixed per-verify time used by the `tpot` policy |
 
 The predictor only runs in the **draft segment-graph path** (predictive /
 draft_segment_indexed prefetch mode). With other draft paths it is a no-op.
+
+### 9.1 Dynamic draft length (`draft_stop_policy="tpot"`)
+
+`spec_engine.expected_tpot_ms` turns the per-step predicted alphas into the expected
+per-output-token latency for a draft of length `k`:
+
+```
+acc_len(k) = sum_i prod_{j<=i} e_j          # cumulative acceptance, per sequence
+T(k) = (k*td + tv) / sum_seq (acc_len_seq(k) + 1)
+```
+
+`T(k)` is unimodal in `k`. The draft loop (`SpeculativeEngine.speculative_step`) uses a
+**reactive-lookback** rule: draft step `k`, recompute `T(k)`, and stop once `T(k)`
+exceeds `T(k-1)` (i.e. predicted tokens/s has peaked). `td`/`tv` are fixed config values
+in v1 (a measured-EMA mode is a possible follow-up). The chosen length is exported as
+`step_trace["draft_steps_actual"]` and the latency curve as `step_trace["draft_tpot"]`;
+`_profile["draft_tpot_early_stop_count"]` counts triggered stops.
 
 ## 10. Files changed
 

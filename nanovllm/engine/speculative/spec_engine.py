@@ -10,6 +10,34 @@ from nanovllm.engine.sequence import SequenceStatus
 from nanovllm.engine.speculative.acceptance import create_acceptance_strategy
 
 
+def expected_tpot_ms(step_alphas, num_seqs: int, td_ms: float, tv_ms: float) -> float:
+    """Expected per-output-token latency (TPOT) for a batched draft of length k.
+
+    ``step_alphas`` is a list over the k draft steps; each element is a list of
+    per-sequence acceptance estimates (length ``num_seqs``). For one sequence the
+    expected accepted length is the cumulative-product sum
+    ``acc_len = sum_i prod_{j<=i} e_j`` (a draft token lands only if every earlier
+    token in the run was accepted). The batch produces ``acc_len_s + 1`` tokens per
+    sequence per spec iteration (the ``+1`` is the guaranteed verify token), at a
+    cost of ``k * td + tv``::
+
+        T(k) = (k * td_ms + tv_ms) / sum_s (acc_len_s + 1)
+
+    With ``k == 0`` this is the no-draft baseline ``tv_ms / num_seqs``.
+    """
+    if num_seqs <= 0:
+        return float("inf")
+    k = len(step_alphas)
+    cumprod = [1.0] * num_seqs
+    acc_len_sum = 0.0
+    for alphas in step_alphas:
+        for s in range(num_seqs):
+            cumprod[s] *= float(alphas[s])
+            acc_len_sum += cumprod[s]
+    denom = acc_len_sum + num_seqs
+    return (k * td_ms + tv_ms) / denom
+
+
 class SpeculativeEngine:
     """Minimal Phase 2 speculative entry point.
 
@@ -27,6 +55,9 @@ class SpeculativeEngine:
         threshold = getattr(config, "acceptance_threshold", 0.7)
         self.acceptance_strategy = create_acceptance_strategy(strategy_name, threshold=threshold)
         self.draft_alpha_stop_threshold = float(getattr(config, "draft_alpha_stop_threshold", -1.0))
+        self.draft_stop_policy = str(getattr(config, "draft_stop_policy", "none")).strip().lower()
+        self.draft_tpot_td_ms = float(getattr(config, "draft_tpot_td_ms", 19.0))
+        self.draft_tpot_tv_ms = float(getattr(config, "draft_tpot_tv_ms", 80.0))
         self.profile_enabled = getattr(config, "spec_profile", False)
         self._profile = defaultdict(float)
         self._draft_steps_per_step: list[int] = []
@@ -121,6 +152,13 @@ class SpeculativeEngine:
         draft_alpha_map = {seq.seq_id: [] for seq in seqs}
         draft_prefetch_state = None
         draft_steps_actual = 0
+
+        # TPOT-policy running state (cost-aware dynamic draft length).
+        tpot_alpha_history: list[list[float]] = []   # per-step per-seq alpha
+        # T(0): no draft, just the guaranteed verify token (one per seq).
+        tpot_prev = expected_tpot_ms([], len(seqs), self.draft_tpot_td_ms, self.draft_tpot_tv_ms)
+        tpot_series: list[float] = []
+
         t0 = perf_counter()
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
@@ -149,10 +187,29 @@ class SpeculativeEngine:
                     draft_alpha_map[seq.seq_id].append(float(step_alpha[row_idx]))
             draft_steps_actual = step_idx + 1
 
-            if (self.draft_alpha_stop_threshold >= 0
-                    and step_alpha is not None
-                    and all(a < self.draft_alpha_stop_threshold for a in step_alpha)):
-                self._profile["draft_alpha_early_stop_count"] += 1
+            # Dynamic draft-length stop policy. No-op when alpha is unavailable
+            # (predictor off) or doesn't cover the whole batch.
+            stop = False
+            if step_alpha is not None and len(step_alpha) == len(seqs):
+                if (self.draft_stop_policy == "alpha_threshold"
+                        and self.draft_alpha_stop_threshold >= 0):
+                    if all(a < self.draft_alpha_stop_threshold for a in step_alpha):
+                        self._profile["draft_alpha_early_stop_count"] += 1
+                        stop = True
+                elif self.draft_stop_policy == "tpot":
+                    tpot_alpha_history.append([float(a) for a in step_alpha])
+                    tpot_now = expected_tpot_ms(
+                        tpot_alpha_history, len(seqs),
+                        self.draft_tpot_td_ms, self.draft_tpot_tv_ms,
+                    )
+                    tpot_series.append(tpot_now)
+                    # T(k) is unimodal in k; stop once it stops decreasing.
+                    if tpot_now > tpot_prev:
+                        self._profile["draft_tpot_early_stop_count"] += 1
+                        stop = True
+                    else:
+                        tpot_prev = tpot_now
+            if stop:
                 break
 
             # schedule() already reserved the first decode append slot.
@@ -293,6 +350,9 @@ class SpeculativeEngine:
         self._profile["spec_step_ms"] += step_dt_ms
         step_trace["step_ms"] = step_dt_ms
         step_trace["draft_steps_actual"] = int(draft_steps_actual)
+        step_trace["draft_stop_policy"] = self.draft_stop_policy
+        if tpot_series:
+            step_trace["draft_tpot"] = list(tpot_series)
         self._step_traces.append(step_trace)
 
         return final_token_ids

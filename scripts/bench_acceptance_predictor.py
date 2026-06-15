@@ -305,6 +305,12 @@ def _command(
         str(args.acceptance_predictor_step_horizon),
         "--draft-alpha-stop-threshold",
         str(args.draft_alpha_stop_threshold),
+        "--draft-stop-policy",
+        args.draft_stop_policy,
+        "--draft-tpot-td-ms",
+        str(args.draft_tpot_td_ms),
+        "--draft-tpot-tv-ms",
+        str(args.draft_tpot_tv_ms),
         # -- predictive segment-indexed prefetch (required for the draft tail graph) --
         "--prefetch-enabled",
         "true",
@@ -636,6 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--acceptance-predictor-path", default=DEFAULT_PREDICTOR_PATH)
     parser.add_argument("--acceptance-predictor-step-horizon", type=int, default=32)
     parser.add_argument("--draft-alpha-stop-threshold", type=float, default=-1.0)
+    parser.add_argument("--draft-stop-policy", choices=["none", "alpha_threshold", "tpot"], default="tpot")
+    parser.add_argument("--draft-tpot-td-ms", type=float, default=19.0)
+    parser.add_argument("--draft-tpot-tv-ms", type=float, default=80.0)
     parser.add_argument("--output-lens", default="128,512")
     parser.add_argument("--cache-ratios", default="0.25,0.3125,0.50")
     parser.add_argument("--max-draft-tokens-values", default="4,8")

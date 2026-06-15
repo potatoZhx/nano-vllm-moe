@@ -123,6 +123,14 @@ class Config:
     acceptance_predictor_path: str = ""
     acceptance_predictor_step_horizon: int = 32
     draft_alpha_stop_threshold: float = 0.85
+    # Dynamic draft-length stop policy driven by the acceptance predictor.
+    #   "none"            -> always draft the full budget
+    #   "alpha_threshold" -> legacy: stop when every seq's alpha < threshold
+    #   "tpot"            -> stop when expected per-output-token latency stops
+    #                        decreasing (cost-aware, cumulative acceptance)
+    draft_stop_policy: str = "tpot"
+    draft_tpot_td_ms: float = 19.0         # fixed per-draft-step time (v1)
+    draft_tpot_tv_ms: float = 80.0         # fixed per-verify time (v1)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -132,6 +140,11 @@ class Config:
 
         valid_modes = {"standard", "heter", "spec", "auto"}
         assert self.inference_mode in valid_modes, f"invalid inference_mode: {self.inference_mode}"
+
+        valid_stop_policies = {"none", "alpha_threshold", "tpot"}
+        assert self.draft_stop_policy in valid_stop_policies, (
+            f"invalid draft_stop_policy: {self.draft_stop_policy}"
+        )
 
         # Backward-compatible inference from legacy flags.
         if self.inference_mode == "auto" or (
