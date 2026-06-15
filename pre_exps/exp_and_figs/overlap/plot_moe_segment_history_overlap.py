@@ -18,8 +18,8 @@ The output is one figure containing:
 
 Example:
   python plot_moe_segment_history_overlap.py \
-    --input segment_history_overlap_results.json \
-    --output moe_segment_history_overlap.png
+    --input segment_history_overlap_with_text.json \
+    --output moe_segment_history_overlap_d50.png
 
 Optional:
   python plot_moe_segment_history_overlap.py \

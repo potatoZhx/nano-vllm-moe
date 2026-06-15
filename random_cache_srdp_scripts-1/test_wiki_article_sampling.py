@@ -3,6 +3,7 @@ import math
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -112,7 +113,7 @@ def test_allocate_article_quotas_preserves_minimum_and_target_total():
     ) == [1, 1, 1]
 
 
-def test_sample_article_window_respects_article_specific_limits():
+def test_sample_article_window_uses_article_prefix_and_respects_limits():
     mod = _load_module(
         "collect_random_cache_acceptance_window_test",
         "collect_random_cache_acceptance.py",
@@ -132,14 +133,8 @@ def test_sample_article_window_respects_article_specific_limits():
     assert metadata["article_max_prefill_n"] == 16
     assert 8 <= metadata["sampled_prefill_n"] <= 16
     assert sample.size(1) == 4 * metadata["sampled_prefill_n"]
-    assert 0 <= metadata["window_start"] <= 200 - sample.size(1)
-    assert torch.equal(
-        sample,
-        input_ids[
-            :,
-            metadata["window_start"] : metadata["window_start"] + sample.size(1),
-        ],
-    )
+    assert metadata["window_start"] == 0
+    assert torch.equal(sample, input_ids[:, : sample.size(1)])
 
 
 def test_normalize_cache_ratio_config_preserves_single_ratio_compatibility():
@@ -238,3 +233,80 @@ def test_cache_ratio_output_name_keeps_single_ratio_format_and_labels_mixed_runs
         cache_ratio_weights=[1.0],
         cache_topc_ratio=0.5,
     ) == "wiki_random_cache_lfu_ratio0.123456789_topc0.5"
+
+
+def test_collect_one_sample_saves_target_standard_router(monkeypatch):
+    mod = _load_module(
+        "collect_random_cache_acceptance_target_router_test",
+        "collect_random_cache_acceptance.py",
+    )
+
+    class FakeModel:
+        def __init__(self):
+            self.mode = "standard"
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        def parameters(self):
+            yield self.weight
+
+        def __call__(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(
+                logits=torch.tensor([[[0.0, 1.0, 2.0]]]),
+                past_key_values={"prefill": True},
+            )
+
+    model = FakeModel()
+    monkeypatch.setattr(mod, "reset_prefill_cache_state", lambda model: None)
+    monkeypatch.setattr(mod, "enable_prefill_collection", lambda model, enabled: None)
+    monkeypatch.setattr(mod, "build_all_expert_caches", lambda model, **kwargs: None)
+    monkeypatch.setattr(mod, "summarize_cache", lambda model: [])
+    monkeypatch.setattr(
+        mod,
+        "set_moe_mode",
+        lambda model, mode: setattr(model, "mode", mode),
+    )
+
+    def fake_decode_step(model, input_ids, attention_mask, past_key_values):
+        del input_ids, attention_mask, past_key_values
+        if model.mode == "random_cache":
+            logits = torch.tensor([[0.0, 2.0, 1.0]])
+        else:
+            logits = torch.tensor([[0.0, 1.0, 2.0]])
+        return logits, torch.tensor([[1.0, 2.0]]), {"mode": model.mode}
+
+    monkeypatch.setattr(mod, "decode_step", fake_decode_step)
+    monkeypatch.setattr(
+        mod,
+        "collect_moe_metadata",
+        lambda model, first_token_only: [
+            {
+                "layer_idx": 0,
+                "mode": model.mode,
+                "original_ids": [[1 if model.mode == "random_cache" else 2]],
+                "original_weights": [[0.75]],
+            }
+        ],
+    )
+
+    args = SimpleNamespace(
+        decode_steps=1,
+        cache_policy="lfu",
+        cache_topc_ratio=0.5,
+        logit_topk=2,
+        dataset="wiki",
+        model_path="/model",
+    )
+    record = mod.collect_one_sample(
+        model,
+        torch.tensor([[10, 11, 12, 13]]),
+        args,
+        cache_ratio=0.5,
+    )
+
+    step = record["steps"][0]
+    assert step["router"][0]["mode"] == "random_cache"
+    assert step["router"][0]["original_ids"] == [[1]]
+    assert step["target_router"][0]["mode"] == "standard"
+    assert step["target_router"][0]["original_ids"] == [[2]]
+    assert step["target_router"][0]["original_weights"] == [[0.75]]
