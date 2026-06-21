@@ -85,6 +85,10 @@ class Config:
     engine_profile: bool = False
     engine_profile_cuda_sync: bool = True
     heterogeneous_slots_per_layer: int = 0
+    heterogeneous_slot_allocation: str = "uniform"  # "uniform" | "profile_weighted"
+    heterogeneous_slot_buckets: int = 4
+    heterogeneous_slot_max_bucket_ratio: float = 2.0
+    heterogeneous_slot_profile_csv: str = ""
     cpu_expert_pin_memory: bool = False  # pin_memory adds ~60s for 61GB model
     cpu_expert_execution_enabled: bool = False
     cpu_expert_backend: str = "torch"
@@ -180,6 +184,16 @@ class Config:
         if self.draft_reroute_policy == "similarity_replace":
             assert self.draft_reroute_artifact, "similarity_replace requires draft_reroute_artifact"
         assert self.cache_strategy in {"lru", "lfu", "adaptive", "lfu_rankguard", "lfu_rankguard_online"}
+        assert self.heterogeneous_slot_allocation in {"uniform", "profile_weighted"}, (
+            f"invalid heterogeneous_slot_allocation: {self.heterogeneous_slot_allocation}"
+        )
+        assert 2 <= self.heterogeneous_slot_buckets <= 4
+        assert self.heterogeneous_slot_max_bucket_ratio > 1.0
+        if self.heterogeneous_slot_allocation == "profile_weighted":
+            assert self.draft_reroute_artifact or self.heterogeneous_slot_profile_csv, (
+                "profile_weighted slot allocation requires draft_reroute_artifact or "
+                "heterogeneous_slot_profile_csv"
+            )
         assert 0.0 <= self.rank_guard_threshold <= 1.0
         assert 0.0 < self.rank_guard_ema_alpha <= 1.0
         assert self.prefetch_strategy in {"noop", "history_window"}

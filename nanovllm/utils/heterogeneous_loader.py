@@ -120,12 +120,23 @@ class HeterogeneousModelLoader:
         self,
         cpu_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> dict[int, LayerExpertCache]:
-        slots_per_layer = self.config.heterogeneous_slots_per_layer
+        base_slots = self.config.heterogeneous_slots_per_layer
+        allocation_mode = getattr(self.config, "heterogeneous_slot_allocation", "uniform")
+        sorted_layers = sorted(cpu_pool.keys())
+
+        per_layer_slots = None
+        if allocation_mode == "profile_weighted":
+            per_layer_slots = self._compute_profile_weighted_slots(sorted_layers, cpu_pool, base_slots)
+
         layer_caches: dict[int, LayerExpertCache] = {}
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for layer_idx, experts in cpu_pool.items():
+        for layer_idx in sorted_layers:
+            experts = cpu_pool[layer_idx]
             num_experts = len(experts)
-            slots = num_experts if slots_per_layer <= 0 else min(slots_per_layer, num_experts)
+            if per_layer_slots is not None:
+                slots = min(per_layer_slots[layer_idx], num_experts)
+            else:
+                slots = num_experts if base_slots <= 0 else min(base_slots, num_experts)
             sample = next(iter(experts.values()))
             layer_caches[layer_idx] = LayerExpertCache(
                 num_experts=num_experts,
@@ -139,6 +150,83 @@ class HeterogeneousModelLoader:
                 enable_prefetch=bool(getattr(self.config, "spec_enable_prefetch", False)),
             )
         return layer_caches
+
+    def _compute_profile_weighted_slots(
+        self,
+        sorted_layers: list[int],
+        cpu_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
+        base_slots_per_layer: int,
+    ) -> dict[int, int]:
+        from nanovllm.expert.slot_allocation import (
+            allocate_slots_per_layer,
+            compute_layer_demand_from_act_freq,
+            compute_layer_demand_from_csv,
+        )
+
+        num_experts = len(next(iter(cpu_pool.values())))
+        num_layers = len(sorted_layers)
+        effective_base = num_experts if base_slots_per_layer <= 0 else min(base_slots_per_layer, num_experts)
+        total_budget = effective_base * num_layers
+
+        csv_path = getattr(self.config, "heterogeneous_slot_profile_csv", "")
+        num_buckets = getattr(self.config, "heterogeneous_slot_buckets", 4)
+        max_ratio = getattr(self.config, "heterogeneous_slot_max_bucket_ratio", 2.0)
+
+        demand = None
+        source = "none"
+        if csv_path:
+            try:
+                demand = compute_layer_demand_from_csv(csv_path)
+                source = f"csv({csv_path})"
+            except Exception as e:
+                print(f"[slot_allocation] WARNING: failed to load CSV: {e}", flush=True)
+
+        if demand is None and self.draft_reroute_profile is not None:
+            act_freq = self.draft_reroute_profile.act_freq
+            if act_freq is not None:
+                demand = compute_layer_demand_from_act_freq(act_freq)
+                source = "act_freq"
+
+        if demand is None:
+            print(
+                "[slot_allocation] WARNING: no profile data available, "
+                "falling back to uniform allocation",
+                flush=True,
+            )
+            return {layer_idx: effective_base for layer_idx in sorted_layers}
+
+        if demand.shape[0] < num_layers:
+            print(
+                f"[slot_allocation] WARNING: demand has {demand.shape[0]} layers "
+                f"but model has {num_layers} MoE layers, falling back to uniform",
+                flush=True,
+            )
+            return {layer_idx: effective_base for layer_idx in sorted_layers}
+
+        demand = demand[:num_layers]
+
+        slots_list = allocate_slots_per_layer(
+            demand=demand,
+            total_budget=total_budget,
+            num_experts=num_experts,
+            num_buckets=num_buckets,
+            max_bucket_ratio=max_ratio,
+        )
+
+        result = {}
+        for i, layer_idx in enumerate(sorted_layers):
+            result[layer_idx] = slots_list[i]
+
+        distinct = sorted(set(slots_list))
+        print(
+            f"[slot_allocation] profile_weighted (source={source}): "
+            f"total_budget={total_budget} buckets_used={len(distinct)} "
+            f"bucket_values={distinct} "
+            f"min={min(slots_list)} max={max(slots_list)} "
+            f"sum={sum(slots_list)}",
+            flush=True,
+        )
+        return result
 
     def _load_initial_placement(
         self,

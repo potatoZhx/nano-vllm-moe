@@ -532,6 +532,10 @@ def run_single_case(args: argparse.Namespace) -> None:
     case_info = {
         "cache_ratio": effective_cache_ratio,
         "slots_per_layer": slots,
+        "slot_allocation": args.slot_allocation,
+        "slot_buckets": int(args.slot_buckets),
+        "slot_max_bucket_ratio": float(args.slot_max_bucket_ratio),
+        "slot_profile_csv": args.slot_profile_csv,
         "prefetch_enabled": bool(args.prefetch_enabled),
         "acceptance_strategy": args.acceptance_strategy,
         "temperature": float(args.temperature),
@@ -633,6 +637,10 @@ def run_single_case(args: argparse.Namespace) -> None:
         enable_heterogeneous=True,
         enable_speculative=True,
         heterogeneous_slots_per_layer=slots,
+        heterogeneous_slot_allocation=args.slot_allocation,
+        heterogeneous_slot_buckets=args.slot_buckets,
+        heterogeneous_slot_max_bucket_ratio=args.slot_max_bucket_ratio,
+        heterogeneous_slot_profile_csv=args.slot_profile_csv,
         max_draft_tokens=args.max_draft_tokens,
         draft_top_c=args.draft_top_c,
         draft_reroute_policy=args.draft_reroute_policy,
@@ -945,6 +953,14 @@ def run_suite(args: argparse.Namespace) -> None:
                     str(ratio),
                     "--slots-per-layer",
                     "0",
+                    "--slot-allocation",
+                    args.slot_allocation,
+                    "--slot-buckets",
+                    str(args.slot_buckets),
+                    "--slot-max-bucket-ratio",
+                    str(args.slot_max_bucket_ratio),
+                    "--slot-profile-csv",
+                    args.slot_profile_csv,
                     "--prefetch-enabled",
                     str(prefetch).lower(),
                     "--output",
@@ -1135,6 +1151,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-ratios", default="0.75,0.50,0.25")
     p.add_argument("--cache-ratio", type=float, default=0.75)
     p.add_argument("--slots-per-layer", type=int, default=0)
+    p.add_argument("--slot-allocation", choices=["uniform", "profile_weighted"], default="uniform")
+    p.add_argument("--slot-buckets", type=int, default=4)
+    p.add_argument("--slot-max-bucket-ratio", type=float, default=2.0)
+    p.add_argument("--slot-profile-csv", default="")
     p.add_argument("--prefetch-order", choices=["off,on", "on,off"], default="off,on")
     p.add_argument("--prefetch-enabled", type=str2bool, default=False)
     p.add_argument("--num-seqs", type=int, default=1)
