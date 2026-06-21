@@ -25,9 +25,27 @@ Example:
         --cache-ratios 0.3125 \
         --output-lens 512,4096 \
         --draft-alpha-stop-threshold 0.89 \
-        --max-draft-tokens-values 10 \
+        --max-draft-tokens-values 20 \
         --segment-sizes 12 \
         --predictor-modes on,off \
+        --kt-num-threads 16
+
+    conda activate nano_moe
+    cd /home/linke/nano-vllm-moe
+    rm -rf results/acc_predictor_tpot_bench_dual
+    python scripts/bench_acceptance_predictor.py \
+        --output-dir results/acc_predictor_tpot_bench_dual \
+        --acceptance-predictor-path random_cache_srdp_scripts-1/res/run_20260614_133025 \
+        --gpu-memory-utilization 0.99 \
+        --cache-ratios 0.3125 \
+        --output-lens 512,4096 \
+        --max-draft-tokens-values 15 \
+        --repeats 2 \
+        --segment-sizes 12 \
+        --predictor-modes on \
+        --draft-stop-policy tpot \
+        --draft-tpot-td-ms 19 \
+        --draft-tpot-tv-ms 80 \
         --kt-num-threads 32
 """
 from __future__ import annotations
@@ -70,6 +88,31 @@ def _parse_csv(values: str, cast) -> list:
     return [cast(item.strip()) for item in values.split(",") if item.strip()]
 
 
+def _resolve_verify_cuda_graph_bucket_steps(
+    args: argparse.Namespace,
+    max_draft_tokens_values: list[int] | None = None,
+) -> list[int]:
+    buckets = _parse_csv(args.verify_cuda_graph_bucket_steps, int)
+    if not buckets:
+        raise argparse.ArgumentTypeError("--verify-cuda-graph-bucket-steps must not be empty")
+    if bool(args.auto_extend_verify_cuda_graph_buckets):
+        draft_values = (
+            max_draft_tokens_values
+            if max_draft_tokens_values is not None
+            else _parse_csv(args.max_draft_tokens_values, int)
+        )
+        buckets.extend(int(k) + 1 for k in draft_values)
+    return sorted(set(int(x) for x in buckets))
+
+
+def _bucket_steps_arg(args: argparse.Namespace, case: dict[str, Any]) -> str:
+    buckets = _resolve_verify_cuda_graph_bucket_steps(
+        args,
+        max_draft_tokens_values=[int(case["max_draft_tokens"])],
+    )
+    return ",".join(str(x) for x in buckets)
+
+
 def _parse_predictor_modes(values: str) -> list[bool]:
     modes = []
     for item in values.split(","):
@@ -96,6 +139,11 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                 for segment_size in _parse_csv(args.segment_sizes, int):
                     for repeat in range(int(args.repeats)):
                         for predictor_enabled in predictor_modes:
+                            verify_segment_size = (
+                                int(args.verify_segment_size_override)
+                                if int(args.verify_segment_size_override) > 0
+                                else int(segment_size)
+                            )
                             cases.append(
                                 {
                                     "predictor_enabled": bool(predictor_enabled),
@@ -103,6 +151,7 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                                     "cache_ratio": float(cache_ratio),
                                     "max_draft_tokens": int(max_draft_tokens),
                                     "segment_size": int(segment_size),
+                                    "verify_segment_size": int(verify_segment_size),
                                     "repeat": int(repeat),
                                 }
                             )
@@ -112,10 +161,17 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
 def _case_name(case: dict[str, Any]) -> str:
     ratio_pct = int(round(float(case["cache_ratio"]) * 10000))
     pred = "predON" if case["predictor_enabled"] else "predOFF"
+    verify_segment_size = int(case.get("verify_segment_size", case["segment_size"]))
+    verify_suffix = (
+        f"_vseg{verify_segment_size}"
+        if verify_segment_size != int(case["segment_size"])
+        else ""
+    )
     return (
         f"{pred}_seg{int(case['segment_size'])}_"
         f"ratio{ratio_pct:04d}_l{int(case['output_len'])}_"
         f"k{int(case['max_draft_tokens'])}_r{int(case['repeat'])}"
+        f"{verify_suffix}"
     )
 
 
@@ -136,8 +192,31 @@ def _row_from_raw(
         engine_profile.get("model_draft_segment_graph_replay_count", 0) or 0
     )
     verify_calls = int(cuda_graph.get("verify_call_count", 0) or 0)
+    if verify_calls <= 0:
+        verify_calls = int(engine_profile.get("spec_run_verify_calls", 0) or 0)
     num_segments = max(1, 48 // segment_size) if segment_size > 0 else 1
     draft_forward_count = max(1, draft_seg_replays // num_segments) if draft_seg_replays else 1
+    draft_profile_count = int(engine_profile.get("spec_run_draft_calls", 0) or 0)
+    if draft_profile_count <= 0:
+        draft_profile_count = draft_forward_count
+    verify_profile_count = int(engine_profile.get("spec_run_verify_calls", 0) or 0)
+    if verify_profile_count <= 0:
+        verify_profile_count = verify_calls
+    verify_hybrid_graph_replays = int(
+        cuda_graph.get(
+            "verify_kt_hybrid_replay_count",
+            engine_profile.get("model_verify_kt_hybrid_graph_replay_count", 0),
+        ) or 0
+    )
+    verify_segment_graph_replays = int(
+        cuda_graph.get("verify_kt_hybrid_segment_graph_replay_count", 0) or 0
+    )
+    verify_graph_replays = verify_hybrid_graph_replays + verify_segment_graph_replays
+
+    def per_count(key: str, count: int) -> float:
+        if count <= 0:
+            return 0.0
+        return float(engine_profile.get(key, 0.0) or 0.0) / float(count)
 
     pred_draft_seg_submit = int(prefetch.get("draft_segment_indexed_submit_count", 0) or 0)
     pred_draft_live_submit = int(
@@ -155,6 +234,7 @@ def _row_from_raw(
         "cache_ratio": float(case["cache_ratio"]),
         "max_draft_tokens": int(case["max_draft_tokens"]),
         "segment_size": int(case["segment_size"]),
+        "verify_segment_size": int(case.get("verify_segment_size", case["segment_size"])),
         "repeat": int(case["repeat"]),
         "wall_elapsed_sec": float(wall_elapsed_sec),
         "generated_output_tokens": int(raw.get("generated_output_tokens", 0) or 0),
@@ -168,10 +248,48 @@ def _row_from_raw(
         ),
         "avg_miss_routes_per_layer": float(cache.get("avg_miss_per_layer", 0.0) or 0.0),
         "avg_active_per_layer": float(cache.get("avg_active_per_layer", 0.0) or 0.0),
+        "verify_cuda_graph_bucket_steps": raw.get("case", {}).get(
+            "verify_cuda_graph_bucket_steps",
+            raw.get("verify_cuda_graph_bucket_steps", []),
+        ),
         "draft_forward_count": draft_forward_count,
+        "draft_profile_count": draft_profile_count,
         "verify_calls": verify_calls,
-        "verify_segment_graph_replays": int(
-            cuda_graph.get("verify_kt_hybrid_segment_graph_replay_count", 0) or 0
+        "verify_profile_count": verify_profile_count,
+        "verify_hybrid_graph_replays": verify_hybrid_graph_replays,
+        "verify_segment_graph_replays": verify_segment_graph_replays,
+        "verify_segment_graph_replay_rate": (
+            float(verify_segment_graph_replays / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_graph_replays": verify_graph_replays,
+        "verify_graph_replay_rate": (
+            float(verify_graph_replays / verify_calls) if verify_calls else 0.0
+        ),
+        "draft_graph_replay_ms_per_forward": per_count(
+            "model_draft_graph_replay_ms", draft_profile_count
+        ),
+        "draft_run_total_ms_per_forward": per_count(
+            "model_run_draft_total_ms", draft_profile_count
+        ),
+        "draft_prepare_decode_ms_per_forward": per_count(
+            "model_prepare_decode_ms", draft_profile_count
+        ),
+        "draft_sample_ms_per_forward": per_count("model_sample_decode_ms", draft_profile_count),
+        "verify_profile_forward_ms_per_call": per_count(
+            "model_verify_forward_ms", verify_profile_count
+        ),
+        "verify_run_total_ms_per_call": per_count(
+            "model_run_verify_total_ms", verify_profile_count
+        ),
+        "verify_metadata_enqueue_ms_per_call": per_count(
+            "model_verify_segment_metadata_enqueue_ms", verify_profile_count
+        ),
+        "verify_prefetch_visible_ms_per_call": per_count(
+            "model_verify_segment_prefetch_visible_overhead_ms", verify_profile_count
+        ),
+        "verify_length_buckets": engine_profile.get(
+            "model_verify_length_buckets",
+            engine_profile.get("verify_length_buckets", {}),
         ),
         # -- per-phase prefetch --
         "draft_phase_submit": draft_phase_submit,
@@ -202,13 +320,14 @@ def _row_from_raw(
 
 
 def _comparison_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[int, float, int, int, int], dict[bool, dict[str, Any]]] = {}
+    grouped: dict[tuple[int, float, int, int, int, int], dict[bool, dict[str, Any]]] = {}
     for row in rows:
         key = (
             int(row["output_len"]),
             round(float(row["cache_ratio"]), 6),
             int(row["max_draft_tokens"]),
             int(row["segment_size"]),
+            int(row["verify_segment_size"]),
             int(row["repeat"]),
         )
         grouped.setdefault(key, {})[bool(row["predictor_enabled"])] = row
@@ -227,6 +346,7 @@ def _comparison_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "cache_ratio": float(on["cache_ratio"]),
                 "max_draft_tokens": int(on["max_draft_tokens"]),
                 "segment_size": int(on["segment_size"]),
+                "verify_segment_size": int(on["verify_segment_size"]),
                 "repeat": int(on["repeat"]),
                 "digest_match": on["outputs_digest"] == off["outputs_digest"],
                 "predicted_alpha_avg": float(on["predicted_alpha_avg"]),
@@ -259,6 +379,7 @@ def _command(
         repo_root / "benchmarks" / "scripts" / "spec_verify_expert_count_stats.py"
     )
     segment_size = int(case["segment_size"])
+    verify_segment_size = int(case.get("verify_segment_size", segment_size))
     predictor_enabled = bool(case["predictor_enabled"])
     return [
         sys.executable,
@@ -276,6 +397,8 @@ def _command(
         str(case["cache_ratio"]),
         "--slots-per-layer",
         "0",
+        "--slots-per-layer-list",
+        args.slots_per_layer_list,
         "--num-seqs",
         "1",
         "--input-len",
@@ -317,7 +440,7 @@ def _command(
         "--prefetch-runtime-mode",
         "draft_segment_indexed",
         "--prefetch-runtime-kind",
-        "predictive",
+        "dual_queue",
         "--dual-queue-segment-size",
         str(segment_size),
         "--prefetch-strategy",
@@ -359,9 +482,9 @@ def _command(
         "--verify-cuda-graph",
         "true",
         "--verify-cuda-graph-bucket-steps",
-        args.verify_cuda_graph_bucket_steps,
+        _bucket_steps_arg(args, case),
         "--verify-prefetch-segment-size",
-        str(segment_size),
+        str(verify_segment_size),
         "--verify-prefetch-visible-budget-ms",
         str(args.verify_prefetch_visible_budget_ms),
         "--verify-prefetch-min-per-boundary",
@@ -416,6 +539,8 @@ def _command(
         str(args.seed),
         "--sync-layer-timing",
         str(args.sync_layer_timing).lower(),
+        "--engine-profile-cuda-sync",
+        str(args.engine_profile_cuda_sync).lower(),
     ]
 
 
@@ -438,6 +563,8 @@ def run_case(
     cmd = _command(args, repo_root, prompt_file, case, case_json, case_index)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    if int(case.get("verify_segment_size", case["segment_size"])) != int(case["segment_size"]):
+        env["NANOVLLM_DUAL_QUEUE_DECOUPLE_VERIFY_SEGMENT"] = "1"
     print(f"[{case_index + 1}] running {name}", flush=True)
     started = time.time()
     with case_log.open("w", encoding="utf-8") as log_file:
@@ -469,9 +596,33 @@ def run_case(
         f"verify_ms={row['verify_forward_ms_avg']:.3f} "
         f"hit={row['route_hit_rate']:.4f} accept={row['acceptance_rate']:.4f} "
         f"miss/L={row['avg_miss_routes_per_layer']:.2f} "
-        f"active/L={row['avg_active_per_layer']:.2f}",
+        f"active/L={row['avg_active_per_layer']:.2f} "
+        f"vgraph={100.0 * row['verify_graph_replay_rate']:.1f}% "
+        f"(full={row['verify_hybrid_graph_replays']},seg={row['verify_segment_graph_replays']})",
         flush=True,
     )
+    print(
+        f"  profile: draft_graph={row['draft_graph_replay_ms_per_forward']:.3f}ms/fwd "
+        f"draft_total={row['draft_run_total_ms_per_forward']:.3f}ms/fwd "
+        f"verify_forward={row['verify_profile_forward_ms_per_call']:.3f}ms/call "
+        f"verify_total={row['verify_run_total_ms_per_call']:.3f}ms/call "
+        f"verify_meta={row['verify_metadata_enqueue_ms_per_call']:.3f}ms/call "
+        f"verify_prefetch_visible={row['verify_prefetch_visible_ms_per_call']:.3f}ms/call",
+        flush=True,
+    )
+    verify_buckets = row.get("verify_length_buckets") or {}
+    if verify_buckets:
+        bucket_parts = []
+        for length_key in sorted(verify_buckets, key=lambda item: int(item)):
+            bucket = verify_buckets[length_key]
+            bucket_parts.append(
+                f"L{length_key}:n={int(bucket.get('call_count', 0))},"
+                f"ms={float(bucket.get('forward_ms_avg', 0.0)):.1f},"
+                f"act={float(bucket.get('active_per_layer_avg', 0.0)):.1f},"
+                f"miss={float(bucket.get('miss_per_layer_avg', 0.0)):.1f},"
+                f"g={100.0 * float(bucket.get('graph_hit_rate', 0.0)):.0f}%"
+            )
+        print(f"  verify buckets: {'; '.join(bucket_parts)}", flush=True)
     print(
         f"  prefetch: submit={row['prefetch_submit_count']} "
         f"publish={row['prefetch_publish_count']} "
@@ -508,40 +659,73 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         f"- predictor path: `{metadata['acceptance_predictor_path']}`",
         f"- predictor modes: `{', '.join('on' if m else 'off' for m in metadata['predictor_modes'])}`",
         f"- segment sizes: `{', '.join(str(x) for x in metadata['segment_sizes'])}`",
+        f"- verify segment override: `{metadata['verify_segment_size_override']}`",
+        f"- verify CUDA graph buckets: `{', '.join(str(x) for x in metadata['verify_cuda_graph_bucket_steps'])}`",
+        f"- auto-extend verify buckets: `{metadata['auto_extend_verify_cuda_graph_buckets']}`",
         f"- output directory: `{metadata['output_dir']}`",
         "",
         "## Cases",
         "",
-        "| predictor | seg | out | ratio | K | rep | tok/s | draft ms | verify ms | hit | accept | predict_alpha_avg | submit | publish | late | draft/fwd | verify/fwd |",
-        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| predictor | seg | vseg | out | ratio | K | rep | tok/s | draft ms | verify ms | vgraph % | active/L | miss/L | hit | accept | predict_alpha_avg | draft graph ms | verify prof ms | verify prefetch ms |",
+        "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         alpha_str = f"{row['predicted_alpha_avg']:.4f}" if row["predictor_enabled"] else "-"
         lines.append(
             "| "
             f"{'on' if row['predictor_enabled'] else 'off'} | {row['segment_size']} | "
+            f"{row['verify_segment_size']} | "
             f"{row['output_len']} | {row['cache_ratio']:.4f} | {row['max_draft_tokens']} | "
             f"{row['repeat']} | {row['throughput_output_tok_s']:.3f} | "
             f"{row['draft_forward_ms_avg']:.3f} | {row['verify_forward_ms_avg']:.3f} | "
+            f"{100.0 * row['verify_graph_replay_rate']:.1f} | "
+            f"{row['avg_active_per_layer']:.2f} | {row['avg_miss_routes_per_layer']:.2f} | "
             f"{row['route_hit_rate']:.4f} | {row['acceptance_rate']:.4f} | {alpha_str} | "
-            f"{row['prefetch_submit_count']} | {row['prefetch_publish_count']} | "
-            f"{row['prefetch_late_count']} | {row['draft_prefetch_per_forward']:.1f} | "
-            f"{row['verify_prefetch_per_forward']:.1f} |"
+            f"{row['draft_graph_replay_ms_per_forward']:.3f} | "
+            f"{row['verify_profile_forward_ms_per_call']:.3f} | "
+            f"{row['verify_prefetch_visible_ms_per_call']:.3f} |"
         )
+
+    bucket_rows = [
+        (row, length_key, bucket)
+        for row in rows
+        for length_key, bucket in (row.get("verify_length_buckets") or {}).items()
+    ]
+    if bucket_rows:
+        lines.extend(
+            [
+                "",
+                "## Verify Length Buckets",
+                "",
+                "| case | len | calls | verify ms | token count | graph % | active/L | miss/L |",
+                "|:---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, length_key, bucket in bucket_rows:
+            lines.append(
+                "| "
+                f"{row['name']} | {int(length_key)} | {int(bucket.get('call_count', 0))} | "
+                f"{float(bucket.get('forward_ms_avg', 0.0)):.3f} | "
+                f"{float(bucket.get('token_count_avg', 0.0)):.2f} | "
+                f"{100.0 * float(bucket.get('graph_hit_rate', 0.0)):.1f} | "
+                f"{float(bucket.get('active_per_layer_avg', 0.0)):.2f} | "
+                f"{float(bucket.get('miss_per_layer_avg', 0.0)):.2f} |"
+            )
 
     lines.extend(
         [
             "",
             "## Predictor on vs off (overhead + prediction quality)",
             "",
-            "| seg | out | ratio | K | rep | digest | tok/s on | tok/s off | overhead % | draft ms delta | predict_alpha_avg | measured accept | alpha-accept delta |",
-            "|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| seg | vseg | out | ratio | K | rep | digest | tok/s on | tok/s off | overhead % | draft ms delta | predict_alpha_avg | measured accept | alpha-accept delta |",
+            "|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in comparisons:
         lines.append(
             "| "
-            f"{row['segment_size']} | {row['output_len']} | {row['cache_ratio']:.4f} | "
+            f"{row['segment_size']} | {row['verify_segment_size']} | "
+            f"{row['output_len']} | {row['cache_ratio']:.4f} | "
             f"{row['max_draft_tokens']} | {row['repeat']} | "
             f"{'match' if row['digest_match'] else 'DIFF'} | "
             f"{row['throughput_on']:.3f} | {row['throughput_off']:.3f} | "
@@ -557,7 +741,9 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             "",
             "- `predict_alpha_avg` is the mean predicted theoretical acceptance alpha over all draft sub-steps.",
             "- `overhead %` = throughput reduction from enabling the predictor (predictor-off is the baseline).",
-            "- `digest` should be `match`: the predictor must not change generated tokens (it only observes).",
+            "- `digest` can differ when the predictor participates in a stopping policy such as `tpot`.",
+            "  Use identical stopping policy and draft lengths when validating predictor observation-only overhead.",
+            "- `vgraph %` must be near 100% before comparing verify latency; low values mean bucket fallback.",
             "- `alpha-accept delta` compares predicted alpha against the measured acceptance rate; a large gap",
             "  indicates distribution shift between the predictor's training mechanism and the live draft.",
             "- All other columns mirror `bench_dual_queue_prefetch.py` for direct comparison.",
@@ -598,9 +784,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "output_dir": str(output_dir),
             "predictor_modes": predictor_modes,
             "segment_sizes": _parse_csv(args.segment_sizes, int),
+            "verify_segment_size_override": int(args.verify_segment_size_override),
             "cache_ratios": _parse_csv(args.cache_ratios, float),
             "output_lens": _parse_csv(args.output_lens, int),
             "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int),
+            "verify_cuda_graph_bucket_steps": _resolve_verify_cuda_graph_bucket_steps(args),
+            "auto_extend_verify_cuda_graph_buckets": bool(
+                args.auto_extend_verify_cuda_graph_buckets
+            ),
+            "engine_profile_cuda_sync": bool(args.engine_profile_cuda_sync),
             "repeats": int(args.repeats),
             "argv": sys.argv,
         },
@@ -647,8 +839,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-tpot-tv-ms", type=float, default=80.0)
     parser.add_argument("--output-lens", default="128,512")
     parser.add_argument("--cache-ratios", default="0.25,0.3125,0.50")
+    parser.add_argument("--slots-per-layer-list", default="")
     parser.add_argument("--max-draft-tokens-values", default="4,8")
     parser.add_argument("--segment-sizes", default="12")
+    parser.add_argument(
+        "--verify-segment-size-override",
+        type=int,
+        default=0,
+        help=(
+            "If >0, keep draft/dual_queue segment size from --segment-sizes but "
+            "use this value for verify_prefetch_segment_size. This enables "
+            "NANOVLLM_DUAL_QUEUE_DECOUPLE_VERIFY_SEGMENT for the child process."
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--cache-strategy", default="lru")
     parser.add_argument("--draft-reroute-policy", default="entropy_cache_bias")
@@ -688,9 +891,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.99)
     parser.add_argument("--verify-cuda-graph-bucket-steps", default="3,5,8,12")
+    parser.add_argument("--auto-extend-verify-cuda-graph-buckets", type=str2bool, default=True)
     parser.add_argument("--dist-port-base", type=int, default=30700)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sync-layer-timing", type=str2bool, default=False)
+    parser.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     parser.add_argument("--case-timeout-sec", type=int, default=2400)
     parser.add_argument("--skip-existing", type=str2bool, default=True)
     parser.add_argument("--fail-fast", type=str2bool, default=True)

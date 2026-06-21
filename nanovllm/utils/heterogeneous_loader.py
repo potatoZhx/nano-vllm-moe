@@ -121,11 +121,16 @@ class HeterogeneousModelLoader:
         cpu_pool: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> dict[int, LayerExpertCache]:
         slots_per_layer = self.config.heterogeneous_slots_per_layer
+        slots_per_layer_list = list(getattr(self.config, "heterogeneous_slots_per_layer_list", []) or [])
         layer_caches: dict[int, LayerExpertCache] = {}
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for layer_idx, experts in cpu_pool.items():
             num_experts = len(experts)
-            slots = num_experts if slots_per_layer <= 0 else min(slots_per_layer, num_experts)
+            if slots_per_layer_list:
+                requested_slots = int(slots_per_layer_list[int(layer_idx)])
+                slots = num_experts if requested_slots <= 0 else min(requested_slots, num_experts)
+            else:
+                slots = num_experts if slots_per_layer <= 0 else min(slots_per_layer, num_experts)
             sample = next(iter(experts.values()))
             layer_caches[layer_idx] = LayerExpertCache(
                 num_experts=num_experts,

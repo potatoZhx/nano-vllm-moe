@@ -49,6 +49,12 @@ if TYPE_CHECKING:
     from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
 
 
+def _verify_all_cpu_experts_enabled() -> bool:
+    return os.getenv("NANOVLLM_VERIFY_ALL_CPU_EXPERTS", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 class Qwen3MoeAttention(nn.Module):
 
     def __init__(
@@ -718,6 +724,29 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+        verify_all_cpu = _verify_all_cpu_experts_enabled()
+        if verify_all_cpu:
+            cpu_route_mask = torch.ones(
+                selected_experts.numel(),
+                dtype=torch.bool,
+                device=selected_experts.device,
+            )
+            if self.runtime_meta_recorder is not None:
+                self.runtime_meta_recorder.record_layer(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    uncached_route_mask=cpu_route_mask,
+                )
+            self.cpu_backend.begin_forward_graph_verify(
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                force_all_cpu=True,
+            )
+            kt_output = self.cpu_backend.finish_forward_graph_verify(hidden_states)
+            return kt_output.to(dtype=hidden_states.dtype, device=hidden_states.device)
+
         plan = build_verify_graph_safe_plan_gpu(
             layer_idx=self.layer_idx,
             selected_experts=selected_experts,
@@ -743,10 +772,31 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
         gpu_hidden = hidden_states[gpu_token_indices]
         gpu_weights = plan.gpu_route_weights.index_select(0, gpu_route_indices)
+        compact_gpu_routes = os.getenv(
+            "NANOVLLM_VERIFY_COMPACT_GPU_ROUTES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if compact_gpu_routes:
+            gpu_active_mask = (~plan.cpu_route_mask).index_select(
+                0, gpu_route_indices,
+            ).unsqueeze(-1)
+        else:
+            gpu_active_mask = None
 
         gate_up_buffer, down_buffer = self.expert_cache.get_layer_buffers()
         gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.gpu_m_sizes)
+        if gpu_active_mask is not None:
+            gate_up = torch.where(
+                gpu_active_mask,
+                gate_up,
+                torch.zeros((), dtype=gate_up.dtype, device=gate_up.device),
+            )
         gpu_expert_out = fused_moe_linear(self.act_fn(gate_up), down_buffer, plan.gpu_m_sizes)
+        if gpu_active_mask is not None:
+            gpu_expert_out = torch.where(
+                gpu_active_mask,
+                gpu_expert_out,
+                torch.zeros((), dtype=gpu_expert_out.dtype, device=gpu_expert_out.device),
+            )
         gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
 
         kt_output = self.cpu_backend.finish_forward_graph_verify(hidden_states)

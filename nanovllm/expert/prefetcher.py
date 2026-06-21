@@ -1941,6 +1941,10 @@ class PrefetchRuntime:
     ) -> int:
         t0 = time.perf_counter()
         published = 0
+        batch_deferred_publish = os.getenv("NANOVLLM_BATCH_DEFERRED_PUBLISH", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        deferred_device_updates: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
         for key, ticket in list(self.inflight.items()):
             if not ticket.direct_active:
                 continue
@@ -1978,6 +1982,8 @@ class PrefetchRuntime:
             _non_deferred = ticket.source in _NON_DEFERRED_SOURCES
             if _non_deferred:
                 published_item = cache.commit_active_prefetch(reservation)
+            elif batch_deferred_publish:
+                published_item = cache.commit_deferred_active_prefetch_host_only(reservation)
             else:
                 published_item = cache.commit_deferred_active_prefetch(reservation)
             self.inflight.pop(key, None)
@@ -1987,6 +1993,14 @@ class PrefetchRuntime:
                 self._profile["prefetch_late_count"] += 1
                 self._record_prefetch_late(ticket)
                 continue
+            if batch_deferred_publish and not _non_deferred:
+                deferred_device_updates[int(ticket.layer_idx)].append(
+                    (
+                        int(ticket.active_slot_idx),
+                        int(ticket.expert_idx),
+                        int(ticket.active_slot_prev_expert),
+                    )
+                )
             self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
             self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
             published += 1
@@ -2001,6 +2015,11 @@ class PrefetchRuntime:
                     self._draft_segment_indexed_success_by_segment[int(ticket.segment_id)] += 1
             elif ticket.source == "verify_layer_predict":
                 self._profile["verify_layer_prefetch_publish_count"] += 1
+        if batch_deferred_publish:
+            for layer_idx, updates in deferred_device_updates.items():
+                cache = self.layer_caches.get(int(layer_idx))
+                if cache is not None:
+                    cache.apply_deferred_active_prefetch_device_updates(updates)
         publish_ms = (time.perf_counter() - t0) * 1000.0
         self._profile["publish_ms"] += publish_ms
         self._profile["direct_active_prefetch_publish_ms"] += publish_ms

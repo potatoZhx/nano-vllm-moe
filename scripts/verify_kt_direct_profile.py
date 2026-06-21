@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import mean, median
 from time import perf_counter
@@ -465,6 +466,8 @@ def analyze_prefetch_snapshots(snapshots: list[dict[str, Any]]) -> dict[str, Any
 
 # ── main ─────────────────────────────────────────────────────────────────────
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.nvtx_ranges:
+        os.environ["NANOVLLM_NVTX_RANGES"] = "1"
     install_verify_layer_probe(sync_layer_timing=args.sync_layer_timing)
     install_model_forward_probe()
     install_kt_direct_probe()
@@ -493,6 +496,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     kt_numa = [int(x) for x in args.kt_numa_nodes.split(",") if x.strip()] if args.kt_numa_nodes else []
     kt_bs = [int(x) for x in args.kt_capture_bs.split(",") if x.strip()] if args.kt_capture_bs else [1, 2, 4, 8, 16, 32]
     verify_buckets = [int(x) for x in args.verify_cuda_graph_bucket_steps.split(",") if x.strip()] if args.verify_cuda_graph_bucket_steps else [4, 8, 12, 16]
+    if args.auto_extend_verify_cuda_graph_buckets:
+        verify_buckets.append(int(args.max_draft_tokens) + 1)
+    verify_buckets = sorted(set(verify_buckets))
 
     prefetch_enabled = args.prefetch_enabled
 
@@ -542,11 +548,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         spec_verify_miss_policy=args.spec_verify_miss_policy,
         cache_strategy=args.cache_strategy,
         spec_enable_prefetch=prefetch_enabled,
+        prefetch_runtime_mode=args.prefetch_runtime_mode,
+        prefetch_runtime_kind=args.prefetch_runtime_kind,
+        dual_queue_segment_size=args.dual_queue_segment_size,
+        draft_prefetch_segment_size=args.draft_prefetch_segment_size,
+        verify_prefetch_segment_size=args.verify_prefetch_segment_size,
+        prefetch_transfer_stream_count=args.prefetch_transfer_stream_count,
+        prefetch_metadata_host_buffer_pool_size=args.prefetch_metadata_host_buffer_pool_size,
         prefetch_step_budget=args.prefetch_step_budget,
         prefetch_max_inflight=args.prefetch_max_inflight,
         prefetch_verify_layer_max_budget=args.prefetch_verify_layer_max_budget,
         prefetch_staging_slots_per_layer=args.prefetch_staging_slots_per_layer,
         prefetch_verify_attention_ratio=args.prefetch_verify_attention_ratio,
+        draft_prefetch_visible_budget_ms=args.draft_prefetch_visible_budget_ms,
+        draft_prefetch_min_per_boundary=args.draft_prefetch_min_per_boundary,
+        draft_prefetch_max_per_boundary=args.draft_prefetch_max_per_boundary,
+        verify_prefetch_visible_budget_ms=args.verify_prefetch_visible_budget_ms,
+        verify_prefetch_min_per_boundary=args.verify_prefetch_min_per_boundary,
+        verify_prefetch_max_per_boundary=args.verify_prefetch_max_per_boundary,
         cache_eviction_budget_per_step=args.cache_eviction_budget_per_step,
         prefetch_global_queue_capacity=args.prefetch_global_queue_capacity,
         prefetch_use_prefill_history=args.prefetch_use_prefill_history,
@@ -558,6 +577,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         draft_cuda_graph_cpu_backend=args.draft_cuda_graph_cpu_backend,
         verify_cuda_graph=args.verify_cuda_graph,
         verify_cuda_graph_bucket_steps=verify_buckets,
+        spec_profile=True,
+        engine_profile=True,
+        engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         seed=args.seed,
     )
 
@@ -583,14 +605,53 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     PREFETCH_STEP_SNAPSHOTS.clear()
 
     print(f"Benchmark run (output_len={args.output_len}) ...", flush=True)
+    torch_profiler_result: dict[str, Any] = {}
+    profiler_context = nullcontext()
+    if args.torch_profile_output:
+        profiler_context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=args.torch_profile_record_shapes,
+            profile_memory=args.torch_profile_memory,
+            with_stack=False,
+        )
     t0 = perf_counter()
-    result = llm.generate([prompt], sp)
+    if args.cuda_profiler_range and torch.cuda.is_available():
+        torch.cuda.cudart().cudaProfilerStart()
+    try:
+        with profiler_context as prof:
+            result = llm.generate([prompt], sp)
+    finally:
+        if args.cuda_profiler_range and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
     elapsed = perf_counter() - t0
+    if args.torch_profile_output:
+        trace_path = Path(args.torch_profile_output)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(trace_path))
+        torch_profiler_result = {
+            "chrome_trace": str(trace_path),
+            "cpu_top": prof.key_averages().table(
+                sort_by="self_cpu_time_total",
+                row_limit=args.torch_profile_row_limit,
+            ),
+            "cuda_top": prof.key_averages().table(
+                sort_by="self_cuda_time_total",
+                row_limit=args.torch_profile_row_limit,
+            ),
+        }
 
     profile = llm.get_profile(reset=False)
-    ep = profile.get("engine_profile", {})
+    ep = profile
     generated_tokens = int(profile.get("generated_output_tokens", 0) or profile.get("decode_count", 0) or 0)
+    if generated_tokens <= 0:
+        generated_tokens = int(args.output_len)
     throughput = float(profile.get("throughput_output_tok_s", 0.0) or 0.0)
+    if throughput <= 0.0 and elapsed > 0.0:
+        throughput = float(generated_tokens) / float(elapsed)
 
     print(f"Generated {generated_tokens} tokens in {elapsed:.1f}s ({throughput:.2f} tok/s)")
 
@@ -621,6 +682,66 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     verify_analysis = analyze_verify_layer_events(VERIFY_LAYER_EVENTS)
     draft_analysis = analyze_verify_layer_events(DRAFT_LAYER_EVENTS) if DRAFT_LAYER_EVENTS else {}
     prefetch_analysis = analyze_prefetch_snapshots(PREFETCH_STEP_SNAPSHOTS)
+
+    if "aggregate" not in verify_analysis:
+        print()
+        print("=" * 72)
+        print("VERIFY PROFILE")
+        print("=" * 72)
+        print("  No Python per-layer verify events were recorded.")
+        print("  This is expected when the measured verify path replays a CUDA graph:")
+        print("  Python hooks run during graph capture, not on each replay.")
+        print("  Use --verify-cuda-graph false for Python-level per-layer decomposition,")
+        print("  and use --torch-profile-output for CUDA graph replay kernel/timeline analysis.")
+        print()
+        print(f"  Verify calls: {int(ep.get('spec_run_verify_calls', 0) or 0)}")
+        print(f"  Verify forward ms avg:  {float(ep.get('verify_forward_ms', 0)):.3f}")
+        print(f"  Draft forward ms avg:   {float(ep.get('draft_forward_ms', 0)):.3f}")
+
+        out = {
+            "config": {
+                "model_path": args.model_path,
+                "cache_ratio": effective_cache_ratio,
+                "slots": slots,
+                "num_experts": num_experts,
+                "cpu_expert_backend": args.cpu_expert_backend,
+                "spec_verify_miss_policy": args.spec_verify_miss_policy,
+                "prefetch_enabled": prefetch_enabled,
+                "prefetch_step_budget": args.prefetch_step_budget,
+                "prefetch_max_inflight": args.prefetch_max_inflight,
+                "prefetch_runtime_mode": args.prefetch_runtime_mode,
+                "prefetch_runtime_kind": args.prefetch_runtime_kind,
+                "dual_queue_segment_size": args.dual_queue_segment_size,
+                "output_len": args.output_len,
+                "max_draft_tokens": args.max_draft_tokens,
+                "verify_cuda_graph": args.verify_cuda_graph,
+                "verify_cuda_graph_bucket_steps": verify_buckets,
+                "engine_profile_cuda_sync": args.engine_profile_cuda_sync,
+                "torch_profile_output": args.torch_profile_output,
+                "cuda_profiler_range": args.cuda_profiler_range,
+            },
+            "summary": {
+                "generated_tokens": generated_tokens,
+                "elapsed_sec": elapsed,
+                "throughput_tok_s": throughput,
+                "verify_calls": int(ep.get("spec_run_verify_calls", 0) or 0),
+                "verify_forward_ms_avg": float(ep.get("verify_forward_ms", 0)),
+                "draft_forward_ms_avg": float(ep.get("draft_forward_ms", 0)),
+                "note": "No Python per-layer events; CUDA graph replay bypasses Python hooks.",
+            },
+            "verify_per_layer": verify_analysis,
+            "draft_per_layer": draft_analysis,
+            "prefetch": prefetch_analysis,
+            "torch_profiler": torch_profiler_result,
+        }
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2, ensure_ascii=False)
+            print(f"\nWrote {args.output}")
+        del llm
+        torch.cuda.empty_cache()
+        return out
 
     agg = verify_analysis["aggregate"]
     budget = verify_analysis["budget_per_verify_forward"]
@@ -856,9 +977,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "prefetch_enabled": prefetch_enabled,
             "prefetch_step_budget": args.prefetch_step_budget,
             "prefetch_max_inflight": args.prefetch_max_inflight,
+            "prefetch_runtime_mode": args.prefetch_runtime_mode,
+            "prefetch_runtime_kind": args.prefetch_runtime_kind,
+            "dual_queue_segment_size": args.dual_queue_segment_size,
             "output_len": args.output_len,
             "max_draft_tokens": args.max_draft_tokens,
             "verify_cuda_graph": args.verify_cuda_graph,
+            "verify_cuda_graph_bucket_steps": verify_buckets,
+            "engine_profile_cuda_sync": args.engine_profile_cuda_sync,
+            "torch_profile_output": args.torch_profile_output,
+            "cuda_profiler_range": args.cuda_profiler_range,
         },
         "summary": {
             "generated_tokens": generated_tokens,
@@ -871,6 +999,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "verify_per_layer": verify_analysis,
         "draft_per_layer": draft_analysis,
         "prefetch": prefetch_analysis,
+        "torch_profiler": torch_profiler_result,
     }
 
     if args.output:
@@ -927,11 +1056,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     # prefetch
     p.add_argument("--prefetch-enabled", type=lambda x: x.lower() == "true", default="true")
+    p.add_argument("--prefetch-runtime-mode", default="baseline_staging",
+                   choices=["baseline_staging", "draft_direct_active", "draft_segment_indexed"])
+    p.add_argument("--prefetch-runtime-kind", default="legacy",
+                   choices=["legacy", "predictive", "dual_queue"])
+    p.add_argument("--dual-queue-segment-size", type=int, default=12)
+    p.add_argument("--draft-prefetch-segment-size", type=int, default=12)
+    p.add_argument("--verify-prefetch-segment-size", type=int, default=12)
+    p.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
+    p.add_argument("--prefetch-metadata-host-buffer-pool-size", type=int, default=3)
     p.add_argument("--prefetch-step-budget", type=int, default=8)
     p.add_argument("--prefetch-max-inflight", type=int, default=16)
     p.add_argument("--prefetch-verify-layer-max-budget", type=int, default=8)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--prefetch-verify-attention-ratio", type=float, default=1.0)
+    p.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
+    p.add_argument("--draft-prefetch-min-per-boundary", type=int, default=0)
+    p.add_argument("--draft-prefetch-max-per-boundary", type=int, default=4)
+    p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
+    p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
+    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
     p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     p.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
     p.add_argument("--prefetch-use-prefill-history", type=lambda x: x.lower() == "true", default="true")
@@ -942,8 +1086,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-cuda-graph-cpu-backend", default="none")
     p.add_argument("--verify-cuda-graph", type=lambda x: x.lower() == "true", default="false")
     p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
+    p.add_argument("--auto-extend-verify-cuda-graph-buckets", type=lambda x: x.lower() == "true", default=True)
 
     p.add_argument("--sync-layer-timing", type=lambda x: x.lower() == "true", default="true")
+    p.add_argument("--engine-profile-cuda-sync", type=lambda x: x.lower() == "true", default=True)
+    p.add_argument("--torch-profile-output", default="")
+    p.add_argument("--torch-profile-row-limit", type=int, default=30)
+    p.add_argument("--torch-profile-record-shapes", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--torch-profile-memory", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--cuda-profiler-range", type=lambda x: x.lower() == "true", default=False)
+    p.add_argument("--nvtx-ranges", type=lambda x: x.lower() == "true", default=False)
     p.add_argument("--dist-port", type=int, default=29500)
 
     return p

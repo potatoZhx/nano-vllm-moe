@@ -85,6 +85,7 @@ class Config:
     engine_profile: bool = False
     engine_profile_cuda_sync: bool = True
     heterogeneous_slots_per_layer: int = 0
+    heterogeneous_slots_per_layer_list: list[int] = field(default_factory=list)
     cpu_expert_pin_memory: bool = False  # pin_memory adds ~60s for 61GB model
     cpu_expert_execution_enabled: bool = False
     cpu_expert_backend: str = "torch"
@@ -133,6 +134,10 @@ class Config:
     draft_tpot_tv_ms: float = 80.0         # fixed per-verify time (v1)
 
     def __post_init__(self):
+        if isinstance(self.heterogeneous_slots_per_layer_list, str):
+            self.heterogeneous_slots_per_layer_list = [
+                int(x) for x in self.heterogeneous_slots_per_layer_list.split(",") if x.strip()
+            ]
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
@@ -217,7 +222,11 @@ class Config:
             assert self.spec_verify_miss_policy == "cpu", "dual_queue verify requires spec_verify_miss_policy=cpu"
             self.draft_prefetch_frontier_granularity = "segment"
             self.draft_prefetch_segment_size = int(self.dual_queue_segment_size)
-            self.verify_prefetch_segment_size = int(self.dual_queue_segment_size)
+            decouple_verify_segment = os.getenv(
+                "NANOVLLM_DUAL_QUEUE_DECOUPLE_VERIFY_SEGMENT", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not decouple_verify_segment:
+                self.verify_prefetch_segment_size = int(self.dual_queue_segment_size)
             self.draft_cuda_graph_enabled = True
             self.verify_cuda_graph = True
             self.verify_cuda_graph_kt_hybrid = True
@@ -270,6 +279,13 @@ class Config:
             assert self.acceptance_predictor_path, "acceptance_predictor_enabled requires acceptance_predictor_path"
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.heterogeneous_slots_per_layer_list:
+            assert len(self.heterogeneous_slots_per_layer_list) == int(self.hf_config.num_hidden_layers), (
+                "heterogeneous_slots_per_layer_list must have one entry per hidden layer"
+            )
+            assert all(int(x) >= 0 for x in self.heterogeneous_slots_per_layer_list), (
+                "heterogeneous_slots_per_layer_list entries must be non-negative"
+            )
         if self.prefetch_runtime_kind == "dual_queue":
             assert self.prefetch_staging_slots_per_layer >= 1, (
                 "dual_queue requires prefetch_staging_slots_per_layer >= 1"

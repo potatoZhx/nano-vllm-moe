@@ -46,6 +46,13 @@ def _parse_int_csv(values: str) -> list[int]:
     return out
 
 
+def _resolve_verify_cuda_graph_bucket_steps(args: argparse.Namespace) -> list[int]:
+    buckets = _parse_int_csv(args.verify_cuda_graph_bucket_steps)
+    if bool(getattr(args, "auto_extend_verify_cuda_graph_buckets", True)):
+        buckets.append(int(args.max_draft_tokens) + 1)
+    return sorted(set(int(x) for x in buckets))
+
+
 def _make_prompts(num_seqs: int, input_len: int, seed: int) -> list[str]:
     rng = Random(seed)
     prompts: list[str] = []
@@ -527,11 +534,23 @@ def run_single_case(args: argparse.Namespace) -> None:
     slots = int(args.slots_per_layer)
     if slots <= 0:
         slots = int(round(num_experts * args.cache_ratio))
-    effective_cache_ratio = float(slots / num_experts)
+    slots_per_layer_list = _parse_int_csv(args.slots_per_layer_list) if args.slots_per_layer_list else []
+    if slots_per_layer_list:
+        if len(slots_per_layer_list) != int(getattr(hf_config, "num_hidden_layers")):
+            raise ValueError(
+                "--slots-per-layer-list must have one entry per hidden layer "
+                f"({getattr(hf_config, 'num_hidden_layers')} expected)"
+            )
+        effective_cache_ratio = float(sum(slots_per_layer_list) / (len(slots_per_layer_list) * num_experts))
+    else:
+        effective_cache_ratio = float(slots / num_experts)
+
+    verify_cuda_graph_bucket_steps = _resolve_verify_cuda_graph_bucket_steps(args)
 
     case_info = {
         "cache_ratio": effective_cache_ratio,
         "slots_per_layer": slots,
+        "slots_per_layer_list": slots_per_layer_list,
         "prefetch_enabled": bool(args.prefetch_enabled),
         "acceptance_strategy": args.acceptance_strategy,
         "temperature": float(args.temperature),
@@ -568,7 +587,9 @@ def run_single_case(args: argparse.Namespace) -> None:
         "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
         "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
         "verify_cuda_graph": bool(args.verify_cuda_graph),
-        "verify_cuda_graph_bucket_steps": _parse_int_csv(args.verify_cuda_graph_bucket_steps),
+        "verify_cuda_graph_bucket_steps": verify_cuda_graph_bucket_steps,
+        "auto_extend_verify_cuda_graph_buckets": bool(args.auto_extend_verify_cuda_graph_buckets),
+        "engine_profile_cuda_sync": bool(args.engine_profile_cuda_sync),
     }
 
     # ---- monkey-patch: cap verify CPU routes per layer ----
@@ -633,6 +654,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         enable_heterogeneous=True,
         enable_speculative=True,
         heterogeneous_slots_per_layer=slots,
+        heterogeneous_slots_per_layer_list=slots_per_layer_list,
         max_draft_tokens=args.max_draft_tokens,
         draft_top_c=args.draft_top_c,
         draft_reroute_policy=args.draft_reroute_policy,
@@ -664,7 +686,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         spec_verify_miss_policy=args.spec_verify_miss_policy,
         spec_profile=True,
         engine_profile=True,
-        engine_profile_cuda_sync=True,
+        engine_profile_cuda_sync=args.engine_profile_cuda_sync,
         spec_enable_prefetch=args.prefetch_enabled,
         cache_strategy=args.cache_strategy,
         rank_guard_threshold=args.rank_guard_threshold,
@@ -708,7 +730,7 @@ def run_single_case(args: argparse.Namespace) -> None:
         draft_prefetch_min_per_boundary=args.draft_prefetch_min_per_boundary,
         draft_prefetch_max_per_boundary=args.draft_prefetch_max_per_boundary,
         verify_cuda_graph=args.verify_cuda_graph,
-        verify_cuda_graph_bucket_steps=_parse_int_csv(args.verify_cuda_graph_bucket_steps),
+        verify_cuda_graph_bucket_steps=verify_cuda_graph_bucket_steps,
         verify_prefetch_segment_size=args.verify_prefetch_segment_size,
         verify_prefetch_visible_budget_ms=args.verify_prefetch_visible_budget_ms,
         verify_prefetch_min_per_boundary=args.verify_prefetch_min_per_boundary,
@@ -1058,7 +1080,9 @@ def run_suite(args: argparse.Namespace) -> None:
                     "--verify-cuda-graph",
                     str(args.verify_cuda_graph).lower(),
                     "--verify-cuda-graph-bucket-steps",
-                    args.verify_cuda_graph_bucket_steps,
+                    ",".join(str(x) for x in _resolve_verify_cuda_graph_bucket_steps(args)),
+                    "--auto-extend-verify-cuda-graph-buckets",
+                    str(args.auto_extend_verify_cuda_graph_buckets).lower(),
                     "--rank-guard-threshold",
                     str(args.rank_guard_threshold),
                     "--rank-guard-ema-alpha",
@@ -1108,7 +1132,9 @@ def run_suite(args: argparse.Namespace) -> None:
             "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
             "draft_cuda_graph_cpu_backend": args.draft_cuda_graph_cpu_backend,
             "verify_cuda_graph": bool(args.verify_cuda_graph),
-            "verify_cuda_graph_bucket_steps": _parse_int_csv(args.verify_cuda_graph_bucket_steps),
+            "verify_cuda_graph_bucket_steps": _resolve_verify_cuda_graph_bucket_steps(args),
+            "auto_extend_verify_cuda_graph_buckets": bool(args.auto_extend_verify_cuda_graph_buckets),
+            "engine_profile_cuda_sync": bool(args.engine_profile_cuda_sync),
             "acceptance_strategy": args.acceptance_strategy,
             "temperature": float(args.temperature),
             "cpu_expert_pin_memory": bool(args.cpu_expert_pin_memory),
@@ -1135,6 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-ratios", default="0.75,0.50,0.25")
     p.add_argument("--cache-ratio", type=float, default=0.75)
     p.add_argument("--slots-per-layer", type=int, default=0)
+    p.add_argument("--slots-per-layer-list", default="")
     p.add_argument("--prefetch-order", choices=["off,on", "on,off"], default="off,on")
     p.add_argument("--prefetch-enabled", type=str2bool, default=False)
     p.add_argument("--num-seqs", type=int, default=1)
@@ -1237,6 +1264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--draft-prefetch-max-per-boundary", type=int, default=4)
     p.add_argument("--verify-cuda-graph", type=str2bool, default=False)
     p.add_argument("--verify-cuda-graph-bucket-steps", default="4,8,12,16")
+    p.add_argument("--auto-extend-verify-cuda-graph-buckets", type=str2bool, default=True)
     p.add_argument("--verify-prefetch-segment-size", type=int, default=12)
     p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
     p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
@@ -1245,6 +1273,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sync-layer-timing", type=str2bool, default=True)
+    p.add_argument("--engine-profile-cuda-sync", type=str2bool, default=True)
     p.add_argument("--prompt-text", default="",
                    help="Optional custom prompt text.")
     p.add_argument("--prompt-text-file", default="",

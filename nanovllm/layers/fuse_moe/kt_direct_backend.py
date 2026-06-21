@@ -544,7 +544,15 @@ class KtDirectCpuMoeBackend:
     def supports_batch_size(self, batch_size: int) -> bool:
         return int(batch_size) <= self.max_tokens
 
-    def _refresh_gpu_expert_mask(self, *, non_blocking: bool) -> None:
+    def _refresh_gpu_expert_mask(
+        self,
+        *,
+        non_blocking: bool,
+        force_all_cpu: bool = False,
+    ) -> None:
+        if force_all_cpu:
+            self.gpu_expert_mask_cpu.fill_(False)
+            return
         source = self._gpu_expert_mask_source
         if source.device.type == "cpu":
             self.gpu_expert_mask_cpu.copy_(source.to(dtype=torch.bool))
@@ -652,6 +660,7 @@ class KtDirectCpuMoeBackend:
         hidden_states: torch.Tensor,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
+        force_all_cpu: bool = False,
     ) -> int:
         """Submit kt_direct CPU work for CUDA graph capture/replay.
 
@@ -671,7 +680,13 @@ class KtDirectCpuMoeBackend:
         ) = KtDirectCPUBuffer.get_buffer(flat_hidden, self.num_experts_per_tok)
         slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
 
-        self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
+        if force_all_cpu:
+            self._refresh_gpu_expert_mask(
+                non_blocking=flat_hidden.is_cuda,
+                force_all_cpu=True,
+            )
+        else:
+            self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
         input_cpu[slot].copy_(flat_hidden, non_blocking=True)
         expert_ids_cpu[slot].copy_(topk_ids, non_blocking=True)
         routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)

@@ -94,6 +94,9 @@ class ModelRunner:
         self.event = event
         self.profile_enabled = bool(getattr(config, "engine_profile", False))
         self.profile_cuda_sync = bool(getattr(config, "engine_profile_cuda_sync", True))
+        self._nvtx_ranges_enabled = os.getenv("NANOVLLM_NVTX_RANGES", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         self._profile = defaultdict(float)
         self.layer_caches = {}
         self.cpu_expert_pool = {}
@@ -123,9 +126,13 @@ class ModelRunner:
         self._verify_layer_compute_ms_ema: dict[int, float] = {}
         self._verify_layer_timing_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
         self._verify_layer_active_timing: dict[int, object] = {}
+        self._verify_length_buckets: dict[int, defaultdict[str, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
         self._dual_queue_segment_timing_events: list[tuple[str, int, object, object]] = []
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
+        self._verify_segment_metadata_enqueued_step_id = -1
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -352,11 +359,29 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def _nvtx_push(self, name: str) -> None:
+        if (
+            getattr(self, "_nvtx_ranges_enabled", False)
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.nvtx.range_push(name)
+
+    def _nvtx_pop(self) -> None:
+        if (
+            getattr(self, "_nvtx_ranges_enabled", False)
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.nvtx.range_pop()
+
     def _ensure_prefetch_internal_state(self) -> None:
         if not hasattr(self, "profile_enabled"):
             self.profile_enabled = False
         if not hasattr(self, "profile_cuda_sync"):
             self.profile_cuda_sync = False
+        if not hasattr(self, "_nvtx_ranges_enabled"):
+            self._nvtx_ranges_enabled = os.getenv("NANOVLLM_NVTX_RANGES", "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
         if not hasattr(self, "rank"):
             self.rank = 0
         if not hasattr(self, "_profile"):
@@ -393,14 +418,50 @@ class ModelRunner:
             self._verify_layer_timing_events = []
         if not hasattr(self, "_verify_layer_active_timing"):
             self._verify_layer_active_timing = {}
+        if not hasattr(self, "_verify_length_buckets"):
+            self._verify_length_buckets = defaultdict(lambda: defaultdict(float))
         if not hasattr(self, "_dual_queue_segment_timing_events"):
             self._dual_queue_segment_timing_events = []
+        if not hasattr(self, "_verify_segment_metadata_enqueued_step_id"):
+            self._verify_segment_metadata_enqueued_step_id = -1
 
     def _record_profile(self, key: str, dt_sec: float) -> None:
         self._ensure_prefetch_internal_state()
         if self.profile_enabled and self.rank == 0:
             with self._prefetch_profile_lock:
                 self._profile[key] += dt_sec * 1000.0
+
+    def _record_verify_length_bucket(
+        self,
+        *,
+        verify_lengths: list[int],
+        token_count: int,
+        forward_ms: float,
+        used_graph: bool,
+        moe_profile: dict[str, float],
+    ) -> None:
+        self._ensure_prefetch_internal_state()
+        if not (self.profile_enabled and self.rank == 0):
+            return
+        bucket_len = max((int(length) for length in verify_lengths), default=int(token_count))
+        moe_count = float(moe_profile.get("moe_profile_count", 0.0) or 0.0)
+        active_per_layer = 0.0
+        miss_per_layer = 0.0
+        if moe_count > 0.0:
+            active_per_layer = float(
+                moe_profile.get("pre_transfer_active_count_sum", 0.0) or 0.0
+            ) / moe_count
+            miss_per_layer = float(
+                moe_profile.get("pre_transfer_cache_miss_sum", 0.0) or 0.0
+            ) / moe_count
+        with self._prefetch_profile_lock:
+            bucket = self._verify_length_buckets[int(bucket_len)]
+            bucket["call_count"] += 1.0
+            bucket["forward_ms_sum"] += float(forward_ms)
+            bucket["token_count_sum"] += float(token_count)
+            bucket["graph_hit_count"] += 1.0 if used_graph else 0.0
+            bucket["active_per_layer_sum"] += active_per_layer
+            bucket["miss_per_layer_sum"] += miss_per_layer
 
     def _next_prefetch_step_id(self) -> int:
         self._prefetch_step_id += 1
@@ -451,6 +512,33 @@ class ModelRunner:
             return []
         segment_size = self._verify_segment_size()
         return [(s, min(s + segment_size, num_layers)) for s in range(0, num_layers, segment_size)]
+
+    def _verify_metadata_segment_boundaries(self) -> list[tuple[int, int]]:
+        """Logical verify metadata boundaries, independent of graph replay shape.
+
+        The full-graph verify experiment can use a large verify graph bucket while
+        still publishing verify metadata in the same segment cadence as the
+        dual-queue prefetch policy. This helper is default-compatible because it
+        only diverges under the explicit full-graph metadata experiment flag.
+        """
+        if not self._full_verify_graph_segment_metadata_enabled():
+            return self._verify_segment_boundaries()
+        num_layers = int(getattr(getattr(self.config, "hf_config", None), "num_hidden_layers", 0))
+        if num_layers <= 0:
+            return []
+        env_size = os.getenv("NANOVLLM_VERIFY_FULL_GRAPH_METADATA_SEGMENT_SIZE", "").strip()
+        if env_size:
+            segment_size = max(1, int(env_size))
+        elif self._dual_queue_prefetch_enabled():
+            segment_size = max(1, int(getattr(self.config, "dual_queue_segment_size", 12)))
+        else:
+            segment_size = self._verify_segment_size()
+        return [(s, min(s + segment_size, num_layers)) for s in range(0, num_layers, segment_size)]
+
+    def _full_verify_graph_segment_metadata_enabled(self) -> bool:
+        return os.getenv(
+            "NANOVLLM_VERIFY_FULL_GRAPH_SEGMENT_METADATA", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _verify_segment_graph_enabled(self) -> bool:
         if not getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
@@ -937,6 +1025,33 @@ class ModelRunner:
         self._flush_pending_prefetch_metadata(block=not dual_queue)
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+            verify_length_buckets = {
+                str(length): {
+                    "call_count": int(values.get("call_count", 0.0)),
+                    "forward_ms_avg": (
+                        float(values.get("forward_ms_sum", 0.0))
+                        / float(values.get("call_count", 1.0))
+                    ) if float(values.get("call_count", 0.0)) > 0.0 else 0.0,
+                    "token_count_avg": (
+                        float(values.get("token_count_sum", 0.0))
+                        / float(values.get("call_count", 1.0))
+                    ) if float(values.get("call_count", 0.0)) > 0.0 else 0.0,
+                    "graph_hit_rate": (
+                        float(values.get("graph_hit_count", 0.0))
+                        / float(values.get("call_count", 1.0))
+                    ) if float(values.get("call_count", 0.0)) > 0.0 else 0.0,
+                    "active_per_layer_avg": (
+                        float(values.get("active_per_layer_sum", 0.0))
+                        / float(values.get("call_count", 1.0))
+                    ) if float(values.get("call_count", 0.0)) > 0.0 else 0.0,
+                    "miss_per_layer_avg": (
+                        float(values.get("miss_per_layer_sum", 0.0))
+                        / float(values.get("call_count", 1.0))
+                    ) if float(values.get("call_count", 0.0)) > 0.0 else 0.0,
+                }
+                for length, values in sorted(self._verify_length_buckets.items())
+            }
+        out["verify_length_buckets"] = verify_length_buckets
         decode_count = int(self._profile.get("decode_count", 0))
         graph_hit_count = int(self._profile.get("graph_hit_count", 0))
         out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
@@ -970,6 +1085,7 @@ class ModelRunner:
             with self._prefetch_profile_lock:
                 self._profile.clear()
                 self._prefetch_trace_events.clear()
+                self._verify_length_buckets.clear()
             pending = getattr(self, "_pending_prefetch_metadata", None)
             if pending is not None:
                 pending.clear()
@@ -1258,75 +1374,103 @@ class ModelRunner:
             self._flush_pending_prefetch_metadata(block=True)
 
     def _replay_draft_segment_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        self._nvtx_push("nano:draft_segment_graph_total")
         bs = input_ids.size(0)
-        context = get_context()
-        bucket = next(x for x in self.draft_graph_bs if x >= bs)
-        graphs = self.draft_segment_graphs[bucket]
-        boundaries = self.draft_segment_boundaries[bucket]
-        graph_vars = self.draft_segment_graph_vars
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        try:
+            context = get_context()
+            bucket = next(x for x in self.draft_graph_bs if x >= bs)
+            graphs = self.draft_segment_graphs[bucket]
+            boundaries = self.draft_segment_boundaries[bucket]
+            graph_vars = self.draft_segment_graph_vars
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
 
-        replay_t0 = perf_counter()
-        step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
-        prefetch_runtime = getattr(self, "prefetch_runtime", None)
-        dual_queue = self._dual_queue_prefetch_enabled()
-        for segment_id, (graph, (layer_start, layer_end)) in enumerate(
-            zip(graphs, boundaries, strict=True)
-        ):
-            if dual_queue and prefetch_runtime is not None:
-                with self._prefetch_runtime_lock:
-                    prefetch_runtime.on_draft_segment_start(
-                        step_id=step_id,
-                        segment_id=segment_id,
-                        boundaries=boundaries,
-                    )
-            timing_start = self._start_dual_queue_segment_timing()
-            segment_t0 = perf_counter()
-            graph.replay()
-            self._end_dual_queue_segment_timing("draft", segment_id, timing_start)
-            segment_enqueue_ms = (perf_counter() - segment_t0) * 1000.0
+            replay_t0 = perf_counter()
+            step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
+            prefetch_runtime = getattr(self, "prefetch_runtime", None)
+            dual_queue = self._dual_queue_prefetch_enabled()
+            for segment_id, (graph, (layer_start, layer_end)) in enumerate(
+                zip(graphs, boundaries, strict=True)
+            ):
+                if dual_queue and prefetch_runtime is not None:
+                    self._nvtx_push(f"nano:draft_segment_prefetch_start:{segment_id}")
+                    try:
+                        with self._prefetch_runtime_lock:
+                            prefetch_runtime.on_draft_segment_start(
+                                step_id=step_id,
+                                segment_id=segment_id,
+                                boundaries=boundaries,
+                            )
+                    finally:
+                        self._nvtx_pop()
+                timing_start = self._start_dual_queue_segment_timing()
+                segment_t0 = perf_counter()
+                self._nvtx_push(f"nano:draft_segment_graph_replay:{segment_id}:{layer_start}-{layer_end}")
+                try:
+                    graph.replay()
+                finally:
+                    self._nvtx_pop()
+                self._end_dual_queue_segment_timing("draft", segment_id, timing_start)
+                segment_enqueue_ms = (perf_counter() - segment_t0) * 1000.0
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["draft_segment_graph_replay_count"] += 1
+                        self._profile["draft_segment_graph_replay_enqueue_ms"] += segment_enqueue_ms
+                if step_id >= 0:
+                    self._nvtx_push(f"nano:draft_segment_metadata:{segment_id}:{layer_start}-{layer_end}")
+                    try:
+                        self._enqueue_draft_segment_metadata(
+                            step_id=step_id,
+                            token_capacity=int(bucket),
+                            layer_start_idx=int(layer_start),
+                            layer_end_idx=int(layer_end),
+                        )
+                    finally:
+                        self._nvtx_pop()
+                self._poll_dual_queue_segment_timings(block=False)
+
             if self.profile_enabled and self.rank == 0:
-                with self._prefetch_profile_lock:
-                    self._profile["draft_segment_graph_replay_count"] += 1
-                    self._profile["draft_segment_graph_replay_enqueue_ms"] += segment_enqueue_ms
-            if step_id >= 0:
-                self._enqueue_draft_segment_metadata(
-                    step_id=step_id,
-                    token_capacity=int(bucket),
-                    layer_start_idx=int(layer_start),
-                    layer_end_idx=int(layer_end),
-                )
-            self._poll_dual_queue_segment_timings(block=False)
+                if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                replay_ms = (perf_counter() - replay_t0) * 1000.0
+                self._profile["graph_replay_count"] += 1
+                self._profile["graph_hit_count"] += 1
+                self._profile["draft_graph_replay_count"] += 1
+                self._profile["draft_graph_replay_ms"] += replay_ms
+                self._profile["draft_segment_graph_replay_ms"] += replay_ms
 
-        if self.profile_enabled and self.rank == 0:
-            if getattr(self, "profile_cuda_sync", True) and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            replay_ms = (perf_counter() - replay_t0) * 1000.0
-            self._profile["graph_replay_count"] += 1
-            self._profile["graph_hit_count"] += 1
-            self._profile["draft_graph_replay_count"] += 1
-            self._profile["draft_graph_replay_ms"] += replay_ms
-            self._profile["draft_segment_graph_replay_ms"] += replay_ms
-
-        final_hidden = graph_vars["outputs"][:bs]
-        extractor = getattr(self, "_acceptance_extractor", None)
-        if extractor is not None:
-            tail_graph = getattr(self, "draft_tail_graphs", {}).get(bucket)
-            if tail_graph is not None:
-                # Eager LM head -> eager token_features (stays on GPU) -> replay the
-                # captured tail graph (route/history/predictor) -> alpha_buf/state_out.
-                logits = self.model.compute_logits(final_hidden)
-                extractor.set_token_features_from_logits(logits)
-                tail_graph.replay()
-                self._pending_acceptance = True
-                return logits
-        return self.model.compute_logits(final_hidden)
+            final_hidden = graph_vars["outputs"][:bs]
+            extractor = getattr(self, "_acceptance_extractor", None)
+            if extractor is not None:
+                tail_graph = getattr(self, "draft_tail_graphs", {}).get(bucket)
+                if tail_graph is not None:
+                    # Eager LM head -> eager token_features (stays on GPU) -> replay the
+                    # captured tail graph (route/history/predictor) -> alpha_buf/state_out.
+                    self._nvtx_push("nano:draft_lm_head")
+                    try:
+                        logits = self.model.compute_logits(final_hidden)
+                    finally:
+                        self._nvtx_pop()
+                    self._nvtx_push("nano:draft_acceptance_tail_graph")
+                    try:
+                        extractor.set_token_features_from_logits(logits)
+                        tail_graph.replay()
+                    finally:
+                        self._nvtx_pop()
+                    self._pending_acceptance = True
+                    return logits
+            self._nvtx_push("nano:draft_lm_head")
+            try:
+                return self.model.compute_logits(final_hidden)
+            finally:
+                self._nvtx_pop()
+        finally:
+            self._nvtx_pop()
 
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
         if not getattr(self.config, "draft_cuda_graph_enabled", True):
@@ -1780,6 +1924,7 @@ class ModelRunner:
         return_logits: bool = False,
     ):
         """Run one-shot verify in prefill-like mode and return traces or logits."""
+        self._nvtx_push("nano:run_verify_total")
         self._ensure_prefetch_internal_state()
         total_t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
@@ -1819,6 +1964,9 @@ class ModelRunner:
             self.model.set_verify_prefetch_controller(self)
 
         used_verify_segment_graph = False
+        used_verify_graph = False
+        verify_moe_profile: dict[str, float] = {}
+        self._verify_segment_metadata_enqueued_step_id = -1
         # compute_logits() slices prefill outputs to last token per sequence.
         # Verify needs logits for every queried token position.
         try:
@@ -1869,28 +2017,52 @@ class ModelRunner:
                 self._verify_torch_profile_done = True
             else:
                 if self._can_use_verify_cudagraph(int(input_ids.numel())):
+                    used_verify_graph = True
                     if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
                         if self._verify_segment_graph_enabled():
                             used_verify_segment_graph = True
-                            hidden_states = self._run_verify_with_kt_hybrid_segment_graph(
-                                input_ids,
-                                positions,
-                                step_id=step_id,
-                            )
+                            self._nvtx_push("nano:verify_segment_graph_total")
+                            try:
+                                hidden_states = self._run_verify_with_kt_hybrid_segment_graph(
+                                    input_ids,
+                                    positions,
+                                    step_id=step_id,
+                                )
+                            finally:
+                                self._nvtx_pop()
                         else:
-                            hidden_states = self._run_verify_with_kt_hybrid_graph(
-                                input_ids,
-                                positions,
-                                step_id=step_id,
-                            )
+                            self._nvtx_push("nano:verify_kt_hybrid_graph_total")
+                            try:
+                                hidden_states = self._run_verify_with_kt_hybrid_graph(
+                                    input_ids,
+                                    positions,
+                                    step_id=step_id,
+                                )
+                            finally:
+                                self._nvtx_pop()
                     else:
-                        hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
-                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                        self._nvtx_push("nano:verify_prefix_graph_total")
+                        try:
+                            hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
+                        finally:
+                            self._nvtx_pop()
+                    self._nvtx_push("nano:verify_lm_head")
+                    try:
+                        logits = F.linear(hidden_states, self.model.lm_head.weight)
+                    finally:
+                        self._nvtx_pop()
                 else:
+                    self._nvtx_push("nano:verify_eager_model")
                     hidden_states = self.model(input_ids, positions)
-                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                    self._nvtx_pop()
+                    self._nvtx_push("nano:verify_lm_head")
+                    try:
+                        logits = F.linear(hidden_states, self.model.lm_head.weight)
+                    finally:
+                        self._nvtx_pop()
             if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
                 prof = self.model.get_and_reset_heterogeneous_profile()
+                verify_moe_profile = dict(prof)
                 for key, value in prof.items():
                     value = float(value)
                     self._profile[key] = float(self._profile.get(key, 0.0) + value)
@@ -1904,7 +2076,15 @@ class ModelRunner:
                     dist.gather(logits, None, 0)
             if self.profile_enabled and self.profile_cuda_sync:
                 torch.cuda.synchronize()
-            self._record_profile("verify_forward_ms", perf_counter() - t0)
+            verify_forward_dt = perf_counter() - t0
+            self._record_profile("verify_forward_ms", verify_forward_dt)
+            self._record_verify_length_bucket(
+                verify_lengths=verify_lengths,
+                token_count=int(input_ids.numel()),
+                forward_ms=verify_forward_dt * 1000.0,
+                used_graph=used_verify_graph,
+                moe_profile=verify_moe_profile,
+            )
         finally:
             if verify_layer_prefetch_enabled:
                 self.model.set_verify_prefetch_controller(None)
@@ -1917,11 +2097,13 @@ class ModelRunner:
             self._dual_queue_prefetch_enabled()
             and prefetch_runtime is not None
             and not used_verify_segment_graph
+            and int(getattr(self, "_verify_segment_metadata_enqueued_step_id", -1)) != int(step_id)
         ):
             with self._prefetch_runtime_lock:
                 prefetch_runtime.discard_verify_round()
 
         if self.rank != 0:
+            self._nvtx_pop()
             return None
 
         if self.profile_enabled:
@@ -1949,8 +2131,12 @@ class ModelRunner:
                 if self._prefetch_runtime_mode() == "draft_segment_indexed":
                     with self._prefetch_runtime_lock:
                         prefetch_runtime.end_draft_iteration()
+                self._nvtx_pop()
                 return verify_outputs
-            _used_segment_graph = used_verify_segment_graph
+            _used_segment_graph = (
+                used_verify_segment_graph
+                or int(getattr(self, "_verify_segment_metadata_enqueued_step_id", -1)) == int(step_id)
+            )
             if _used_segment_graph:
                 runtime_meta_recorder.reset()
                 self._flush_pending_prefetch_metadata(block=False)
@@ -1981,6 +2167,7 @@ class ModelRunner:
             if self._prefetch_runtime_mode() == "draft_segment_indexed":
                 with self._prefetch_runtime_lock:
                     prefetch_runtime.end_draft_iteration()
+        self._nvtx_pop()
         return verify_outputs
 
     @torch.inference_mode()
@@ -2908,6 +3095,19 @@ class ModelRunner:
         graph = self.verify_kt_hybrid_graphs[bucket]
         graph.replay()
 
+        segment_metadata_enqueued = self._enqueue_full_graph_verify_segment_metadata(
+            step_id=int(step_id),
+            token_capacity=max_bucket,
+        )
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if (
+            segment_metadata_enqueued
+            and self._dual_queue_prefetch_enabled()
+            and prefetch_runtime is not None
+        ):
+            with self._prefetch_runtime_lock:
+                prefetch_runtime.complete_verify_round(step_id=int(step_id))
+
         if runtime_meta_recorder is not None:
             key = runtime_meta_recorder.active_key
             if key is not None:
@@ -2994,6 +3194,39 @@ class ModelRunner:
         if not getattr(self, "_prefetch_async_enabled", False):
             self._flush_pending_prefetch_metadata(block=False)
 
+    def _enqueue_full_graph_verify_segment_metadata(
+        self,
+        *,
+        step_id: int,
+        token_capacity: int,
+    ) -> bool:
+        if not self._full_verify_graph_segment_metadata_enabled():
+            return False
+        if self._skip_verify_metadata_offload():
+            return False
+        boundaries = self._verify_metadata_segment_boundaries()
+        if len(boundaries) <= 1:
+            return False
+        for seg_idx, (layer_start, layer_end) in enumerate(boundaries):
+            self._enqueue_verify_segment_metadata(
+                step_id=int(step_id),
+                token_capacity=int(token_capacity),
+                layer_start_idx=int(layer_start),
+                layer_end_idx=int(layer_end),
+                is_last_segment=(seg_idx == len(boundaries) - 1),
+            )
+        self._verify_segment_metadata_enqueued_step_id = int(step_id)
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_full_graph_segment_metadata_count"] = (
+                    float(self._profile.get("verify_full_graph_segment_metadata_count", 0.0)) + 1.0
+                )
+                self._profile["verify_full_graph_segment_metadata_segments"] = (
+                    float(self._profile.get("verify_full_graph_segment_metadata_segments", 0.0))
+                    + float(len(boundaries))
+                )
+        return True
+
     def _run_verify_with_kt_hybrid_segment_graph(
         self,
         input_ids: torch.Tensor,
@@ -3052,52 +3285,68 @@ class ModelRunner:
             zip(graphs, boundaries, strict=True)
         ):
             if prefetch_runtime is not None:
-                with self._prefetch_runtime_lock:
-                    if self._dual_queue_prefetch_enabled():
-                        prefetch_runtime.on_verify_segment_start(
-                            step_id=step_id,
-                            segment_id=seg_idx,
-                            boundaries=boundaries,
-                        )
-                        next_seg = (seg_idx + 1) % num_segments
-                        next_start, next_end = boundaries[next_seg]
-                        prefetch_runtime.submit_verify_segment_prefetch(
-                            step_id=step_id,
-                            target_layer_start=int(next_start),
-                            target_layer_end=int(next_end),
-                            target_segment_id=next_seg,
-                        )
-                    else:
-                        on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
-                        if on_verify_layer_start is not None:
-                            for layer_idx in range(int(layer_start), int(layer_end)):
-                                on_verify_layer_start(layer_idx)
-                        prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+                self._nvtx_push(f"nano:verify_segment_prefetch_start:{seg_idx}:{layer_start}-{layer_end}")
+                try:
+                    with self._prefetch_runtime_lock:
+                        if self._dual_queue_prefetch_enabled():
+                            prefetch_runtime.on_verify_segment_start(
+                                step_id=step_id,
+                                segment_id=seg_idx,
+                                boundaries=boundaries,
+                            )
+                            next_seg = (seg_idx + 1) % num_segments
+                            next_start, next_end = boundaries[next_seg]
+                            prefetch_runtime.submit_verify_segment_prefetch(
+                                step_id=step_id,
+                                target_layer_start=int(next_start),
+                                target_layer_end=int(next_end),
+                                target_segment_id=next_seg,
+                            )
+                        else:
+                            on_verify_layer_start = getattr(prefetch_runtime, "on_verify_layer_start", None)
+                            if on_verify_layer_start is not None:
+                                for layer_idx in range(int(layer_start), int(layer_end)):
+                                    on_verify_layer_start(layer_idx)
+                            prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+                finally:
+                    self._nvtx_pop()
 
             timing_start = self._start_dual_queue_segment_timing()
-            graph.replay()
+            self._nvtx_push(f"nano:verify_segment_graph_replay:{seg_idx}:{layer_start}-{layer_end}")
+            try:
+                graph.replay()
+            finally:
+                self._nvtx_pop()
             self._end_dual_queue_segment_timing("verify", seg_idx, timing_start)
 
             is_last = seg_idx == num_segments - 1
-            self._enqueue_verify_segment_metadata(
-                step_id=step_id,
-                token_capacity=max_bucket,
-                layer_start_idx=int(layer_start),
-                layer_end_idx=int(layer_end),
-                is_last_segment=True,
-            )
+            self._nvtx_push(f"nano:verify_segment_metadata:{seg_idx}:{layer_start}-{layer_end}")
+            try:
+                self._enqueue_verify_segment_metadata(
+                    step_id=step_id,
+                    token_capacity=max_bucket,
+                    layer_start_idx=int(layer_start),
+                    layer_end_idx=int(layer_end),
+                    is_last_segment=is_last,
+                )
+            finally:
+                self._nvtx_pop()
             if prefetch_runtime is not None and not self._dual_queue_prefetch_enabled():
                 next_seg = (seg_idx + 1) % num_segments
                 next_start = boundaries[next_seg][0]
                 next_end = boundaries[next_seg][1]
-                with self._prefetch_runtime_lock:
-                    prefetch_runtime.submit_verify_segment_prefetch(
-                        step_id=step_id,
-                        target_layer_start=int(next_start),
-                        target_layer_end=int(next_end),
-                        visible_budget_ms=float(getattr(
-                            self.config, "verify_prefetch_visible_budget_ms", 12.0)),
-                    )
+                self._nvtx_push(f"nano:verify_segment_prefetch_submit:{seg_idx}:{next_start}-{next_end}")
+                try:
+                    with self._prefetch_runtime_lock:
+                        prefetch_runtime.submit_verify_segment_prefetch(
+                            step_id=step_id,
+                            target_layer_start=int(next_start),
+                            target_layer_end=int(next_end),
+                            visible_budget_ms=float(getattr(
+                                self.config, "verify_prefetch_visible_budget_ms", 12.0)),
+                        )
+                finally:
+                    self._nvtx_pop()
             self._poll_dual_queue_segment_timings(block=False)
 
         if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:

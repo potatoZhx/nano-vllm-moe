@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -117,7 +118,16 @@ class ModelRuntimeMetaRecorder:
                 segment_count = max(1, (self.num_layers + segment_size - 1) // segment_size)
                 target = max(target, min(64, segment_count + 2))
         if str(mode) == "verify_kt_hybrid":
-            segment_size = max(1, int(getattr(self.config, "verify_prefetch_segment_size", 12)))
+            full_graph_segment_metadata = os.getenv(
+                "NANOVLLM_VERIFY_FULL_GRAPH_SEGMENT_METADATA", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            env_size = os.getenv("NANOVLLM_VERIFY_FULL_GRAPH_METADATA_SEGMENT_SIZE", "").strip()
+            if full_graph_segment_metadata and env_size:
+                segment_size = max(1, int(env_size))
+            elif full_graph_segment_metadata:
+                segment_size = max(1, int(getattr(self.config, "dual_queue_segment_size", 12)))
+            else:
+                segment_size = max(1, int(getattr(self.config, "verify_prefetch_segment_size", 12)))
             segment_count = max(1, (self.num_layers + segment_size - 1) // segment_size)
             target = max(target, min(64, segment_count + 2))
         return max(1, target)

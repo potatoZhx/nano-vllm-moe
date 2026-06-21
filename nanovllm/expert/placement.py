@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -81,6 +82,41 @@ def _build_grouped_layout(
     ones = torch.ones_like(sorted_slots, dtype=torch.int32)
     m_sizes.scatter_add_(0, sorted_slots.to(torch.int64), ones)
     return m_sizes, sorted_gpu_route_indices
+
+
+def _build_grouped_layout_masked(
+    gpu_slots: torch.Tensor,
+    gpu_route_indices: torch.Tensor,
+    route_mask: torch.Tensor,
+    num_slots: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Fixed-shape layout for graph capture: active routes are grouped first by
+    # slot, inactive routes remain in the returned permutation tail with zero
+    # contribution to m_sizes.
+    inactive_slot = torch.full_like(gpu_slots, int(num_slots))
+    sort_slots = torch.where(route_mask, gpu_slots, inactive_slot)
+    route_order = torch.argsort(gpu_route_indices, stable=True)
+    slots_by_route = sort_slots.index_select(0, route_order)
+    slot_order = torch.argsort(slots_by_route, stable=True)
+    final_order = route_order.index_select(0, slot_order)
+    sorted_slots = sort_slots.index_select(0, final_order)
+    sorted_gpu_route_indices = gpu_route_indices.index_select(0, final_order)
+
+    active_counts = route_mask.index_select(0, final_order).to(torch.int32)
+    scatter_slots = torch.where(
+        sorted_slots < int(num_slots),
+        sorted_slots,
+        torch.zeros_like(sorted_slots),
+    )
+    m_sizes = torch.zeros(num_slots, dtype=torch.int32, device=sorted_slots.device)
+    m_sizes.scatter_add_(0, scatter_slots.to(torch.int64), active_counts)
+    return m_sizes, sorted_gpu_route_indices
+
+
+def _verify_compact_gpu_routes_enabled() -> bool:
+    return os.getenv("NANOVLLM_VERIFY_COMPACT_GPU_ROUTES", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _select_verify_cache_fill_slot(
@@ -643,13 +679,20 @@ def build_verify_graph_safe_plan_gpu(
     )
     flat_effective = substitution_lut.index_select(0, flat_selected)
 
+    uncached_route_mask = ~cached_expert_mask.index_select(0, flat_selected)
     gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_effective)
     gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
-    m_sizes, gpu_route_indices = _build_grouped_layout(
-        gpu_slots, gpu_route_indices, expert_cache.num_slots,
-    )
-
-    uncached_route_mask = ~cached_expert_mask.index_select(0, flat_selected)
+    if _verify_compact_gpu_routes_enabled():
+        m_sizes, gpu_route_indices = _build_grouped_layout_masked(
+            gpu_slots,
+            gpu_route_indices,
+            ~uncached_route_mask,
+            expert_cache.num_slots,
+        )
+    else:
+        m_sizes, gpu_route_indices = _build_grouped_layout(
+            gpu_slots, gpu_route_indices, expert_cache.num_slots,
+        )
     gpu_route_weights = torch.where(
         uncached_route_mask,
         torch.zeros_like(flat_weights),

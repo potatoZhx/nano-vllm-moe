@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -96,6 +97,18 @@ class LayerExpertCache:
             dtype=torch.bool,
             device=device,
         )
+        self._device_lut_scalar_copy = os.getenv(
+            "NANOVLLM_DEVICE_LUT_SCALAR_COPY", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._expert_id_values_device = torch.arange(
+            self.num_experts, dtype=torch.int64, device=device,
+        )
+        self._slot_id_values_device = torch.arange(
+            self.num_slots, dtype=torch.int64, device=device,
+        )
+        self._neg_one_i64_device = torch.full((1,), -1, dtype=torch.int64, device=device)
+        self._bool_true_device = torch.ones((1,), dtype=torch.bool, device=device)
+        self._bool_false_device = torch.zeros((1,), dtype=torch.bool, device=device)
 
         self.last_access_step = [-1] * self.num_experts
         self.access_count = [0] * self.num_experts
@@ -123,6 +136,35 @@ class LayerExpertCache:
         self.staging_slot_to_expert = [-1] * self.num_staging_slots
         self.staging_slot_generation = [0] * self.num_staging_slots
         self.active_slot_pending_expert = [-1] * self.num_slots
+
+    def _set_slot_to_expert_lut(self, slot_idx: int, expert_idx: int) -> None:
+        if not self._device_lut_scalar_copy:
+            self.slot_to_expert_lut[slot_idx] = expert_idx
+            return
+        src = (
+            self._expert_id_values_device.narrow(0, expert_idx, 1)
+            if expert_idx >= 0
+            else self._neg_one_i64_device
+        )
+        self.slot_to_expert_lut.narrow(0, int(slot_idx), 1).copy_(src, non_blocking=True)
+
+    def _set_expert_to_slot_lut(self, expert_idx: int, slot_idx: int) -> None:
+        if not self._device_lut_scalar_copy:
+            self.expert_to_slot_lut[expert_idx] = slot_idx
+            return
+        src = (
+            self._slot_id_values_device.narrow(0, slot_idx, 1)
+            if slot_idx >= 0
+            else self._neg_one_i64_device
+        )
+        self.expert_to_slot_lut.narrow(0, int(expert_idx), 1).copy_(src, non_blocking=True)
+
+    def _set_cached_expert_mask(self, expert_idx: int, value: bool) -> None:
+        if not self._device_lut_scalar_copy:
+            self.cached_expert_mask[expert_idx] = bool(value)
+            return
+        src = self._bool_true_device if bool(value) else self._bool_false_device
+        self.cached_expert_mask.narrow(0, int(expert_idx), 1).copy_(src, non_blocking=True)
 
     def put_to_slot(
         self,
@@ -462,14 +504,14 @@ class LayerExpertCache:
 
         if prev_expert >= 0 and prev_expert in self.expert_to_slot:
             del self.expert_to_slot[prev_expert]
-            self.expert_to_slot_lut[prev_expert] = -1
-            self.cached_expert_mask[prev_expert] = False
+            self._set_expert_to_slot_lut(prev_expert, -1)
+            self._set_cached_expert_mask(prev_expert, False)
 
         self.slot_to_expert[slot_idx] = expert_idx
-        self.slot_to_expert_lut[slot_idx] = expert_idx
+        self._set_slot_to_expert_lut(slot_idx, expert_idx)
         self.expert_to_slot[expert_idx] = slot_idx
-        self.expert_to_slot_lut[expert_idx] = slot_idx
-        self.cached_expert_mask[expert_idx] = True
+        self._set_expert_to_slot_lut(expert_idx, slot_idx)
+        self._set_cached_expert_mask(expert_idx, True)
         self.active_slot_pending_expert[slot_idx] = -1
         return PublishedExpert(
             layer_idx=reservation.layer_idx,
@@ -478,6 +520,74 @@ class LayerExpertCache:
             staging_slot_idx=-1,
             generation=reservation.generation,
         )
+
+    def commit_deferred_active_prefetch_host_only(self, reservation: ActiveReservation) -> PublishedExpert | None:
+        """Commit deferred active prefetch metadata without per-expert CUDA scalar writes."""
+        slot_idx = reservation.active_slot_idx
+        expert_idx = reservation.expert_idx
+        if not (0 <= slot_idx < self.num_slots):
+            return None
+        if self.slot_generation[slot_idx] != reservation.generation:
+            return None
+        if self.active_slot_pending_expert[slot_idx] != expert_idx:
+            return None
+        prev_expert = int(getattr(reservation, "prev_expert", -1))
+        if prev_expert >= 0 and self.slot_to_expert[slot_idx] != prev_expert:
+            self.active_slot_pending_expert[slot_idx] = -1
+            return None
+
+        if prev_expert >= 0 and prev_expert in self.expert_to_slot:
+            del self.expert_to_slot[prev_expert]
+
+        self.slot_to_expert[slot_idx] = expert_idx
+        self.expert_to_slot[expert_idx] = slot_idx
+        self.active_slot_pending_expert[slot_idx] = -1
+        return PublishedExpert(
+            layer_idx=reservation.layer_idx,
+            expert_idx=expert_idx,
+            active_slot_idx=slot_idx,
+            staging_slot_idx=-1,
+            generation=reservation.generation,
+        )
+
+    def apply_deferred_active_prefetch_device_updates(
+        self,
+        updates: list[tuple[int, int, int]],
+    ) -> None:
+        """Apply published expert LUT/mask changes in vectorized device operations.
+
+        Each update is ``(active_slot_idx, expert_idx, prev_expert_idx)``.
+        """
+        if not updates:
+            return
+        device = self.expert_to_slot_lut.device
+        slot_ids_host = sorted({int(u[0]) for u in updates})
+        expert_ids_host = sorted(
+            {int(u[1]) for u in updates}
+            | {int(u[2]) for u in updates if int(u[2]) >= 0}
+        )
+        slot_ids = torch.tensor(slot_ids_host, dtype=torch.int64, device=device)
+        slot_values = torch.tensor(
+            [int(self.slot_to_expert[idx]) for idx in slot_ids_host],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.slot_to_expert_lut[slot_ids] = slot_values
+
+        if expert_ids_host:
+            expert_ids = torch.tensor(expert_ids_host, dtype=torch.int64, device=device)
+            expert_slot_values = torch.tensor(
+                [int(self.expert_to_slot.get(expert_idx, -1)) for expert_idx in expert_ids_host],
+                dtype=torch.int64,
+                device=device,
+            )
+            expert_mask_values = torch.tensor(
+                [expert_idx in self.expert_to_slot for expert_idx in expert_ids_host],
+                dtype=torch.bool,
+                device=device,
+            )
+            self.expert_to_slot_lut[expert_ids] = expert_slot_values
+            self.cached_expert_mask[expert_ids] = expert_mask_values
 
     def cancel_deferred_active_prefetch(self, reservation: ActiveReservation) -> None:
         slot_idx = reservation.active_slot_idx
