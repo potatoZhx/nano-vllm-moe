@@ -19,16 +19,16 @@ Example:
     cd /home/linke/nano-vllm-moe
     rm -rf results/acc_predictor_bench
     CUDA_VISIBLE_DEVICES=2 python scripts/bench_acceptance_predictor.py \
-        --output-dir results/acc_predictor_bench \
+        --output-dir results/acc_predictor_bench15 \
         --acceptance-predictor-path random_cache_srdp_scripts-1/res/run_20260614_133025 \
         --gpu-memory-utilization 0.99 \
         --cache-ratios 0.3125 \
-        --output-lens 512,4096 \
+        --output-lens 512 \
         --draft-alpha-stop-threshold 0.89 \
-        --max-draft-tokens-values 10 \
+        --max-draft-tokens-values 15 \
         --segment-sizes 12 \
-        --predictor-modes on,off \
-        --kt-num-threads 32
+        --predictor-modes on \
+        --kt-num-threads 16
 """
 from __future__ import annotations
 

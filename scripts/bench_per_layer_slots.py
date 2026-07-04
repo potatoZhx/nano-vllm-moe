@@ -19,10 +19,10 @@ Example:
         --output-dir results/per_layer_slots_bench \
         --gpu-memory-utilization 0.99 \
         --cache-ratios 0.3125 \
-        --output-lens 512,4096 \
-        --max-draft-tokens-values 15 \
+        --output-lens 512 \
+        --max-draft-tokens-values 12 \
         --segment-sizes 12 \
-        --allocation-modes uniform,profile_weighted \
+        --allocation-modes profile_weighted \
         --slot-buckets 4 \
         --slot-max-bucket-ratio 2.0 \
         --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
