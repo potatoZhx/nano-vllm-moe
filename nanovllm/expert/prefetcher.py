@@ -228,12 +228,46 @@ class SegmentCandidateIndex:
         granularity = str(getattr(config, "draft_prefetch_frontier_granularity", "segment"))
         self.segment_size = 1 if granularity == "layer" else max(1, int(getattr(config, "draft_prefetch_segment_size", 12)))
         self.entries_by_segment: dict[int, dict[tuple[int, int], PrefetchCandidate]] = defaultdict(dict)
+        self._ranked_cache_by_segment: dict[int, list[PrefetchCandidate]] = {}
+        self._dirty_segments: set[int] = set()
 
     def clear(self) -> None:
         self.entries_by_segment.clear()
+        self._ranked_cache_by_segment.clear()
+        self._dirty_segments.clear()
 
     def _segment_id(self, layer_idx: int) -> int:
         return int(layer_idx) // int(self.segment_size)
+
+    def _mark_dirty(self, segment_id: int) -> None:
+        self._dirty_segments.add(int(segment_id))
+
+    def _ranked_entries_for_segment(self, segment_id: int) -> list[PrefetchCandidate]:
+        segment_id = int(segment_id)
+        if segment_id not in self._dirty_segments and segment_id in self._ranked_cache_by_segment:
+            return self._ranked_cache_by_segment[segment_id]
+        entries = self.entries_by_segment.get(segment_id)
+        if not entries:
+            self._ranked_cache_by_segment.pop(segment_id, None)
+            self._dirty_segments.discard(segment_id)
+            return []
+        age_penalty = float(getattr(self.config, "prefetch_age_penalty", 0.0))
+
+        def static_rank(entry: PrefetchCandidate) -> tuple[float, int, int]:
+            base_priority = compute_priority(
+                source=entry.source,
+                score_sum=entry.score_sum,
+                activation_count=entry.activation_count,
+                age=0,
+                config=self.config,
+            )
+            age_adjusted = float(base_priority) + age_penalty * float(entry.last_seen_step)
+            return (-age_adjusted, int(entry.layer_idx), int(entry.expert_idx))
+
+        ranked = sorted(entries.values(), key=static_rank)
+        self._ranked_cache_by_segment[segment_id] = ranked
+        self._dirty_segments.discard(segment_id)
+        return ranked
 
     def update_from_runtime_meta(
         self,
@@ -245,6 +279,7 @@ class SegmentCandidateIndex:
         stats = defaultdict(float)
         if not runtime_meta:
             return stats
+        updated_segments: set[int] = set()
 
         for layer_idx, meta in runtime_meta.items():
             cache = layer_caches.get(layer_idx)
@@ -293,7 +328,8 @@ class SegmentCandidateIndex:
                 continue
 
             update_t0 = time.perf_counter()
-            segment_entries = self.entries_by_segment[self._segment_id(int(layer_idx))]
+            segment_id = self._segment_id(int(layer_idx))
+            segment_entries = self.entries_by_segment[segment_id]
             for expert_idx, new_score, new_count in uncached_entries:
                 key = (int(layer_idx), int(expert_idx))
                 if key in segment_entries:
@@ -324,7 +360,15 @@ class SegmentCandidateIndex:
                     config=self.config,
                 )
                 stats["segment_index_candidate_count"] += 1.0
+            self._mark_dirty(segment_id)
+            updated_segments.add(segment_id)
             stats["segment_index_entry_update_ms"] += (time.perf_counter() - update_t0) * 1000.0
+        if updated_segments:
+            rebuild_t0 = time.perf_counter()
+            for segment_id in updated_segments:
+                self._ranked_entries_for_segment(segment_id)
+            stats["segment_index_rank_cache_rebuild_count"] += float(len(updated_segments))
+            stats["segment_index_rank_cache_rebuild_ms"] += (time.perf_counter() - rebuild_t0) * 1000.0
         return stats
 
     def ranked_candidates(
@@ -364,6 +408,8 @@ class SegmentCandidateIndex:
             ranked.append(entry)
         for key in stale_keys:
             segment_entries.pop(key, None)
+        if stale_keys:
+            self._mark_dirty(segment_id)
         ranked.sort(key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
         return ranked
 
@@ -404,6 +450,8 @@ class SegmentCandidateIndex:
             out.append(entry)
         for key in stale_keys:
             segment_entries.pop(key, None)
+        if stale_keys:
+            self._mark_dirty(segment_id)
         return out
 
     def candidates_for_layer_range(
@@ -414,6 +462,7 @@ class SegmentCandidateIndex:
         step_id: int,
         layer_caches: dict[int, LayerExpertCache],
         inflight_keys: set[tuple[int, int]],
+        max_candidates: int | None = None,
     ) -> list[PrefetchCandidate]:
         start = max(0, int(layer_start))
         end = max(start, int(layer_end))
@@ -422,6 +471,68 @@ class SegmentCandidateIndex:
 
         first_segment = self._segment_id(start)
         last_segment = self._segment_id(end - 1)
+        limit = None if max_candidates is None else max(1, int(max_candidates))
+        if limit is not None:
+            selected: list[PrefetchCandidate] = []
+            ttl = int(self.config.prefetch_history_ttl_steps)
+            for segment_id in range(first_segment, last_segment + 1):
+                segment_entries = self.entries_by_segment.get(int(segment_id))
+                if not segment_entries:
+                    continue
+                stale_keys = []
+                segment_selected = 0
+                for entry in self._ranked_entries_for_segment(segment_id):
+                    layer_idx = int(entry.layer_idx)
+                    expert_idx = int(entry.expert_idx)
+                    key = (layer_idx, expert_idx)
+                    if segment_entries.get(key) is not entry:
+                        self._mark_dirty(segment_id)
+                        continue
+                    if not (start <= int(layer_idx) < end):
+                        continue
+                    cache = layer_caches.get(layer_idx)
+                    if cache is None:
+                        stale_keys.append(key)
+                        continue
+                    age = max(0, int(step_id) - int(entry.last_seen_step))
+                    if age > ttl:
+                        stale_keys.append(key)
+                        continue
+                    if (
+                        key in inflight_keys
+                        or cache.is_cached_cpu(expert_idx)
+                        or cache.is_pending_cpu(expert_idx)
+                    ):
+                        continue
+                    priority = compute_priority(
+                        source=entry.source,
+                        score_sum=entry.score_sum,
+                        activation_count=entry.activation_count,
+                        age=age,
+                        config=self.config,
+                    )
+                    selected.append(
+                        PrefetchCandidate(
+                            layer_idx=layer_idx,
+                            expert_idx=expert_idx,
+                            source=entry.source,
+                            score_sum=entry.score_sum,
+                            activation_count=entry.activation_count,
+                            first_seen_step=entry.first_seen_step,
+                            last_seen_step=entry.last_seen_step,
+                            priority=priority,
+                        )
+                    )
+                    segment_selected += 1
+                    if segment_selected >= limit:
+                        break
+                for key in stale_keys:
+                    segment_entries.pop(key, None)
+                if stale_keys:
+                    self._mark_dirty(segment_id)
+            selected.sort(key=lambda candidate: (-candidate.priority, candidate.layer_idx, candidate.expert_idx))
+            return selected[:limit]
+
         out: list[PrefetchCandidate] = []
         for segment_id in range(first_segment, last_segment + 1):
             candidates = self.candidates(
@@ -937,6 +1048,12 @@ class PrefetchRuntime:
             "segment_index_aggregate_ms": float(queue_stats.get("segment_index_aggregate_ms", 0.0)),
             "segment_index_filter_ms": float(queue_stats.get("segment_index_filter_ms", 0.0)),
             "segment_index_entry_update_ms": float(queue_stats.get("segment_index_entry_update_ms", 0.0)),
+            "segment_index_rank_cache_rebuild_ms": float(
+                queue_stats.get("segment_index_rank_cache_rebuild_ms", 0.0)
+            ),
+            "segment_index_rank_cache_rebuild_count": float(
+                queue_stats.get("segment_index_rank_cache_rebuild_count", 0.0)
+            ),
         }
         return out
 
@@ -970,18 +1087,32 @@ class PrefetchRuntime:
         return {}
 
     def observe_verify(self, runtime_meta: dict[int, LayerRuntimeMetaCPU] | None, step_id: int) -> dict[str, float]:
+        rank_guard_t0 = time.perf_counter()
         self._update_rank_guard_scores(runtime_meta)
+        rank_guard_ms = (time.perf_counter() - rank_guard_t0) * 1000.0
+        segment_index_ms = 0.0
         if runtime_meta is not None:
+            segment_index_t0 = time.perf_counter()
             self.verify_segment_index.update_from_runtime_meta(
                 runtime_meta, "verify_history", step_id, self.layer_caches,
             )
+            segment_index_ms = (time.perf_counter() - segment_index_t0) * 1000.0
+        self._profile["observe_verify_rank_guard_ms"] += rank_guard_ms
+        self._profile["observe_verify_segment_index_ms"] += segment_index_ms
         if bool(self.config.prefetch_use_verify_history):
-            return self.observe_runtime_meta(
+            runtime_t0 = time.perf_counter()
+            out = self.observe_runtime_meta(
                 runtime_meta,
                 source="verify_history",
                 step_id=step_id,
                 segment_index=self.long_term_segment_index if self._segment_indexed_enabled() else None,
             )
+            runtime_ms = (time.perf_counter() - runtime_t0) * 1000.0
+            self._profile["observe_verify_runtime_meta_call_ms"] += runtime_ms
+            out["observe_verify_rank_guard_ms"] = rank_guard_ms
+            out["observe_verify_segment_index_ms"] = segment_index_ms
+            out["observe_verify_runtime_meta_call_ms"] = runtime_ms
+            return out
         return {}
 
     def _update_rank_guard_scores(
@@ -1477,9 +1608,22 @@ class PrefetchRuntime:
             else getattr(self.config, "verify_prefetch_visible_budget_ms", 12.0)
         )
         inflight_keys = set(self.inflight.keys())
+        self._profile["verify_segment_prefetch_dispatch_budget_sum"] += float(dispatch_budget)
+        self._profile["verify_segment_prefetch_inflight_budget_sum"] += float(inflight_budget)
+        rank_multiplier_raw = os.getenv("NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER", "1").strip()
+        try:
+            rank_multiplier = int(rank_multiplier_raw)
+        except ValueError:
+            rank_multiplier = 1
+        rank_limit = None
+        if rank_multiplier > 0:
+            rank_limit = max(dispatch_budget, dispatch_budget * rank_multiplier)
+            self._profile["verify_segment_prefetch_rank_limited_count"] += 1
+            self._profile["verify_segment_prefetch_rank_limit_sum"] += float(rank_limit)
 
         rank_t0 = time.perf_counter()
         ranked_by_key: dict[tuple[int, int], PrefetchCandidate] = {}
+        scan_t0 = time.perf_counter()
         for index in (self.draft_segment_index, self.verify_segment_index, self.long_term_segment_index):
             candidates = index.candidates_for_layer_range(
                 layer_start=target_start,
@@ -1487,6 +1631,7 @@ class PrefetchRuntime:
                 step_id=step_id,
                 layer_caches=self.layer_caches,
                 inflight_keys=inflight_keys,
+                max_candidates=rank_limit,
             )
             self._profile["verify_segment_prefetch_candidate_scan_count"] += 1
             self._profile["verify_segment_prefetch_candidate_ranked_count"] += len(candidates)
@@ -1495,7 +1640,10 @@ class PrefetchRuntime:
                 prev = ranked_by_key.get(key)
                 if prev is None or candidate.priority > prev.priority:
                     ranked_by_key[key] = candidate
+        self._profile["verify_segment_prefetch_rank_scan_ms"] += (time.perf_counter() - scan_t0) * 1000.0
+        sort_t0 = time.perf_counter()
         ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+        self._profile["verify_segment_prefetch_rank_sort_ms"] += (time.perf_counter() - sort_t0) * 1000.0
         self._profile["verify_segment_prefetch_candidate_merge_count"] += len(ranked)
         self._profile["verify_segment_prefetch_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0
         if not ranked:
@@ -1503,29 +1651,41 @@ class PrefetchRuntime:
 
         submitted = 0
         used_transfer_ms = 0.0
+        loop_t0 = time.perf_counter()
+        filter_ms = 0.0
+        victim_select_ms = 0.0
+        reservation_ms = 0.0
+        transfer_call_ms = 0.0
+        bookkeeping_ms = 0.0
         for candidate in ranked:
             if submitted >= dispatch_budget:
                 break
 
+            filter_t0 = time.perf_counter()
             layer_idx = int(candidate.layer_idx)
             expert_idx = int(candidate.expert_idx)
             key = (layer_idx, expert_idx)
             cache = self.layer_caches.get(layer_idx)
             if cache is None:
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 continue
             if cache.is_cached_cpu(expert_idx) or cache.is_pending_cpu(expert_idx):
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 continue
             if key in self.inflight:
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 continue
 
             weights = self.cpu_expert_pool.get(layer_idx, {}).get(expert_idx)
             if not weights or "gate_up" not in weights or "down" not in weights:
                 self._profile["verify_segment_prefetch_missing_weights_count"] += 1
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 continue
 
             transfer_ms = self._estimated_expert_transfer_ms(weights)
             if not isfinite(transfer_ms):
                 self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 continue
             if (
                 transfer_budget_ms > 0.0
@@ -1533,29 +1693,38 @@ class PrefetchRuntime:
                 and used_transfer_ms + transfer_ms > transfer_budget_ms
             ):
                 self._profile["verify_segment_prefetch_skipped_by_budget_count"] += 1
+                filter_ms += (time.perf_counter() - filter_t0) * 1000.0
                 break
+            filter_ms += (time.perf_counter() - filter_t0) * 1000.0
 
+            victim_t0 = time.perf_counter()
             victim_slot = self._select_publish_slot_cpu(
                 cache, expert_idx=expert_idx, step_id=step_id, layer_idx=layer_idx,
             )
+            victim_select_ms += (time.perf_counter() - victim_t0) * 1000.0
             if victim_slot is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 self._profile["verify_segment_prefetch_skipped_by_pending_count"] += 1
                 continue
 
+            reservation_t0 = time.perf_counter()
             reservation = cache.reserve_active_slot_for_prefetch_deferred(
                 layer_idx=layer_idx, active_slot_idx=victim_slot, expert_idx=expert_idx,
             )
+            reservation_ms += (time.perf_counter() - reservation_t0) * 1000.0
             if reservation is None:
                 self._rollback_round_loaded_prefetch(layer_idx, expert_idx)
                 self._profile["verify_segment_prefetch_skipped_by_pending_count"] += 1
                 continue
 
+            transfer_call_t0 = time.perf_counter()
             ready_event, submit_ts_ms, enqueue_ms, num_bytes, stream_idx = self._begin_prefetch_transfer(
                 cache=cache, reservation=reservation, weights=weights,
                 source="verify_segment", direct_active=True,
             )
+            transfer_call_ms += (time.perf_counter() - transfer_call_t0) * 1000.0
 
+            bookkeeping_t0 = time.perf_counter()
             ticket = PrefetchTicket(
                 step_id=step_id,
                 layer_idx=layer_idx,
@@ -1585,7 +1754,14 @@ class PrefetchRuntime:
             self._profile["verify_segment_prefetch_submit_count"] += 1
             self._profile["verify_segment_prefetch_est_transfer_ms"] += transfer_ms
             self._record_source_submit(candidate.source)
+            bookkeeping_ms += (time.perf_counter() - bookkeeping_t0) * 1000.0
 
+        self._profile["verify_segment_prefetch_loop_ms"] += (time.perf_counter() - loop_t0) * 1000.0
+        self._profile["verify_segment_prefetch_filter_ms"] += filter_ms
+        self._profile["verify_segment_prefetch_victim_select_ms"] += victim_select_ms
+        self._profile["verify_segment_prefetch_reservation_ms"] += reservation_ms
+        self._profile["verify_segment_prefetch_begin_transfer_call_ms"] += transfer_call_ms
+        self._profile["verify_segment_prefetch_bookkeeping_ms"] += bookkeeping_ms
         self._profile["verify_segment_prefetch_used_transfer_budget_ms"] += used_transfer_ms
         self._profile["verify_segment_prefetch_visible_overhead_ms"] += (
             time.perf_counter() - submit_t0
@@ -2196,6 +2372,11 @@ class PrefetchRuntime:
             "observe_runtime_meta_ms": float(self._profile.get("observe_runtime_meta_ms", 0.0)),
             "observe_mark_access_ms": float(self._profile.get("observe_mark_access_ms", 0.0)),
             "observe_queue_update_ms": float(self._profile.get("observe_queue_update_ms", 0.0)),
+            "observe_verify_rank_guard_ms": float(self._profile.get("observe_verify_rank_guard_ms", 0.0)),
+            "observe_verify_segment_index_ms": float(self._profile.get("observe_verify_segment_index_ms", 0.0)),
+            "observe_verify_runtime_meta_call_ms": float(
+                self._profile.get("observe_verify_runtime_meta_call_ms", 0.0)
+            ),
             "queue_layer_count": int(self._profile.get("queue_layer_count", 0.0)),
             "queue_aggregate_ms": float(self._profile.get("queue_aggregate_ms", 0.0)),
             "queue_filter_ms": float(self._profile.get("queue_filter_ms", 0.0)),
@@ -2253,6 +2434,12 @@ class PrefetchRuntime:
             "verify_segment_prefetch_candidate_merge_count": int(
                 self._profile.get("verify_segment_prefetch_candidate_merge_count", 0.0)
             ),
+            "verify_segment_prefetch_rank_limited_count": int(
+                self._profile.get("verify_segment_prefetch_rank_limited_count", 0.0)
+            ),
+            "verify_segment_prefetch_rank_limit_sum": float(
+                self._profile.get("verify_segment_prefetch_rank_limit_sum", 0.0)
+            ),
             "verify_segment_prefetch_no_candidate_count": int(
                 self._profile.get("verify_segment_prefetch_no_candidate_count", 0.0)
             ),
@@ -2267,6 +2454,39 @@ class PrefetchRuntime:
             ),
             "verify_segment_prefetch_rank_ms": float(
                 self._profile.get("verify_segment_prefetch_rank_ms", 0.0)
+            ),
+            "verify_segment_prefetch_rank_scan_ms": float(
+                self._profile.get("verify_segment_prefetch_rank_scan_ms", 0.0)
+            ),
+            "verify_segment_prefetch_rank_sort_ms": float(
+                self._profile.get("verify_segment_prefetch_rank_sort_ms", 0.0)
+            ),
+            "verify_segment_prefetch_loop_ms": float(
+                self._profile.get("verify_segment_prefetch_loop_ms", 0.0)
+            ),
+            "verify_segment_prefetch_filter_ms": float(
+                self._profile.get("verify_segment_prefetch_filter_ms", 0.0)
+            ),
+            "verify_segment_prefetch_victim_select_ms": float(
+                self._profile.get("verify_segment_prefetch_victim_select_ms", 0.0)
+            ),
+            "verify_segment_prefetch_reservation_ms": float(
+                self._profile.get("verify_segment_prefetch_reservation_ms", 0.0)
+            ),
+            "verify_segment_prefetch_begin_transfer_call_ms": float(
+                self._profile.get("verify_segment_prefetch_begin_transfer_call_ms", 0.0)
+            ),
+            "verify_segment_prefetch_bookkeeping_ms": float(
+                self._profile.get("verify_segment_prefetch_bookkeeping_ms", 0.0)
+            ),
+            "verify_segment_prefetch_dispatch_budget_sum": float(
+                self._profile.get("verify_segment_prefetch_dispatch_budget_sum", 0.0)
+            ),
+            "verify_segment_prefetch_inflight_budget_sum": float(
+                self._profile.get("verify_segment_prefetch_inflight_budget_sum", 0.0)
+            ),
+            "verify_segment_prefetch_transfer_enqueue_ms": float(
+                self._profile.get("verify_segment_prefetch_transfer_enqueue_ms", 0.0)
             ),
             "verify_segment_prefetch_visible_overhead_ms": float(
                 self._profile.get("verify_segment_prefetch_visible_overhead_ms", 0.0)

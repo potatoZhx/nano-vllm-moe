@@ -28,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -46,6 +47,7 @@ PROMPT_TEXT = (
 )
 
 MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
+NUM_MOE_LAYERS = 48
 
 
 def str2bool(value: str | bool) -> bool:
@@ -107,6 +109,96 @@ def _row_from_raw(
     acceptance = summary.get("acceptance", {})
     cache = summary.get("cache", {})
     cuda_graph = summary.get("cuda_graph", {})
+    engine_profile = raw.get("engine_profile", {})
+    verify_calls = int(cuda_graph.get("verify_call_count", 0) or 0)
+
+    def ep_float(key: str) -> float:
+        value = engine_profile.get(key)
+        if value is None:
+            value = engine_profile.get(f"model_{key}", 0.0)
+        return float(value or 0.0)
+
+    def has_ep(key: str) -> bool:
+        return key in engine_profile or f"model_{key}" in engine_profile
+
+    verify_tokens = ep_float("verify_tokens_in_total")
+    cpu_routes = ep_float("verify_cpu_routes_sum")
+    cpu_routes_source = "verify_profile" if has_ep("verify_cpu_routes_sum") else "aggregate_fallback"
+    cpu_compute_source = "verify_profile" if has_ep("verify_cpu_compute_ms") else "aggregate_fallback"
+    realized_cpu_experts_source = (
+        "verify_profile"
+        if has_ep("verify_realized_cpu_expert_count_sum")
+        else "aggregate_fallback"
+    )
+    cpu_compute_ms = ep_float("verify_cpu_compute_ms")
+    cpu_prepare_ms = ep_float("verify_cpu_prepare_ms")
+    cpu_merge_ms = ep_float("verify_cpu_to_gpu_merge_ms")
+    gpu_compute_ms = ep_float("verify_gpu_compute_ms")
+    parallel_wall_ms = ep_float("verify_parallel_wall_ms")
+    parallel_critical_path_ms = ep_float("verify_parallel_critical_path_est_ms")
+    parallel_overlap_ms = ep_float("verify_parallel_overlap_est_ms")
+    cpu_wait_ms = ep_float("verify_cpu_wait_ms")
+    gpu_wait_ms = ep_float("verify_gpu_wait_ms")
+    realized_cpu_experts = ep_float("verify_realized_cpu_expert_count_sum")
+    if cpu_routes <= 0.0:
+        cpu_routes = ep_float("cpu_routes_sum")
+    if cpu_compute_ms <= 0.0:
+        cpu_compute_ms = ep_float("cpu_compute_ms")
+    if cpu_prepare_ms <= 0.0:
+        cpu_prepare_ms = ep_float("cpu_prepare_ms")
+    if cpu_merge_ms <= 0.0:
+        cpu_merge_ms = ep_float("cpu_to_gpu_merge_ms")
+    if gpu_compute_ms <= 0.0:
+        gpu_compute_ms = ep_float("gpu_compute_ms")
+    if realized_cpu_experts <= 0.0:
+        realized_cpu_experts = ep_float("realized_cpu_expert_count_sum")
+    def ep_float_prefer(preferred_key: str, fallback_key: str) -> float:
+        if has_ep(preferred_key):
+            return ep_float(preferred_key)
+        return ep_float(fallback_key)
+
+    def per_layer_sum(suffix: str) -> list[float]:
+        return [
+            ep_float_prefer(
+                f"verify_layer_{layer_idx}_{suffix}",
+                f"layer_{layer_idx}_{suffix}",
+            )
+            for layer_idx in range(NUM_MOE_LAYERS)
+        ]
+
+    def per_call(values: list[float]) -> list[float]:
+        if verify_calls <= 0:
+            return [0.0 for _ in values]
+        return [float(value / verify_calls) for value in values]
+
+    layer_cpu_expert_sums = per_layer_sum("realized_cpu_expert_count_sum")
+    layer_cpu_route_sums = per_layer_sum("cpu_routes_sum")
+    layer_active_expert_sums = per_layer_sum("active_expert_count_sum")
+    layer_active_route_sums = per_layer_sum("active_routes_sum")
+    layer_profile_counts = per_layer_sum("moe_profile_count")
+    layer_cpu_experts_per_call = per_call(layer_cpu_expert_sums)
+    layer_cpu_routes_per_call = per_call(layer_cpu_route_sums)
+    layer_active_experts_per_call = per_call(layer_active_expert_sums)
+    layer_active_routes_per_call = per_call(layer_active_route_sums)
+    layer_top_cpu_experts = [
+        {
+            "layer": layer_idx,
+            "cpu_experts_per_call": float(layer_cpu_experts_per_call[layer_idx]),
+            "cpu_routes_per_call": float(layer_cpu_routes_per_call[layer_idx]),
+            "active_experts_per_call": float(layer_active_experts_per_call[layer_idx]),
+            "active_routes_per_call": float(layer_active_routes_per_call[layer_idx]),
+        }
+        for layer_idx in range(NUM_MOE_LAYERS)
+    ]
+    layer_top_cpu_experts.sort(
+        key=lambda item: (
+            -float(item["cpu_experts_per_call"]),
+            -float(item["cpu_routes_per_call"]),
+            int(item["layer"]),
+        )
+    )
+    segment_event_ms = ep_float("verify_segment_cuda_event_ms")
+    segment_event_count = ep_float("verify_segment_cuda_event_count")
 
     return {
         "name": _case_name(case),
@@ -128,7 +220,72 @@ def _row_from_raw(
         ),
         "avg_miss_routes_per_layer": float(cache.get("avg_miss_per_layer", 0.0) or 0.0),
         "avg_active_per_layer": float(cache.get("avg_active_per_layer", 0.0) or 0.0),
-        "verify_calls": int(cuda_graph.get("verify_call_count", 0) or 0),
+        "verify_calls": verify_calls,
+        "verify_tokens_total": verify_tokens,
+        "verify_tokens_per_call": float(verify_tokens / verify_calls) if verify_calls else 0.0,
+        "verify_cpu_routes_total": cpu_routes,
+        "verify_cpu_routes_source": cpu_routes_source,
+        "verify_cpu_routes_per_call": float(cpu_routes / verify_calls) if verify_calls else 0.0,
+        "verify_cpu_routes_per_layer_call": (
+            float(cpu_routes / (verify_calls * NUM_MOE_LAYERS)) if verify_calls else 0.0
+        ),
+        "verify_realized_cpu_expert_count_total": realized_cpu_experts,
+        "verify_realized_cpu_expert_count_source": realized_cpu_experts_source,
+        "verify_realized_cpu_expert_count_per_call": (
+            float(realized_cpu_experts / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_realized_cpu_expert_count_per_layer_call": (
+            float(realized_cpu_experts / (verify_calls * NUM_MOE_LAYERS)) if verify_calls else 0.0
+        ),
+        "verify_layer_realized_cpu_expert_count_total": layer_cpu_expert_sums,
+        "verify_layer_realized_cpu_expert_count_per_call": layer_cpu_experts_per_call,
+        "verify_layer_cpu_routes_total": layer_cpu_route_sums,
+        "verify_layer_cpu_routes_per_call": layer_cpu_routes_per_call,
+        "verify_layer_active_expert_count_total": layer_active_expert_sums,
+        "verify_layer_active_expert_count_per_call": layer_active_experts_per_call,
+        "verify_layer_active_routes_total": layer_active_route_sums,
+        "verify_layer_active_routes_per_call": layer_active_routes_per_call,
+        "verify_layer_moe_profile_count": layer_profile_counts,
+        "verify_layer_cpu_expert_top": layer_top_cpu_experts[:12],
+        "verify_cpu_compute_ms_total": cpu_compute_ms,
+        "verify_cpu_compute_source": cpu_compute_source,
+        "verify_cpu_compute_ms_per_call": (
+            float(cpu_compute_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_cpu_compute_ms_per_route": (
+            float(cpu_compute_ms / cpu_routes) if cpu_routes > 0.0 else 0.0
+        ),
+        "verify_cpu_compute_ms_per_expert": (
+            float(cpu_compute_ms / realized_cpu_experts) if realized_cpu_experts > 0.0 else 0.0
+        ),
+        "verify_cpu_prepare_ms_total": cpu_prepare_ms,
+        "verify_cpu_prepare_ms_per_call": (
+            float(cpu_prepare_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_cpu_to_gpu_merge_ms_total": cpu_merge_ms,
+        "verify_cpu_to_gpu_merge_ms_per_call": (
+            float(cpu_merge_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_gpu_compute_ms_total": gpu_compute_ms,
+        "verify_gpu_compute_ms_per_call": (
+            float(gpu_compute_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_parallel_wall_ms_total": parallel_wall_ms,
+        "verify_parallel_wall_ms_per_call": (
+            float(parallel_wall_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_parallel_critical_path_ms_total": parallel_critical_path_ms,
+        "verify_parallel_overlap_ms_total": parallel_overlap_ms,
+        "verify_cpu_wait_ms_total": cpu_wait_ms,
+        "verify_gpu_wait_ms_total": gpu_wait_ms,
+        "verify_segment_cuda_event_ms_total": segment_event_ms,
+        "verify_segment_cuda_event_count": int(round(segment_event_count)),
+        "verify_segment_cuda_event_ms_per_call": (
+            float(segment_event_ms / verify_calls) if verify_calls else 0.0
+        ),
+        "verify_segment_cuda_event_ms_per_segment": (
+            float(segment_event_ms / segment_event_count) if segment_event_count > 0.0 else 0.0
+        ),
         "outputs_digest": str(raw.get("outputs_digest", "")),
     }
 
@@ -315,10 +472,23 @@ def run_case(
         f"draft_ms={row['draft_forward_ms_avg']:.3f} "
         f"verify_ms={row['verify_forward_ms_avg']:.3f} "
         f"hit={row['route_hit_rate']:.4f} accept={row['acceptance_rate']:.4f} "
+        f"cpu_routes/call={row['verify_cpu_routes_per_call']:.1f} "
+        f"cpu_exp/call={row['verify_realized_cpu_expert_count_per_call']:.1f} "
+        f"cpu_compute/call={row['verify_cpu_compute_ms_per_call']:.3f}ms "
+        f"cpu_src={row['verify_cpu_compute_source']} "
+        f"cpu_compute/route={row['verify_cpu_compute_ms_per_route']:.5f}ms "
+        f"seg_event/call={row['verify_segment_cuda_event_ms_per_call']:.3f}ms "
         f"miss/L={row['avg_miss_routes_per_layer']:.2f} "
         f"active/L={row['avg_active_per_layer']:.2f}{cap_str}",
         flush=True,
     )
+    top_layers = ", ".join(
+        f"L{int(item['layer'])}:{float(item['cpu_experts_per_call']):.1f}exp/"
+        f"{float(item['cpu_routes_per_call']):.1f}routes"
+        for item in row["verify_layer_cpu_expert_top"][:6]
+        if float(item["cpu_experts_per_call"]) > 0.0
+    )
+    print(f"  verify per-layer cpu_exp top: {top_layers or 'none'}", flush=True)
     return row
 
 
@@ -335,8 +505,8 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         "",
         "## Cases",
         "",
-        "| seg | out | ratio | K | cpu_cap | rep | tok/s | decode tok/s | draft ms | verify ms | hit | accept | miss/L | active/L |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| seg | out | ratio | K | cpu_cap | rep | tok/s | decode tok/s | draft ms | verify ms | hit | accept | routes/call | exp/call | cpu ms/call | cpu ms/route | gpu ms/call | seg event/call | miss/L | active/L |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         cpu_cap = int(row.get("verify_max_cpu_routes_per_layer", 0) or 0)
@@ -349,9 +519,41 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             f"{row['decode_phase_output_tok_s']:.3f} | "
             f"{row['draft_forward_ms_avg']:.3f} | {row['verify_forward_ms_avg']:.3f} | "
             f"{row['route_hit_rate']:.4f} | {row['acceptance_rate']:.4f} | "
+            f"{row['verify_cpu_routes_per_call']:.1f} | "
+            f"{row['verify_realized_cpu_expert_count_per_call']:.1f} | "
+            f"{row['verify_cpu_compute_ms_per_call']:.3f} | "
+            f"{row['verify_cpu_compute_ms_per_route']:.5f} | "
+            f"{row['verify_gpu_compute_ms_per_call']:.3f} | "
+            f"{row['verify_segment_cuda_event_ms_per_call']:.3f} | "
             f"{row['avg_miss_routes_per_layer']:.2f} | "
             f"{row['avg_active_per_layer']:.2f} |"
         )
+
+    lines.extend(
+        [
+            "",
+            "## Per-Layer CPU Experts",
+            "",
+            "Full 48-layer arrays are in `summary.json`; the CSV export is `per_layer_cpu_experts.csv`.",
+            "",
+            "| case | K | cpu_cap | layer | CPU experts/call | CPU routes/call | active experts/call | active routes/call |",
+            "|:---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in rows:
+        cpu_cap = int(row.get("verify_max_cpu_routes_per_layer", 0) or 0)
+        for item in row["verify_layer_cpu_expert_top"]:
+            if float(item["cpu_experts_per_call"]) <= 0.0:
+                continue
+            lines.append(
+                "| "
+                f"{row['name']} | {row['max_draft_tokens']} | {cpu_cap} | "
+                f"{int(item['layer'])} | "
+                f"{float(item['cpu_experts_per_call']):.3f} | "
+                f"{float(item['cpu_routes_per_call']):.3f} | "
+                f"{float(item['active_experts_per_call']):.3f} | "
+                f"{float(item['active_routes_per_call']):.3f} |"
+            )
 
     lines.extend(
         [
@@ -364,6 +566,11 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
             "- `draft_ms` and `verify_ms` are the mean forward latencies per call.",
             "- `cpu_cap` > 0 means verify CPU routes per layer were capped at that count "
             "(excess routes discarded); 0 means no cap.",
+            "- `cpu ms/call` and `cpu ms/route` use `model_verify_cpu_compute_ms` when "
+            "available and fall back to aggregate `model_cpu_compute_ms` otherwise.",
+            "- `seg event/call` is CUDA event elapsed time around verify segment graph "
+            "replay; with `NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING=1` it is available "
+            "even when prefetch is disabled.",
             "- Compare these numbers against prefetch-enabled runs to quantify how much "
             "transfer scheduling adds to (or hides behind) forward time.",
             "",
@@ -371,6 +578,69 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_per_layer_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    fieldnames = [
+        "case",
+        "output_len",
+        "cache_ratio",
+        "segment_size",
+        "max_draft_tokens",
+        "verify_max_cpu_routes_per_layer",
+        "repeat",
+        "layer",
+        "cpu_experts_total",
+        "cpu_experts_per_call",
+        "cpu_routes_total",
+        "cpu_routes_per_call",
+        "active_experts_total",
+        "active_experts_per_call",
+        "active_routes_total",
+        "active_routes_per_call",
+        "layer_profile_count",
+        "verify_calls",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            for layer_idx in range(NUM_MOE_LAYERS):
+                writer.writerow(
+                    {
+                        "case": row["name"],
+                        "output_len": row["output_len"],
+                        "cache_ratio": row["cache_ratio"],
+                        "segment_size": row["segment_size"],
+                        "max_draft_tokens": row["max_draft_tokens"],
+                        "verify_max_cpu_routes_per_layer": row[
+                            "verify_max_cpu_routes_per_layer"
+                        ],
+                        "repeat": row["repeat"],
+                        "layer": layer_idx,
+                        "cpu_experts_total": row[
+                            "verify_layer_realized_cpu_expert_count_total"
+                        ][layer_idx],
+                        "cpu_experts_per_call": row[
+                            "verify_layer_realized_cpu_expert_count_per_call"
+                        ][layer_idx],
+                        "cpu_routes_total": row["verify_layer_cpu_routes_total"][layer_idx],
+                        "cpu_routes_per_call": row["verify_layer_cpu_routes_per_call"][layer_idx],
+                        "active_experts_total": row[
+                            "verify_layer_active_expert_count_total"
+                        ][layer_idx],
+                        "active_experts_per_call": row[
+                            "verify_layer_active_expert_count_per_call"
+                        ][layer_idx],
+                        "active_routes_total": row["verify_layer_active_routes_total"][layer_idx],
+                        "active_routes_per_call": row[
+                            "verify_layer_active_routes_per_call"
+                        ][layer_idx],
+                        "layer_profile_count": row["verify_layer_moe_profile_count"][layer_idx],
+                        "verify_calls": row["verify_calls"],
+                    }
+                )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -404,6 +674,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int),
             "verify_max_cpu_routes_per_layer": _parse_csv(args.verify_max_cpu_routes_per_layer, int),
             "repeats": int(args.repeats),
+            "per_layer_cpu_experts_csv": str(output_dir / "per_layer_cpu_experts.csv"),
             "argv": sys.argv,
         },
         "rows": rows,
@@ -411,6 +682,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     summary_json = output_dir / "summary.json"
     summary_md = output_dir / "summary.md"
+    write_per_layer_csv(rows, output_dir / "per_layer_cpu_experts.csv")
     summary_json.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2) + "\n",
         encoding="utf-8",

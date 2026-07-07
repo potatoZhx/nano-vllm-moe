@@ -500,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefetch-max-inflight", type=int, default=16)
     p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
     p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
-    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
+    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
     p.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
     p.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     p.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)

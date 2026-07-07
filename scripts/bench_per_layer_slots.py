@@ -14,7 +14,7 @@ Example:
 
     conda activate nano_moe
     cd /home/linke/nano-vllm-moe
-    rm -rf results/per_layer_slots_bench
+    rm -rf results/per_layer_slots_bench_76
     CUDA_VISIBLE_DEVICES=2 python scripts/bench_per_layer_slots.py \
         --output-dir results/per_layer_slots_bench \
         --gpu-memory-utilization 0.99 \
@@ -26,11 +26,13 @@ Example:
         --slot-buckets 4 \
         --slot-max-bucket-ratio 2.0 \
         --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
-        --kt-num-threads 16
+        --kt-num-threads 16 \
+        --verify-cuda-graph-bucket-steps 3,5,7,10,13
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -51,6 +53,7 @@ PROMPT_TEXT = (
 DEFAULT_PROFILE = "results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors"
 DEFAULT_PREDICTOR_PATH = "random_cache_srdp_scripts-1/res/run_20260614_133025"
 MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
+NUM_MOE_LAYERS = 48
 
 
 def str2bool(value: str | bool) -> bool:
@@ -154,6 +157,60 @@ def _row_from_raw(
         pred_draft_seg_submit + pred_draft_live_submit + pred_phase1_submit
     )
     verify_phase_submit = pred_verify_seg_submit
+    def ep_float(key: str) -> float:
+        value = engine_profile.get(key)
+        if value is None:
+            value = engine_profile.get(f"model_{key}", 0.0)
+        return float(value or 0.0)
+
+    def has_ep(key: str) -> bool:
+        return key in engine_profile or f"model_{key}" in engine_profile
+
+    def ep_float_prefer(preferred_key: str, fallback_key: str) -> float:
+        if has_ep(preferred_key):
+            return ep_float(preferred_key)
+        return ep_float(fallback_key)
+
+    def per_layer_sum(suffix: str) -> list[float]:
+        return [
+            ep_float_prefer(
+                f"verify_layer_{layer_idx}_{suffix}",
+                f"layer_{layer_idx}_{suffix}",
+            )
+            for layer_idx in range(NUM_MOE_LAYERS)
+        ]
+
+    def per_call(values: list[float]) -> list[float]:
+        if verify_calls <= 0:
+            return [0.0 for _ in values]
+        return [float(value / verify_calls) for value in values]
+
+    layer_cpu_expert_sums = per_layer_sum("realized_cpu_expert_count_sum")
+    layer_cpu_route_sums = per_layer_sum("cpu_routes_sum")
+    layer_active_expert_sums = per_layer_sum("active_expert_count_sum")
+    layer_active_route_sums = per_layer_sum("active_routes_sum")
+    layer_profile_counts = per_layer_sum("moe_profile_count")
+    layer_cpu_experts_per_call = per_call(layer_cpu_expert_sums)
+    layer_cpu_routes_per_call = per_call(layer_cpu_route_sums)
+    layer_active_experts_per_call = per_call(layer_active_expert_sums)
+    layer_active_routes_per_call = per_call(layer_active_route_sums)
+    layer_top_cpu_experts = [
+        {
+            "layer": layer_idx,
+            "cpu_experts_per_call": float(layer_cpu_experts_per_call[layer_idx]),
+            "cpu_routes_per_call": float(layer_cpu_routes_per_call[layer_idx]),
+            "active_experts_per_call": float(layer_active_experts_per_call[layer_idx]),
+            "active_routes_per_call": float(layer_active_routes_per_call[layer_idx]),
+        }
+        for layer_idx in range(NUM_MOE_LAYERS)
+    ]
+    layer_top_cpu_experts.sort(
+        key=lambda item: (
+            -float(item["cpu_experts_per_call"]),
+            -float(item["cpu_routes_per_call"]),
+            int(item["layer"]),
+        )
+    )
 
     return {
         "name": _case_name(case),
@@ -210,6 +267,16 @@ def _row_from_raw(
         "verify_prefetch_per_forward": (
             float(verify_phase_submit / verify_calls) if verify_calls else 0.0
         ),
+        "verify_layer_realized_cpu_expert_count_total": layer_cpu_expert_sums,
+        "verify_layer_realized_cpu_expert_count_per_call": layer_cpu_experts_per_call,
+        "verify_layer_cpu_routes_total": layer_cpu_route_sums,
+        "verify_layer_cpu_routes_per_call": layer_cpu_routes_per_call,
+        "verify_layer_active_expert_count_total": layer_active_expert_sums,
+        "verify_layer_active_expert_count_per_call": layer_active_experts_per_call,
+        "verify_layer_active_routes_total": layer_active_route_sums,
+        "verify_layer_active_routes_per_call": layer_active_routes_per_call,
+        "verify_layer_moe_profile_count": layer_profile_counts,
+        "verify_layer_cpu_expert_top": layer_top_cpu_experts[:12],
         "prefetch_submit_count": int(
             prefetch.get("submit_count", 0) or 0
         ),
@@ -553,6 +620,13 @@ def run_case(
         f"active/L={row['avg_active_per_layer']:.2f}",
         flush=True,
     )
+    top_layers = ", ".join(
+        f"L{int(item['layer'])}:{float(item['cpu_experts_per_call']):.1f}exp/"
+        f"{float(item['cpu_routes_per_call']):.1f}routes"
+        for item in row["verify_layer_cpu_expert_top"][:6]
+        if float(item["cpu_experts_per_call"]) > 0.0
+    )
+    print(f"  verify per-layer cpu_exp top: {top_layers or 'none'}", flush=True)
     print(
         f"  prefetch: submit={row['prefetch_submit_count']} "
         f"publish={row['prefetch_publish_count']} "
@@ -612,6 +686,31 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
     lines.extend(
         [
             "",
+            "## Per-Layer CPU Experts",
+            "",
+            "Full 48-layer arrays are in `summary.json`; the CSV export is `per_layer_cpu_experts.csv`.",
+            "",
+            "| case | alloc | K | layer | CPU experts/call | CPU routes/call | active experts/call | active routes/call |",
+            "|:---|:---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in rows:
+        for item in row["verify_layer_cpu_expert_top"]:
+            if float(item["cpu_experts_per_call"]) <= 0.0:
+                continue
+            lines.append(
+                "| "
+                f"{row['name']} | {row['allocation_mode']} | "
+                f"{row['max_draft_tokens']} | {int(item['layer'])} | "
+                f"{float(item['cpu_experts_per_call']):.3f} | "
+                f"{float(item['cpu_routes_per_call']):.3f} | "
+                f"{float(item['active_experts_per_call']):.3f} | "
+                f"{float(item['active_routes_per_call']):.3f} |"
+            )
+
+    lines.extend(
+        [
+            "",
             "## Uniform vs Profile-Weighted Comparison",
             "",
             "| seg | out | ratio | K | rep | digest | tok/s uniform | tok/s weighted | change % | hit uniform | hit weighted | hit delta | accept delta | alpha uniform | alpha weighted | draft ms delta | verify ms delta | miss/L uniform | miss/L weighted |",
@@ -650,6 +749,67 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_per_layer_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    fieldnames = [
+        "case",
+        "allocation_mode",
+        "output_len",
+        "cache_ratio",
+        "segment_size",
+        "max_draft_tokens",
+        "repeat",
+        "layer",
+        "cpu_experts_total",
+        "cpu_experts_per_call",
+        "cpu_routes_total",
+        "cpu_routes_per_call",
+        "active_experts_total",
+        "active_experts_per_call",
+        "active_routes_total",
+        "active_routes_per_call",
+        "layer_profile_count",
+        "verify_calls",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            for layer_idx in range(NUM_MOE_LAYERS):
+                writer.writerow(
+                    {
+                        "case": row["name"],
+                        "allocation_mode": row["allocation_mode"],
+                        "output_len": row["output_len"],
+                        "cache_ratio": row["cache_ratio"],
+                        "segment_size": row["segment_size"],
+                        "max_draft_tokens": row["max_draft_tokens"],
+                        "repeat": row["repeat"],
+                        "layer": layer_idx,
+                        "cpu_experts_total": row[
+                            "verify_layer_realized_cpu_expert_count_total"
+                        ][layer_idx],
+                        "cpu_experts_per_call": row[
+                            "verify_layer_realized_cpu_expert_count_per_call"
+                        ][layer_idx],
+                        "cpu_routes_total": row["verify_layer_cpu_routes_total"][layer_idx],
+                        "cpu_routes_per_call": row["verify_layer_cpu_routes_per_call"][layer_idx],
+                        "active_experts_total": row[
+                            "verify_layer_active_expert_count_total"
+                        ][layer_idx],
+                        "active_experts_per_call": row[
+                            "verify_layer_active_expert_count_per_call"
+                        ][layer_idx],
+                        "active_routes_total": row["verify_layer_active_routes_total"][layer_idx],
+                        "active_routes_per_call": row[
+                            "verify_layer_active_routes_per_call"
+                        ][layer_idx],
+                        "layer_profile_count": row["verify_layer_moe_profile_count"][layer_idx],
+                        "verify_calls": row["verify_calls"],
+                    }
+                )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -691,6 +851,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args.max_draft_tokens_values, int
             ),
             "repeats": int(args.repeats),
+            "per_layer_cpu_experts_csv": str(output_dir / "per_layer_cpu_experts.csv"),
             "argv": sys.argv,
         },
         "rows": rows,
@@ -699,6 +860,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     summary_json = output_dir / "summary.json"
     summary_md = output_dir / "summary.md"
+    write_per_layer_csv(rows, output_dir / "per_layer_cpu_experts.csv")
     summary_json.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2) + "\n",
         encoding="utf-8",
@@ -791,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify-prefetch-visible-budget-ms", type=float, default=12.0
     )
     parser.add_argument(
-        "--verify-prefetch-max-per-boundary", type=int, default=16
+        "--verify-prefetch-max-per-boundary", type=int, default=4
     )
 
     parser.add_argument(

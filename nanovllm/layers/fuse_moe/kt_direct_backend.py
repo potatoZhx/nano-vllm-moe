@@ -9,6 +9,7 @@ from typing import Callable
 import torch
 
 from nanovllm.layers.fuse_moe.cpu_backend import CpuMoeResult
+from nanovllm.utils.verify_op_events import verify_op_event
 
 
 def _trim_cpu_allocator() -> None:
@@ -671,22 +672,25 @@ class KtDirectCpuMoeBackend:
         ) = KtDirectCPUBuffer.get_buffer(flat_hidden, self.num_experts_per_tok)
         slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
 
-        self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
-        input_cpu[slot].copy_(flat_hidden, non_blocking=True)
-        expert_ids_cpu[slot].copy_(topk_ids, non_blocking=True)
-        routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)
+        with verify_op_event("kt.cpu_prepare_copies", self.layer_idx):
+            self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
+            input_cpu[slot].copy_(flat_hidden, non_blocking=True)
+            expert_ids_cpu[slot].copy_(topk_ids, non_blocking=True)
+            routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)
 
-        task = self.moe.forward_task(
-            batch_size_cpu[slot].data_ptr(),
-            self.num_experts_per_tok,
-            expert_ids_cpu[slot].data_ptr(),
-            routing_weights_cpu[slot].data_ptr(),
-            input_cpu[slot].data_ptr(),
-            output_cpu[slot].data_ptr(),
-            False,
-        )
+        with verify_op_event("kt.forward_task_create", self.layer_idx):
+            task = self.moe.forward_task(
+                batch_size_cpu[slot].data_ptr(),
+                self.num_experts_per_tok,
+                expert_ids_cpu[slot].data_ptr(),
+                routing_weights_cpu[slot].data_ptr(),
+                input_cpu[slot].data_ptr(),
+                output_cpu[slot].data_ptr(),
+                False,
+            )
         stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
-        self.runtime.cpu_infer.submit_with_cuda_stream(stream, task)
+        with verify_op_event("kt.cpuinfer_submit", self.layer_idx):
+            self.runtime.cpu_infer.submit_with_cuda_stream(stream, task)
         return slot
 
     @torch.no_grad()
@@ -704,6 +708,8 @@ class KtDirectCpuMoeBackend:
             flat_hidden, self.num_experts_per_tok,
         )
         stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
-        self.runtime.cpu_infer.sync_with_cuda_stream(stream, 0)
-        output_device[slot].copy_(output_cpu[slot], non_blocking=True)
+        with verify_op_event("kt.cpuinfer_sync", self.layer_idx):
+            self.runtime.cpu_infer.sync_with_cuda_stream(stream, 0)
+        with verify_op_event("kt.output_cpu_to_gpu_copy", self.layer_idx):
+            output_device[slot].copy_(output_cpu[slot], non_blocking=True)
         return output_device[slot]

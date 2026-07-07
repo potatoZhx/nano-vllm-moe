@@ -40,6 +40,38 @@ from nanovllm.utils.heterogeneous_loader import HeterogeneousModelLoader
 from nanovllm.layers.fuse_moe.heterogeneous import GpuFallbackWorkspace
 
 
+def _export_torch_profile_summary(prof, profile_dir: str, stem: str, rank: int, extra: dict) -> None:
+    trace_path = os.path.join(profile_dir, f"{stem}_rank{rank}.json")
+    summary_path = os.path.join(profile_dir, f"{stem}_rank{rank}_summary.json")
+    prof.export_chrome_trace(trace_path)
+    events = []
+    for evt in prof.key_averages():
+        events.append(
+            {
+                "key": evt.key,
+                "count": int(evt.count),
+                "self_cpu_time_total_us": float(evt.self_cpu_time_total),
+                "cpu_time_total_us": float(evt.cpu_time_total),
+                "self_cuda_time_total_us": float(getattr(evt, "self_cuda_time_total", 0.0)),
+                "cuda_time_total_us": float(getattr(evt, "cuda_time_total", 0.0)),
+            }
+        )
+    events_by_cuda = sorted(events, key=lambda x: x["self_cuda_time_total_us"], reverse=True)
+    events_by_cpu = sorted(events, key=lambda x: x["self_cpu_time_total_us"], reverse=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "trace_path": trace_path,
+                **extra,
+                "top_self_cuda_events": events_by_cuda[:80],
+                "top_self_cpu_events": events_by_cpu[:80],
+            },
+            f,
+            ensure_ascii=True,
+            indent=2,
+        )
+
+
 def _create_cache_strategy_from_config(config: Config):
     if str(config.cache_strategy).strip().lower() in {"lfu_rankguard", "lfu_rankguard_online"}:
         return create_cache_strategy(
@@ -117,6 +149,11 @@ class ModelRunner:
         self._prefetch_device_handles: dict[tuple[str, int], list[object]] = defaultdict(list)
         self._prefetch_worker_error: BaseException | None = None
         self._prefetch_worker_thread: threading.Thread | None = None
+        self._verify_boundary_worker_queue: Queue | None = None
+        self._verify_boundary_worker_cv = threading.Condition()
+        self._verify_boundary_worker_outstanding = 0
+        self._verify_boundary_worker_error: BaseException | None = None
+        self._verify_boundary_worker_thread: threading.Thread | None = None
         self._prefetch_trace_events: list[dict[str, object]] = []
         self._verify_prefetch_active = False
         self._current_verify_prefetch_step_id = -1
@@ -124,6 +161,7 @@ class ModelRunner:
         self._verify_layer_timing_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
         self._verify_layer_active_timing: dict[int, object] = {}
         self._dual_queue_segment_timing_events: list[tuple[str, int, object, object]] = []
+        self._verify_op_event_records: list[dict[str, object]] = []
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
 
@@ -236,6 +274,14 @@ class ModelRunner:
                         daemon=True,
                     )
                     self._prefetch_worker_thread.start()
+                    if self._verify_boundary_prefetch_async_enabled():
+                        self._verify_boundary_worker_queue = Queue()
+                        self._verify_boundary_worker_thread = threading.Thread(
+                            target=self._verify_boundary_worker_main,
+                            name=f"verify-boundary-prefetch-rank{self.rank}",
+                            daemon=True,
+                        )
+                        self._verify_boundary_worker_thread.start()
         else:
             load_model(self.model, config.model)
             self.draft_scheduler = None
@@ -381,6 +427,16 @@ class ModelRunner:
             self._prefetch_worker_queue = None
         if not hasattr(self, "_prefetch_worker_thread"):
             self._prefetch_worker_thread = None
+        if not hasattr(self, "_verify_boundary_worker_queue"):
+            self._verify_boundary_worker_queue = None
+        if not hasattr(self, "_verify_boundary_worker_cv"):
+            self._verify_boundary_worker_cv = threading.Condition()
+        if not hasattr(self, "_verify_boundary_worker_outstanding"):
+            self._verify_boundary_worker_outstanding = 0
+        if not hasattr(self, "_verify_boundary_worker_error"):
+            self._verify_boundary_worker_error = None
+        if not hasattr(self, "_verify_boundary_worker_thread"):
+            self._verify_boundary_worker_thread = None
         if not hasattr(self, "_prefetch_trace_events"):
             self._prefetch_trace_events = []
         if not hasattr(self, "_verify_prefetch_active"):
@@ -412,6 +468,10 @@ class ModelRunner:
     def _dual_queue_prefetch_enabled(self) -> bool:
         return str(getattr(getattr(self, "config", None), "prefetch_runtime_kind", "legacy")) == "dual_queue"
 
+    def _verify_boundary_prefetch_async_enabled(self) -> bool:
+        raw = os.getenv("NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC", "0").strip().lower()
+        return raw not in {"0", "false", "no", "n", "off"}
+
     def _draft_prefetch_granularity(self) -> str:
         return str(getattr(getattr(self, "config", None), "draft_prefetch_frontier_granularity", "segment"))
 
@@ -429,7 +489,13 @@ class ModelRunner:
 
     def _skip_verify_metadata_offload(self) -> bool:
         policy = str(getattr(getattr(self, "config", None), "spec_verify_miss_policy", "")).strip()
-        return policy == "cache_fill_no_cpu"
+        env_skip = os.getenv("NANOVLLM_VERIFY_DISABLE_RUNTIME_METADATA", "").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        env_skip = env_skip or os.getenv("NANOVLLM_VERIFY_SKIP_METADATA_OFFLOAD", "").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        return env_skip or policy == "cache_fill_no_cpu"
 
     def _draft_segment_boundaries(self) -> list[tuple[int, int]]:
         num_layers = int(getattr(getattr(self.config, "hf_config", None), "num_hidden_layers", 0))
@@ -666,6 +732,224 @@ class ModelRunner:
                 self._profile["prefetch_async_drain_wait_ms"] += wait_ms
         return wait_ms
 
+    def _raise_verify_boundary_worker_error(self) -> None:
+        self._ensure_prefetch_internal_state()
+        error = getattr(self, "_verify_boundary_worker_error", None)
+        if error is not None:
+            raise RuntimeError("Background verify boundary prefetch worker failed") from error
+
+    def _enqueue_verify_boundary_prefetch(
+        self,
+        *,
+        step_id: int,
+        target_layer_start: int,
+        target_layer_end: int,
+        target_segment_id: int,
+    ) -> bool:
+        self._ensure_prefetch_internal_state()
+        if not (
+            getattr(self, "_prefetch_async_enabled", False)
+            and self._verify_boundary_prefetch_async_enabled()
+        ):
+            return False
+        queue_obj = getattr(self, "_verify_boundary_worker_queue", None)
+        if queue_obj is None:
+            return False
+        self._raise_verify_boundary_worker_error()
+        enqueue_t0 = perf_counter()
+        item = {
+            "step_id": int(step_id),
+            "target_layer_start": int(target_layer_start),
+            "target_layer_end": int(target_layer_end),
+            "target_segment_id": int(target_segment_id),
+            "enqueue_ts_ms": enqueue_t0 * 1000.0,
+        }
+        with self._verify_boundary_worker_cv:
+            self._verify_boundary_worker_outstanding += 1
+            queue_depth = self._verify_boundary_worker_outstanding
+        queue_obj.put(item)
+        enqueue_ms = (perf_counter() - enqueue_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_boundary_async_prefetch_enqueue_count"] += 1.0
+                self._profile["verify_boundary_async_prefetch_enqueue_ms"] += enqueue_ms
+                self._profile["verify_boundary_async_prefetch_queue_depth_sum"] += float(queue_depth)
+                self._profile["verify_boundary_async_prefetch_queue_depth_max"] = max(
+                    float(self._profile.get("verify_boundary_async_prefetch_queue_depth_max", 0.0)),
+                    float(queue_depth),
+                )
+        return True
+
+    def _wait_for_verify_boundary_prefetch_drain(self) -> float:
+        self._ensure_prefetch_internal_state()
+        if getattr(self, "_verify_boundary_worker_queue", None) is None:
+            return 0.0
+        wait_t0 = perf_counter()
+        with self._verify_boundary_worker_cv:
+            while self._verify_boundary_worker_outstanding > 0:
+                self._raise_verify_boundary_worker_error()
+                self._verify_boundary_worker_cv.wait(timeout=0.001)
+            self._raise_verify_boundary_worker_error()
+        wait_ms = (perf_counter() - wait_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_boundary_async_prefetch_drain_count"] += 1.0
+                self._profile["verify_boundary_async_prefetch_drain_wait_ms"] += wait_ms
+        return wait_ms
+
+    def _process_verify_boundary_prefetch_item(self, item: dict[str, object]) -> None:
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is None:
+            return
+        queue_wait_ms = perf_counter() * 1000.0 - float(item.get("enqueue_ts_ms", 0.0))
+        submit_t0 = perf_counter()
+        with self._prefetch_runtime_lock:
+            if self._dual_queue_prefetch_enabled():
+                submitted = prefetch_runtime.submit_verify_segment_prefetch(
+                    step_id=int(item["step_id"]),
+                    target_layer_start=int(item["target_layer_start"]),
+                    target_layer_end=int(item["target_layer_end"]),
+                    target_segment_id=int(item["target_segment_id"]),
+                )
+            else:
+                submitted = prefetch_runtime.submit_verify_segment_prefetch(
+                    step_id=int(item["step_id"]),
+                    target_layer_start=int(item["target_layer_start"]),
+                    target_layer_end=int(item["target_layer_end"]),
+                    visible_budget_ms=float(getattr(
+                        self.config,
+                        "verify_prefetch_visible_budget_ms",
+                        12.0,
+                    )),
+                )
+        submit_ms = (perf_counter() - submit_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_boundary_async_prefetch_worker_count"] += 1.0
+                self._profile["verify_boundary_async_prefetch_worker_queue_wait_ms"] += queue_wait_ms
+                self._profile["verify_boundary_async_prefetch_worker_submit_ms"] += submit_ms
+                self._profile["verify_boundary_async_prefetch_worker_submitted_count"] += float(submitted)
+            self._trace_prefetch_interval(
+                name="verify_boundary_async_prefetch_submit",
+                start_ms=float(item.get("enqueue_ts_ms", 0.0)) + queue_wait_ms,
+                duration_ms=submit_ms,
+                step_id=int(item["step_id"]),
+                mode="verify",
+                tid="verify-boundary-worker",
+            )
+
+    def _verify_boundary_worker_main(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.rank)
+        while True:
+            queue_obj = self._verify_boundary_worker_queue
+            if queue_obj is None:
+                return
+            item = queue_obj.get()
+            if item is None:
+                return
+            try:
+                self._process_verify_boundary_prefetch_item(item)
+            except BaseException as exc:
+                with self._verify_boundary_worker_cv:
+                    if self._verify_boundary_worker_error is None:
+                        self._verify_boundary_worker_error = exc
+            finally:
+                with self._verify_boundary_worker_cv:
+                    self._verify_boundary_worker_outstanding = max(
+                        0,
+                        self._verify_boundary_worker_outstanding - 1,
+                    )
+                    self._verify_boundary_worker_cv.notify_all()
+
+    def _record_verify_metadata_profile_from_runtime_meta(
+        self,
+        runtime_meta,
+        *,
+        mode: str,
+    ) -> None:
+        if runtime_meta is None or str(mode) not in {"verify", "verify_kt_hybrid"}:
+            return
+        loop_t0 = perf_counter()
+        top_k = int(
+            getattr(
+                getattr(self.config, "hf_config", None),
+                "num_experts_per_tok",
+                getattr(getattr(self.config, "hf_config", None), "top_k", 1),
+            )
+        )
+        layer_count = 0
+        total_routes_sum = 0.0
+        miss_routes_sum = 0.0
+        miss_experts_sum = 0.0
+        active_experts_sum = 0.0
+        route_ratio_sum = 0.0
+        layer_cpu_experts: dict[int, float] = {}
+        layer_cpu_routes: dict[int, float] = {}
+        layer_active_experts: dict[int, float] = {}
+        layer_active_routes: dict[int, float] = {}
+        for _layer_idx, meta in runtime_meta.items():
+            layer_idx = int(_layer_idx)
+            layer_count += 1
+            token_count = int(getattr(meta, "token_count", 0) or 0)
+            total_routes = float(max(0, token_count * top_k))
+            ids = getattr(meta, "aggregated_expert_ids", None)
+            counts = getattr(meta, "aggregated_activation_count", None)
+            status = getattr(meta, "expert_status", None)
+            active_experts = 0.0
+            miss_routes = 0.0
+            miss_experts = 0.0
+            if counts is not None:
+                if counts.device.type != "cpu":
+                    counts = counts.to(device="cpu")
+                total_routes = float(counts.sum().item())
+                active_experts = float((counts > 0).sum().item())
+            if status is not None and ids is not None and counts is not None:
+                if ids.device.type != "cpu" or ids.dtype != torch.int64:
+                    ids = ids.to(device="cpu", dtype=torch.int64)
+                if status.device.type != "cpu":
+                    status = status.to(device="cpu")
+                status_for_ids = status.index_select(0, ids)
+                miss_mask = status_for_ids == 2
+                if miss_mask.numel() > 0:
+                    miss_routes = float(counts[miss_mask].sum().item())
+                    miss_experts = float(miss_mask.sum().item())
+            else:
+                miss_experts = float(getattr(meta, "miss_count", 0.0) or 0.0)
+            total_routes = max(total_routes, 1.0)
+            total_routes_sum += total_routes
+            miss_routes_sum += miss_routes
+            miss_experts_sum += miss_experts
+            active_experts_sum += active_experts
+            route_ratio_sum += miss_routes / total_routes
+            layer_cpu_experts[layer_idx] = miss_experts
+            layer_cpu_routes[layer_idx] = miss_routes
+            layer_active_experts[layer_idx] = active_experts
+            layer_active_routes[layer_idx] = total_routes
+
+        loop_ms = (perf_counter() - loop_t0) * 1000.0
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                self._profile["verify_metadata_profile_async_count"] += 1.0
+                self._profile["verify_metadata_profile_async_loop_ms"] += loop_ms
+                self._profile["verify_metadata_profile_async_layer_count"] += float(layer_count)
+                for prefix in ("", "verify_"):
+                    self._profile[f"{prefix}moe_profile_count"] += float(layer_count)
+                    self._profile[f"{prefix}pre_transfer_cache_miss_sum"] += miss_routes_sum
+                    self._profile[f"{prefix}pre_transfer_active_count_sum"] += total_routes_sum
+                    self._profile[f"{prefix}cpu_route_ratio_sum"] += route_ratio_sum
+                    self._profile[f"{prefix}cpu_routes_sum"] += miss_routes_sum
+                    self._profile[f"{prefix}cpu_weight_mass_ratio_sum"] += 0.0
+                    self._profile[f"{prefix}realized_cpu_expert_count_sum"] += miss_experts_sum
+                    self._profile[f"{prefix}activated_expert_set_size_sum"] += active_experts_sum
+                    for layer_idx, cpu_experts in layer_cpu_experts.items():
+                        base = f"{prefix}layer_{layer_idx}_"
+                        self._profile[f"{base}realized_cpu_expert_count_sum"] += cpu_experts
+                        self._profile[f"{base}cpu_routes_sum"] += layer_cpu_routes.get(layer_idx, 0.0)
+                        self._profile[f"{base}active_expert_count_sum"] += layer_active_experts.get(layer_idx, 0.0)
+                        self._profile[f"{base}active_routes_sum"] += layer_active_routes.get(layer_idx, 0.0)
+                        self._profile[f"{base}moe_profile_count"] += 1.0
+
     def _process_prefetch_metadata_item(
         self,
         item: dict[str, object],
@@ -693,22 +977,36 @@ class ModelRunner:
         collect_t0 = perf_counter()
         runtime_meta = runtime_meta_recorder.collect(handle, wait=False)
         collect_ms = (perf_counter() - collect_t0) * 1000.0
+        self._record_verify_metadata_profile_from_runtime_meta(
+            runtime_meta,
+            mode=str(item["mode"]),
+        )
 
         observe_stats: dict[str, float] = {}
         submit_after_ms = 0.0
+        observe_call_ms = 0.0
+        record_consumed_ms = 0.0
         observe_t0 = perf_counter()
         with self._prefetch_runtime_lock:
             if not getattr(self, "_skip_metadata_observe", False):
                 mode = str(item["mode"])
                 step_id = int(item["step_id"])
                 if mode == "prefill":
+                    observe_call_t0 = perf_counter()
                     observe_stats = prefetch_runtime.observe_prefill(runtime_meta, step_id=step_id)
+                    observe_call_ms = (perf_counter() - observe_call_t0) * 1000.0
                 elif mode == "draft":
+                    observe_call_t0 = perf_counter()
                     observe_stats = prefetch_runtime.observe_draft(runtime_meta, step_id=step_id)
+                    observe_call_ms = (perf_counter() - observe_call_t0) * 1000.0
                 elif mode in ("verify", "verify_kt_hybrid"):
+                    observe_call_t0 = perf_counter()
                     observe_stats = prefetch_runtime.observe_verify(runtime_meta, step_id=step_id)
+                    observe_call_ms = (perf_counter() - observe_call_t0) * 1000.0
                     if bool(item["record_verify_consumed"]):
+                        consumed_t0 = perf_counter()
                         prefetch_runtime.record_verify_consumed(runtime_meta, step_id=step_id)
+                        record_consumed_ms = (perf_counter() - consumed_t0) * 1000.0
             elif self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
                     self._profile["metadata_observe_skipped_count"] += 1
@@ -764,6 +1062,8 @@ class ModelRunner:
                 self._profile[f"{prefix}_wait_ms"] += transfer_wait_ms
                 self._profile[f"{prefix}_collect_ms"] += collect_ms
                 self._profile[f"{prefix}_observe_ms"] += observe_ms
+                self._profile[f"{prefix}_observe_call_ms"] += observe_call_ms
+                self._profile[f"{prefix}_record_consumed_ms"] += record_consumed_ms
                 self._profile[f"{prefix}_mark_access_ms"] += float(observe_stats.get("mark_access_ms", 0.0))
                 self._profile[f"{prefix}_queue_update_ms"] += float(observe_stats.get("queue_update_ms", 0.0))
                 self._profile[f"{prefix}_queue_aggregate_ms"] += float(observe_stats.get("queue_aggregate_ms", 0.0))
@@ -772,6 +1072,15 @@ class ModelRunner:
                 self._profile[f"{prefix}_segment_index_aggregate_ms"] += float(observe_stats.get("segment_index_aggregate_ms", 0.0))
                 self._profile[f"{prefix}_segment_index_filter_ms"] += float(observe_stats.get("segment_index_filter_ms", 0.0))
                 self._profile[f"{prefix}_segment_index_entry_update_ms"] += float(observe_stats.get("segment_index_entry_update_ms", 0.0))
+                self._profile[f"{prefix}_segment_index_rank_cache_rebuild_ms"] += float(
+                    observe_stats.get("segment_index_rank_cache_rebuild_ms", 0.0)
+                )
+                self._profile[f"{prefix}_segment_index_rank_cache_rebuild_count"] += float(
+                    observe_stats.get("segment_index_rank_cache_rebuild_count", 0.0)
+                )
+                self._profile[f"{prefix}_observe_verify_rank_guard_ms"] += float(observe_stats.get("observe_verify_rank_guard_ms", 0.0))
+                self._profile[f"{prefix}_observe_verify_segment_index_ms"] += float(observe_stats.get("observe_verify_segment_index_ms", 0.0))
+                self._profile[f"{prefix}_observe_verify_runtime_meta_call_ms"] += float(observe_stats.get("observe_verify_runtime_meta_call_ms", 0.0))
                 self._profile[f"{prefix}_async_turnaround_ms"] += turnaround_ms
                 if item["mode"] in {"draft", "verify", "verify_kt_hybrid"}:
                     self._profile[f"run_{item['mode']}_submit_after_ms"] += submit_after_ms
@@ -849,6 +1158,14 @@ class ModelRunner:
             worker.join(timeout=5.0)
         self._prefetch_worker_queue = None
         self._prefetch_worker_thread = None
+        boundary_queue = getattr(self, "_verify_boundary_worker_queue", None)
+        boundary_worker = getattr(self, "_verify_boundary_worker_thread", None)
+        if boundary_queue is not None:
+            boundary_queue.put(None)
+        if boundary_worker is not None:
+            boundary_worker.join(timeout=5.0)
+        self._verify_boundary_worker_queue = None
+        self._verify_boundary_worker_thread = None
 
     def _enqueue_prefetch_metadata(
         self,
@@ -935,8 +1252,10 @@ class ModelRunner:
         dual_queue = self._dual_queue_prefetch_enabled()
         self._poll_dual_queue_segment_timings(block=not dual_queue)
         self._flush_pending_prefetch_metadata(block=not dual_queue)
+        self._wait_for_verify_boundary_prefetch_drain()
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
+            out["verify_op_event_records"] = list(getattr(self, "_verify_op_event_records", []))
         decode_count = int(self._profile.get("decode_count", 0))
         graph_hit_count = int(self._profile.get("graph_hit_count", 0))
         out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
@@ -970,6 +1289,7 @@ class ModelRunner:
             with self._prefetch_profile_lock:
                 self._profile.clear()
                 self._prefetch_trace_events.clear()
+                self._verify_op_event_records.clear()
             pending = getattr(self, "_pending_prefetch_metadata", None)
             if pending is not None:
                 pending.clear()
@@ -1475,9 +1795,9 @@ class ModelRunner:
 
         try:
             prefetch_before_ms = 0.0
+            draft_capacity = len(seqs)
             if prefetch_runtime is not None and runtime_meta_recorder is not None:
                 before_t0 = perf_counter()
-                draft_capacity = len(seqs)
                 if self._can_use_draft_cudagraph(len(seqs)):
                     draft_capacity = next(x for x in self.draft_graph_bs if x >= len(seqs))
 
@@ -1519,7 +1839,35 @@ class ModelRunner:
                 acceptance_extractor.write_state_in(seqs)
 
             core_run_t0 = perf_counter()
-            run_result = self.run(seqs, False, return_logits=return_logits)
+            profile_dir = os.getenv("NANOVLLM_DRAFT_TORCH_PROFILE_DIR", "").strip()
+            capture_draft_profile = (
+                bool(profile_dir)
+                and self.rank == 0
+                and not bool(getattr(self, "_draft_torch_profile_done", False))
+            )
+            if capture_draft_profile:
+                os.makedirs(profile_dir, exist_ok=True)
+                from torch.profiler import ProfilerActivity, profile, record_function
+
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
+                    with record_function("nanovllm::draft.core_run_actual"):
+                        run_result = self.run(seqs, False, return_logits=return_logits)
+                torch.cuda.synchronize()
+                _export_torch_profile_summary(
+                    prof,
+                    profile_dir,
+                    "draft_forward",
+                    self.rank,
+                    {
+                        "draft_tokens": int(len(seqs)),
+                        "draft_capacity": int(draft_capacity),
+                        "used_draft_segment_graph": bool(self._can_use_draft_segment_graph(len(seqs))),
+                        "used_draft_cuda_graph": bool(self._can_use_draft_cudagraph(len(seqs))),
+                    },
+                )
+                self._draft_torch_profile_done = True
+            else:
+                run_result = self.run(seqs, False, return_logits=return_logits)
             if return_logits and self.rank == 0:
                 token_ids, draft_logits = run_result
             else:
@@ -1642,7 +1990,11 @@ class ModelRunner:
         self._verify_layer_timing_events = remaining
 
     def _start_dual_queue_segment_timing(self):
-        if not self._dual_queue_prefetch_enabled():
+        force_timing = os.getenv(
+            "NANOVLLM_SEGMENT_CUDA_EVENT_TIMING",
+            os.getenv("NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING", ""),
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not self._dual_queue_prefetch_enabled() and not force_timing:
             return None
         if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
             event = torch.cuda.Event(enable_timing=True)
@@ -1671,9 +2023,6 @@ class ModelRunner:
         if not pending:
             return
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
-        if prefetch_runtime is None:
-            pending.clear()
-            return
         remaining = []
         for phase, segment_id, start, end in pending:
             if block:
@@ -1681,12 +2030,74 @@ class ModelRunner:
             elif not bool(end.query()):
                 remaining.append((phase, segment_id, start, end))
                 continue
-            prefetch_runtime.record_segment_compute_ms(
-                phase,
-                segment_id,
-                float(start.elapsed_time(end)),
+            elapsed_ms = float(start.elapsed_time(end))
+            record_segment_compute_ms = getattr(
+                prefetch_runtime,
+                "record_segment_compute_ms",
+                None,
             )
+            if record_segment_compute_ms is not None:
+                record_segment_compute_ms(
+                    phase,
+                    segment_id,
+                    elapsed_ms,
+                )
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile[f"{phase}_segment_cuda_event_count"] = (
+                        float(self._profile.get(f"{phase}_segment_cuda_event_count", 0.0)) + 1.0
+                    )
+                    self._profile[f"{phase}_segment_cuda_event_ms"] = (
+                        float(self._profile.get(f"{phase}_segment_cuda_event_ms", 0.0)) + elapsed_ms
+                    )
+                    self._profile[f"{phase}_segment_{int(segment_id)}_cuda_event_ms"] = (
+                        float(self._profile.get(f"{phase}_segment_{int(segment_id)}_cuda_event_ms", 0.0)) + elapsed_ms
+                    )
         self._dual_queue_segment_timing_events = remaining
+
+    def _collect_verify_op_event_timings(
+        self,
+        *,
+        bucket: int,
+        segment_id: int,
+        step_id: int,
+        token_count: int,
+    ) -> None:
+        from nanovllm.utils.verify_op_events import collect_verify_op_events, verify_op_event_enabled
+
+        if not verify_op_event_enabled() or self.rank != 0:
+            return
+        rows = collect_verify_op_events(int(bucket), int(segment_id))
+        if not rows:
+            return
+        with self._prefetch_profile_lock:
+            for row in rows:
+                label = str(row["label"])
+                layer_idx = int(row["layer_idx"])
+                elapsed_ms = float(row["elapsed_ms"])
+                safe_label = "".join(ch if ch.isalnum() else "_" for ch in label)
+                error = row.get("error")
+                if error:
+                    self._profile["verify_op_event_error_count"] += 1.0
+                self._profile["verify_op_event_count"] += 1.0
+                self._profile["verify_op_event_ms"] += elapsed_ms
+                self._profile[f"verify_op_{safe_label}_count"] += 1.0
+                self._profile[f"verify_op_{safe_label}_ms"] += elapsed_ms
+                if layer_idx >= 0:
+                    self._profile[f"verify_op_layer_{layer_idx}_{safe_label}_count"] += 1.0
+                    self._profile[f"verify_op_layer_{layer_idx}_{safe_label}_ms"] += elapsed_ms
+                self._verify_op_event_records.append(
+                    {
+                        "step_id": int(step_id),
+                        "bucket": int(bucket),
+                        "segment": int(segment_id),
+                        "token_count": int(token_count),
+                        "layer_idx": int(layer_idx),
+                        "label": label,
+                        "elapsed_ms": elapsed_ms,
+                        "error": str(error or ""),
+                    }
+                )
 
     def begin_dual_queue_calibration(self) -> None:
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
@@ -1823,6 +2234,51 @@ class ModelRunner:
         # Verify needs logits for every queried token position.
         try:
             t0 = perf_counter()
+
+            def _execute_verify_forward():
+                nonlocal used_verify_segment_graph
+                breakdown_sync = bool(os.getenv("NANOVLLM_VERIFY_BREAKDOWN_SYNC", "").strip())
+                if self._can_use_verify_cudagraph(int(input_ids.numel())):
+                    if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
+                        if self._verify_segment_graph_enabled():
+                            used_verify_segment_graph = True
+                            hidden = self._run_verify_with_kt_hybrid_segment_graph(
+                                input_ids,
+                                positions,
+                                step_id=step_id,
+                            )
+                        else:
+                            hidden = self._run_verify_with_kt_hybrid_graph(
+                                input_ids,
+                                positions,
+                                step_id=step_id,
+                            )
+                    else:
+                        hidden = self._run_verify_with_prefix_graph(input_ids, positions)
+                    lm_head_t0 = perf_counter()
+                    logits_out = F.linear(hidden, self.model.lm_head.weight)
+                    self._record_profile("verify_lm_head_enqueue_ms", perf_counter() - lm_head_t0)
+                    if self.profile_enabled and self.rank == 0:
+                        with self._prefetch_profile_lock:
+                            self._profile["verify_lm_head_count"] += 1.0
+                    if breakdown_sync:
+                        lm_head_sync_t0 = perf_counter()
+                        torch.cuda.synchronize()
+                        self._record_profile("verify_lm_head_sync_ms", perf_counter() - lm_head_sync_t0)
+                    return hidden, logits_out
+                hidden = self.model(input_ids, positions)
+                lm_head_t0 = perf_counter()
+                logits_out = F.linear(hidden, self.model.lm_head.weight)
+                self._record_profile("verify_lm_head_enqueue_ms", perf_counter() - lm_head_t0)
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["verify_lm_head_count"] += 1.0
+                if breakdown_sync:
+                    lm_head_sync_t0 = perf_counter()
+                    torch.cuda.synchronize()
+                    self._record_profile("verify_lm_head_sync_ms", perf_counter() - lm_head_sync_t0)
+                return hidden, logits_out
+
             profile_dir = os.getenv("NANOVLLM_VERIFY_TORCH_PROFILE_DIR", "").strip()
             capture_verify_profile = (
                 bool(profile_dir)
@@ -1831,64 +2287,29 @@ class ModelRunner:
             )
             if capture_verify_profile:
                 os.makedirs(profile_dir, exist_ok=True)
-                from torch.profiler import ProfilerActivity, profile
+                from torch.profiler import ProfilerActivity, profile, record_function
 
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:
-                    hidden_states = self.model(input_ids, positions)
-                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                    with record_function("nanovllm::verify.forward_actual"):
+                        hidden_states, logits = _execute_verify_forward()
                 torch.cuda.synchronize()
-                trace_path = os.path.join(profile_dir, f"verify_forward_rank{self.rank}.json")
-                summary_path = os.path.join(profile_dir, f"verify_forward_rank{self.rank}_summary.json")
-                prof.export_chrome_trace(trace_path)
-                events = []
-                for evt in prof.key_averages():
-                    events.append(
-                        {
-                            "key": evt.key,
-                            "count": int(evt.count),
-                            "self_cpu_time_total_us": float(evt.self_cpu_time_total),
-                            "cpu_time_total_us": float(evt.cpu_time_total),
-                            "self_cuda_time_total_us": float(getattr(evt, "self_cuda_time_total", 0.0)),
-                            "cuda_time_total_us": float(getattr(evt, "cuda_time_total", 0.0)),
-                        }
-                    )
-                events_by_cuda = sorted(events, key=lambda x: x["self_cuda_time_total_us"], reverse=True)
-                events_by_cpu = sorted(events, key=lambda x: x["self_cpu_time_total_us"], reverse=True)
-                with open(summary_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "trace_path": trace_path,
-                            "verify_tokens": int(input_ids.numel()),
-                            "top_self_cuda_events": events_by_cuda[:40],
-                            "top_self_cpu_events": events_by_cpu[:40],
-                        },
-                        f,
-                        ensure_ascii=True,
-                        indent=2,
-                    )
+                _export_torch_profile_summary(
+                    prof,
+                    profile_dir,
+                    "verify_forward",
+                    self.rank,
+                    {
+                        "verify_tokens": int(input_ids.numel()),
+                        "used_verify_segment_graph": bool(used_verify_segment_graph),
+                        "used_verify_cuda_graph": bool(self._can_use_verify_cudagraph(int(input_ids.numel()))),
+                        "verify_cuda_graph_kt_hybrid": bool(
+                            getattr(self.config, "verify_cuda_graph_kt_hybrid", False)
+                        ),
+                    },
+                )
                 self._verify_torch_profile_done = True
             else:
-                if self._can_use_verify_cudagraph(int(input_ids.numel())):
-                    if getattr(self.config, "verify_cuda_graph_kt_hybrid", False):
-                        if self._verify_segment_graph_enabled():
-                            used_verify_segment_graph = True
-                            hidden_states = self._run_verify_with_kt_hybrid_segment_graph(
-                                input_ids,
-                                positions,
-                                step_id=step_id,
-                            )
-                        else:
-                            hidden_states = self._run_verify_with_kt_hybrid_graph(
-                                input_ids,
-                                positions,
-                                step_id=step_id,
-                            )
-                    else:
-                        hidden_states = self._run_verify_with_prefix_graph(input_ids, positions)
-                    logits = F.linear(hidden_states, self.model.lm_head.weight)
-                else:
-                    hidden_states = self.model(input_ids, positions)
-                    logits = F.linear(hidden_states, self.model.lm_head.weight)
+                hidden_states, logits = _execute_verify_forward()
             if hasattr(self.model, "get_and_reset_heterogeneous_profile") and self.rank == 0:
                 prof = self.model.get_and_reset_heterogeneous_profile()
                 for key, value in prof.items():
@@ -2375,6 +2796,7 @@ class ModelRunner:
             self._capture_verify_cudagraph_kt_hybrid_segments()
             return
         from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCPUBuffer
+        from nanovllm.utils.verify_op_events import verify_op_capture_context
 
         config = self.config
         hf_config = config.hf_config
@@ -2407,6 +2829,10 @@ class ModelRunner:
         verify_graph_pool = getattr(self, "draft_graph_pool", None)
 
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        record_verify_metadata = (
+            runtime_meta_recorder is not None
+            and not self._skip_verify_metadata_offload()
+        )
 
         self._set_speculative_execution_mode("verify")
         try:
@@ -2425,7 +2851,7 @@ class ModelRunner:
                     block_tables=block_tables[:1],
                 )
 
-                if runtime_meta_recorder is not None:
+                if record_verify_metadata:
                     runtime_meta_recorder.arm(
                         mode="verify_kt_hybrid",
                         step_id=0,
@@ -2439,7 +2865,7 @@ class ModelRunner:
                 )
                 torch.cuda.synchronize()
 
-                if runtime_meta_recorder is not None:
+                if record_verify_metadata:
                     runtime_meta_recorder.arm(
                         mode="verify_kt_hybrid",
                         step_id=0,
@@ -2448,11 +2874,12 @@ class ModelRunner:
                     )
 
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=verify_graph_pool):
-                    hidden_states[:bs] = self.model.model.embed_tokens(input_ids[:bs])
-                    hidden_states[:bs] = self.model.model.forward_verify_kt_hybrid_layers(
-                        hidden_states[:bs], positions[:bs], apply_norm=True,
-                    )
+                with verify_op_capture_context(bs, -1):
+                    with torch.cuda.graph(graph, pool=verify_graph_pool):
+                        hidden_states[:bs] = self.model.model.embed_tokens(input_ids[:bs])
+                        hidden_states[:bs] = self.model.model.forward_verify_kt_hybrid_layers(
+                            hidden_states[:bs], positions[:bs], apply_norm=True,
+                        )
                 if verify_graph_pool is None:
                     verify_graph_pool = graph.pool()
                 self.verify_kt_hybrid_graphs[bs] = graph
@@ -2460,7 +2887,7 @@ class ModelRunner:
                 torch.cuda.synchronize()
                 reset_context()
 
-            if runtime_meta_recorder is not None:
+            if record_verify_metadata:
                 runtime_meta_recorder.reset()
         finally:
             self._set_speculative_execution_mode("normal")
@@ -2479,6 +2906,7 @@ class ModelRunner:
     def _capture_verify_cudagraph_kt_hybrid_segments(self):
         """Capture per-segment CUDA graphs for verify with hybrid GPU + kt_direct."""
         from nanovllm.layers.fuse_moe.kt_direct_backend import KtDirectCPUBuffer
+        from nanovllm.utils.verify_op_events import verify_op_capture_context
 
         boundaries = self._verify_segment_boundaries()
         config = self.config
@@ -2517,6 +2945,10 @@ class ModelRunner:
         verify_graph_pool = getattr(self, "draft_graph_pool", None)
 
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        record_verify_metadata = (
+            runtime_meta_recorder is not None
+            and not self._skip_verify_metadata_offload()
+        )
 
         self._set_speculative_execution_mode("verify")
         try:
@@ -2536,7 +2968,7 @@ class ModelRunner:
                     block_tables=block_tables[:1],
                 )
 
-                if runtime_meta_recorder is not None:
+                if record_verify_metadata:
                     runtime_meta_recorder.arm(
                         mode="verify_kt_hybrid",
                         step_id=0,
@@ -2560,7 +2992,7 @@ class ModelRunner:
                         )
                 torch.cuda.synchronize()
 
-                if runtime_meta_recorder is not None:
+                if record_verify_metadata:
                     runtime_meta_recorder.arm(
                         mode="verify_kt_hybrid",
                         step_id=0,
@@ -2571,19 +3003,20 @@ class ModelRunner:
                 for seg_idx, (layer_start, layer_end) in enumerate(boundaries):
                     graph = torch.cuda.CUDAGraph()
                     apply_norm = int(layer_end) >= num_hidden_layers
-                    with torch.cuda.graph(graph, pool=verify_graph_pool):
-                        if seg_idx == 0:
-                            segment_outputs[0][:bs] = self.model.forward_verify_kt_hybrid_segment(
-                                input_ids[:bs], None, positions[:bs],
-                                start_layer=int(layer_start), end_layer=int(layer_end),
-                                apply_norm=apply_norm,
-                            )
-                        else:
-                            segment_outputs[seg_idx][:bs] = self.model.forward_verify_kt_hybrid_segment(
-                                None, segment_outputs[seg_idx - 1][:bs], positions[:bs],
-                                start_layer=int(layer_start), end_layer=int(layer_end),
-                                apply_norm=apply_norm,
-                            )
+                    with verify_op_capture_context(bs, seg_idx):
+                        with torch.cuda.graph(graph, pool=verify_graph_pool):
+                            if seg_idx == 0:
+                                segment_outputs[0][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                                    input_ids[:bs], None, positions[:bs],
+                                    start_layer=int(layer_start), end_layer=int(layer_end),
+                                    apply_norm=apply_norm,
+                                )
+                            else:
+                                segment_outputs[seg_idx][:bs] = self.model.forward_verify_kt_hybrid_segment(
+                                    None, segment_outputs[seg_idx - 1][:bs], positions[:bs],
+                                    start_layer=int(layer_start), end_layer=int(layer_end),
+                                    apply_norm=apply_norm,
+                                )
                     if verify_graph_pool is None:
                         verify_graph_pool = graph.pool()
                     graphs.append(graph)
@@ -2591,7 +3024,7 @@ class ModelRunner:
                 self.verify_kt_hybrid_segment_graphs[bs] = graphs
                 self.verify_kt_hybrid_segment_boundaries[bs] = list(boundaries)
                 torch.cuda.synchronize()
-                if runtime_meta_recorder is not None:
+                if record_verify_metadata:
                     runtime_meta_recorder.reset()
                 reset_context()
         finally:
@@ -2896,8 +3329,12 @@ class ModelRunner:
         )
 
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
+        record_verify_metadata = (
+            runtime_meta_recorder is not None
+            and not self._skip_verify_metadata_offload()
+        )
         max_bucket = max(self.verify_graph_bs)
-        if runtime_meta_recorder is not None:
+        if record_verify_metadata:
             runtime_meta_recorder.arm(
                 mode="verify_kt_hybrid",
                 step_id=int(step_id),
@@ -2907,8 +3344,47 @@ class ModelRunner:
 
         graph = self.verify_kt_hybrid_graphs[bucket]
         graph.replay()
+        if os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }:
+            sync_t0 = perf_counter()
+            torch.cuda.synchronize()
+            sync_ms = (perf_counter() - sync_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_op_event_sync_count"] += 1.0
+                    self._profile["verify_op_event_sync_ms"] += sync_ms
+            self._collect_verify_op_event_timings(
+                bucket=int(bucket),
+                segment_id=-1,
+                step_id=int(step_id),
+                token_count=int(num_tokens),
+            )
 
-        if runtime_meta_recorder is not None:
+        skip_sync_profile_readback = bool(
+            os.getenv("NANOVLLM_VERIFY_SKIP_SYNC_METADATA_READBACK", "").strip()
+        )
+        sync_profile_readback = os.getenv(
+            "NANOVLLM_VERIFY_SYNC_METADATA_PROFILE_READBACK",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not record_verify_metadata:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_runtime_metadata_disabled_count"] += 1
+        elif skip_sync_profile_readback:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_metadata_profile_readback_skipped_count"] = (
+                        float(self._profile.get("verify_metadata_profile_readback_skipped_count", 0.0)) + 1.0
+                    )
+        elif not sync_profile_readback:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_metadata_profile_readback_async_default_count"] = (
+                        float(self._profile.get("verify_metadata_profile_readback_async_default_count", 0.0)) + 1.0
+                    )
+        elif runtime_meta_recorder is not None:
             key = runtime_meta_recorder.active_key
             if key is not None:
                 dev = runtime_meta_recorder.device_buffers.get(key)
@@ -2935,6 +3411,11 @@ class ModelRunner:
                             "cpu_routes_sum": float(miss_routes),
                             "cpu_weight_mass_ratio_sum": 0.0,
                             "realized_cpu_expert_count_sum": float(miss_experts),
+                            f"layer_{lidx}_realized_cpu_expert_count_sum": float(miss_experts),
+                            f"layer_{lidx}_cpu_routes_sum": float(miss_routes),
+                            f"layer_{lidx}_active_expert_count_sum": float(is_real_active.sum().item()),
+                            f"layer_{lidx}_active_routes_sum": float(total_routes),
+                            f"layer_{lidx}_moe_profile_count": 1.0,
                         }
 
         if self.profile_enabled and self.rank == 0:
@@ -3008,7 +3489,9 @@ class ModelRunner:
         boundaries = self.verify_kt_hybrid_segment_boundaries[bucket]
         gv = self.verify_graph_vars
         context = get_context()
+        breakdown_sync = bool(os.getenv("NANOVLLM_VERIFY_BREAKDOWN_SYNC", "").strip())
 
+        setup_t0 = perf_counter()
         gv["input_ids"][:num_tokens].copy_(input_ids)
         gv["positions"][:num_tokens].copy_(positions)
         if context.cu_seqlens_q is not None:
@@ -3034,12 +3517,37 @@ class ModelRunner:
             slot_mapping=gv["slot_mapping"][:bucket],
             block_tables=gv["block_tables"][:n_seqs_actual],
         )
+        self._record_profile("verify_segment_graph_setup_enqueue_ms", perf_counter() - setup_t0)
+        if breakdown_sync:
+            setup_sync_t0 = perf_counter()
+            torch.cuda.synchronize()
+            self._record_profile("verify_segment_graph_setup_sync_ms", perf_counter() - setup_sync_t0)
 
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         max_bucket = max(self.verify_graph_bs)
         step_id = int(step_id)
-        if runtime_meta_recorder is not None:
+        deep_profile = bool(os.getenv("NANOVLLM_VERIFY_DEEP_PROFILE", "").strip())
+        deep_profile_sync = bool(os.getenv("NANOVLLM_VERIFY_DEEP_PROFILE_SYNC", "").strip())
+        op_event_profile = os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        defer_segment_metadata = os.getenv(
+            "NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "n", "off"}
+        skip_sync_profile_readback = bool(
+            os.getenv("NANOVLLM_VERIFY_SKIP_SYNC_METADATA_READBACK", "").strip()
+        )
+        sync_profile_readback = os.getenv(
+            "NANOVLLM_VERIFY_SYNC_METADATA_PROFILE_READBACK",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        record_verify_metadata = (
+            runtime_meta_recorder is not None
+            and not self._skip_verify_metadata_offload()
+        )
+        if record_verify_metadata:
             runtime_meta_recorder.arm(
                 mode="verify_kt_hybrid",
                 step_id=step_id,
@@ -3048,9 +3556,16 @@ class ModelRunner:
             )
 
         num_segments = len(graphs)
+        async_boundary_prefetch = (
+            prefetch_runtime is not None
+            and not self._dual_queue_prefetch_enabled()
+            and self._verify_boundary_prefetch_async_enabled()
+            and getattr(self, "_verify_boundary_worker_queue", None) is not None
+        )
         for seg_idx, (graph, (layer_start, layer_end)) in enumerate(
             zip(graphs, boundaries, strict=True)
         ):
+            prefetch_hook_t0 = perf_counter()
             if prefetch_runtime is not None:
                 with self._prefetch_runtime_lock:
                     if self._dual_queue_prefetch_enabled():
@@ -3073,20 +3588,83 @@ class ModelRunner:
                             for layer_idx in range(int(layer_start), int(layer_end)):
                                 on_verify_layer_start(layer_idx)
                         prefetch_runtime.publish_direct_active_ready(step_id=step_id)
+                        if async_boundary_prefetch:
+                            next_seg = (seg_idx + 1) % num_segments
+                            next_start, next_end = boundaries[next_seg]
+                            self._enqueue_verify_boundary_prefetch(
+                                step_id=step_id,
+                                target_layer_start=int(next_start),
+                                target_layer_end=int(next_end),
+                                target_segment_id=int(next_seg),
+                            )
+            prefetch_hook_ms = (perf_counter() - prefetch_hook_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_segment_prefetch_hook_ms"] += prefetch_hook_ms
+                    self._profile[f"verify_segment_{seg_idx}_prefetch_hook_ms"] += prefetch_hook_ms
 
             timing_start = self._start_dual_queue_segment_timing()
-            graph.replay()
+            replay_enqueue_t0 = perf_counter()
+            if deep_profile:
+                from torch.profiler import record_function
+                with record_function(f"nanovllm::verify.segment_{seg_idx}.graph_replay_enqueue"):
+                    graph.replay()
+            else:
+                graph.replay()
+            replay_enqueue_ms = (perf_counter() - replay_enqueue_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_segment_graph_replay_enqueue_count"] = (
+                        float(self._profile.get("verify_segment_graph_replay_enqueue_count", 0.0)) + 1.0
+                    )
+                    self._profile["verify_segment_graph_replay_enqueue_ms"] = (
+                        float(self._profile.get("verify_segment_graph_replay_enqueue_ms", 0.0)) + replay_enqueue_ms
+                    )
+                    self._profile[f"verify_segment_{seg_idx}_graph_replay_enqueue_ms"] += replay_enqueue_ms
+            if op_event_profile:
+                sync_t0 = perf_counter()
+                torch.cuda.synchronize()
+                sync_ms = (perf_counter() - sync_t0) * 1000.0
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["verify_op_event_sync_count"] += 1.0
+                        self._profile["verify_op_event_sync_ms"] += sync_ms
+                self._collect_verify_op_event_timings(
+                    bucket=int(bucket),
+                    segment_id=int(seg_idx),
+                    step_id=int(step_id),
+                    token_count=int(num_tokens),
+                )
+            elif deep_profile_sync or breakdown_sync:
+                sync_t0 = perf_counter()
+                torch.cuda.synchronize()
+                sync_ms = (perf_counter() - sync_t0) * 1000.0
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["verify_segment_graph_replay_sync_count"] = (
+                            float(self._profile.get("verify_segment_graph_replay_sync_count", 0.0)) + 1.0
+                        )
+                        self._profile["verify_segment_graph_replay_sync_ms"] = (
+                            float(self._profile.get("verify_segment_graph_replay_sync_ms", 0.0)) + sync_ms
+                        )
+                        self._profile[f"verify_segment_{seg_idx}_graph_replay_sync_ms"] += sync_ms
             self._end_dual_queue_segment_timing("verify", seg_idx, timing_start)
 
             is_last = seg_idx == num_segments - 1
-            self._enqueue_verify_segment_metadata(
-                step_id=step_id,
-                token_capacity=max_bucket,
-                layer_start_idx=int(layer_start),
-                layer_end_idx=int(layer_end),
-                is_last_segment=True,
-            )
-            if prefetch_runtime is not None and not self._dual_queue_prefetch_enabled():
+            if record_verify_metadata and not defer_segment_metadata:
+                self._enqueue_verify_segment_metadata(
+                    step_id=step_id,
+                    token_capacity=max_bucket,
+                    layer_start_idx=int(layer_start),
+                    layer_end_idx=int(layer_end),
+                    is_last_segment=True,
+                )
+            boundary_submit_t0 = perf_counter()
+            if (
+                prefetch_runtime is not None
+                and not self._dual_queue_prefetch_enabled()
+                and not async_boundary_prefetch
+            ):
                 next_seg = (seg_idx + 1) % num_segments
                 next_start = boundaries[next_seg][0]
                 next_end = boundaries[next_seg][1]
@@ -3098,20 +3676,78 @@ class ModelRunner:
                         visible_budget_ms=float(getattr(
                             self.config, "verify_prefetch_visible_budget_ms", 12.0)),
                     )
+            boundary_submit_ms = (perf_counter() - boundary_submit_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_segment_boundary_submit_ms"] += boundary_submit_ms
+                    self._profile[f"verify_segment_{seg_idx}_boundary_submit_ms"] += boundary_submit_ms
             self._poll_dual_queue_segment_timings(block=False)
+
+        if async_boundary_prefetch:
+            self._wait_for_verify_boundary_prefetch_drain()
+
+        if record_verify_metadata and defer_segment_metadata:
+            metadata_t0 = perf_counter()
+            self._enqueue_verify_segment_metadata(
+                step_id=step_id,
+                token_capacity=max_bucket,
+                layer_start_idx=0,
+                layer_end_idx=int(boundaries[-1][1]) if boundaries else 0,
+                is_last_segment=True,
+            )
+            self._record_profile("verify_deferred_segment_metadata_enqueue_total_ms", perf_counter() - metadata_t0)
 
         if self._dual_queue_prefetch_enabled() and prefetch_runtime is not None:
             with self._prefetch_runtime_lock:
                 prefetch_runtime.complete_verify_round(step_id=step_id)
 
-        if runtime_meta_recorder is not None:
+        if not record_verify_metadata:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_runtime_metadata_disabled_count"] += 1
+        elif skip_sync_profile_readback:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_metadata_profile_readback_skipped_count"] = (
+                        float(self._profile.get("verify_metadata_profile_readback_skipped_count", 0.0)) + 1.0
+                    )
+        elif not sync_profile_readback:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_metadata_profile_readback_async_default_count"] = (
+                        float(self._profile.get("verify_metadata_profile_readback_async_default_count", 0.0)) + 1.0
+                    )
+        elif runtime_meta_recorder is not None:
             key = runtime_meta_recorder.active_key
             if key is not None:
                 dev = runtime_meta_recorder.device_buffers.get(key)
                 if dev is not None and "expert_status" in dev:
                     from nanovllm.models.qwen3_moe import Qwen3MoeHeterogeneousSparseMoeBlock
-                    status_cpu = dev["expert_status"].cpu()
-                    act_count_cpu = dev["activation_count"].cpu()
+                    if deep_profile:
+                        from torch.profiler import record_function
+                    status_t0 = perf_counter()
+                    if deep_profile:
+                        with record_function("nanovllm::verify.metadata_status_cpu"):
+                            status_cpu = dev["expert_status"].cpu()
+                    else:
+                        status_cpu = dev["expert_status"].cpu()
+                    self._record_profile("verify_metadata_status_cpu_ms", perf_counter() - status_t0)
+
+                    act_t0 = perf_counter()
+                    if deep_profile:
+                        with record_function("nanovllm::verify.metadata_activation_cpu"):
+                            act_count_cpu = dev["activation_count"].cpu()
+                    else:
+                        act_count_cpu = dev["activation_count"].cpu()
+                    self._record_profile("verify_metadata_activation_cpu_ms", perf_counter() - act_t0)
+
+                    loop_t0 = perf_counter()
+                    if deep_profile:
+                        profile_loop_ctx = record_function("nanovllm::verify.metadata_profile_loop")
+                    else:
+                        profile_loop_ctx = None
+                    if profile_loop_ctx is not None:
+                        profile_loop_ctx.__enter__()
                     for decoder_layer in self.model.model.layers:
                         mlp = decoder_layer.mlp
                         if not isinstance(mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
@@ -3131,7 +3767,20 @@ class ModelRunner:
                             "cpu_routes_sum": float(miss_routes),
                             "cpu_weight_mass_ratio_sum": 0.0,
                             "realized_cpu_expert_count_sum": float(miss_experts),
+                            f"layer_{lidx}_realized_cpu_expert_count_sum": float(miss_experts),
+                            f"layer_{lidx}_cpu_routes_sum": float(miss_routes),
+                            f"layer_{lidx}_active_expert_count_sum": float(is_real_active.sum().item()),
+                            f"layer_{lidx}_active_routes_sum": float(total_routes),
+                            f"layer_{lidx}_moe_profile_count": 1.0,
                         }
+                    if profile_loop_ctx is not None:
+                        profile_loop_ctx.__exit__(None, None, None)
+                    self._record_profile("verify_metadata_profile_loop_ms", perf_counter() - loop_t0)
+                    if self.profile_enabled and self.rank == 0:
+                        with self._prefetch_profile_lock:
+                            self._profile["verify_metadata_profile_readback_count"] = (
+                                float(self._profile.get("verify_metadata_profile_readback_count", 0.0)) + 1.0
+                            )
 
         if self.profile_enabled and self.rank == 0:
             self._profile["verify_kt_hybrid_segment_graph_replay_count"] = (

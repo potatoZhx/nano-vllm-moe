@@ -20,9 +20,12 @@ initial prefill step.
 
 Example:
 
+    NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+    NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+    NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
     CUDA_VISIBLE_DEVICES=2 python scripts/bench_eval_workload_tpot.py \
-        --dataset sharegpt \
-        --num-samples 16 \
+        --dataset mt_bench \
+        --num-samples 0 \
         --output-dir results/eval_workload_tpot \
         --gpu-memory-utilization 0.99 \
         --cache-ratios 0.3125 \
@@ -33,7 +36,11 @@ Example:
         --slot-buckets 4 \
         --slot-max-bucket-ratio 2.0 \
         --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
-        --kt-num-threads 16
+        --kt-num-threads 16 \
+        --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+        --verify-prefetch-max-per-boundary 10 \
+        --draft-stop-policy none \
+        --verify-prefetch-rank-multiplier 1
 
 
         CUDA_VISIBLE_DEVICES=3 python scripts/bench_eval_workload_tpot.py \
@@ -49,6 +56,29 @@ Example:
     --slot-max-bucket-ratio 2.0 \
     --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
     --kt-num-threads 16
+
+Explicit optimized K=12 per-layer-slots prompt benchmark:
+
+    NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+    NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+    NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+    CUDA_VISIBLE_DEVICES=2 python scripts/bench_eval_workload_tpot.py \
+        --request-mode per_layer_slots \
+        --output-dir results/eval_workload_tpot_k12_optimized \
+        --gpu-memory-utilization 0.99 \
+        --cache-ratios 0.3125 \
+        --output-lens 512 \
+        --max-draft-tokens-values 12 \
+        --segment-sizes 12 \
+        --allocation-modes profile_weighted \
+        --slot-buckets 4 \
+        --slot-max-bucket-ratio 2.0 \
+        --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+        --kt-num-threads 16 \
+        --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+        --verify-prefetch-max-per-boundary 10 \
+        --draft-stop-policy none \
+        --verify-prefetch-rank-multiplier 1
 """
 from __future__ import annotations
 
@@ -95,6 +125,28 @@ DATASET_CHOICES = (
     "per_layer_slots",
 )
 REQUEST_MODE_CHOICES = ("dataset", "per_layer_slots")
+OPTIMIZED_CONFIG_CHOICES = ("none", "k4_verify", "k12_decode")
+
+OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
+    "k4_verify": {
+        "allocation_modes": "profile_weighted",
+        "max_draft_tokens_values": "4",
+        "verify_prefetch_max_per_boundary": 4,
+        "draft_stop_policy": "tpot",
+        "kt_num_threads": 16,
+        "verify_cuda_graph_bucket_steps": "3,5,7,10,13",
+        "verify_prefetch_rank_multiplier": 1,
+    },
+    "k12_decode": {
+        "allocation_modes": "profile_weighted",
+        "max_draft_tokens_values": "12",
+        "verify_prefetch_max_per_boundary": 10,
+        "draft_stop_policy": "none",
+        "kt_num_threads": 16,
+        "verify_cuda_graph_bucket_steps": "3,5,7,10,13",
+        "verify_prefetch_rank_multiplier": 1,
+    },
+}
 
 
 @dataclass
@@ -154,6 +206,75 @@ def _parse_allocation_modes(values: str) -> list[str]:
             "--allocation-modes must include uniform and/or profile_weighted"
         )
     return modes
+
+
+def _arg_was_provided(argv: list[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in argv)
+
+
+def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[str, Any]:
+    preset_name = str(getattr(args, "optimized_config", "none") or "none")
+    if preset_name == "none":
+        return {"name": "none", "applied": {}, "manual_overrides": {}}
+    preset = OPTIMIZED_CONFIG_PRESETS[preset_name]
+    option_by_dest = {
+        "allocation_modes": "--allocation-modes",
+        "max_draft_tokens_values": "--max-draft-tokens-values",
+        "verify_prefetch_max_per_boundary": "--verify-prefetch-max-per-boundary",
+        "draft_stop_policy": "--draft-stop-policy",
+        "kt_num_threads": "--kt-num-threads",
+        "verify_cuda_graph_bucket_steps": "--verify-cuda-graph-bucket-steps",
+        "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
+    }
+    applied: dict[str, Any] = {}
+    manual_overrides: dict[str, Any] = {}
+    for dest, value in preset.items():
+        option = option_by_dest[dest]
+        if _arg_was_provided(argv, option):
+            manual_overrides[dest] = getattr(args, dest)
+            continue
+        setattr(args, dest, value)
+        applied[dest] = value
+    return {
+        "name": preset_name,
+        "applied": applied,
+        "manual_overrides": manual_overrides,
+    }
+
+
+def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
+    optimized_config = str(getattr(args, "optimized_config", "none") or "none")
+    rank_multiplier = getattr(args, "verify_prefetch_rank_multiplier", None)
+    should_configure = optimized_config != "none" or rank_multiplier is not None
+    if not should_configure:
+        return {}
+
+    env_overrides: dict[str, str] = {
+        "NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER": str(
+            1 if rank_multiplier is None else int(rank_multiplier)
+        ),
+        "NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA": "1",
+        "NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC": "0",
+    }
+    if bool(getattr(args, "optimized_segment_event_timing", False)):
+        env_overrides["NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING"] = "1"
+    else:
+        os.environ.pop("NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING", None)
+
+    for key, value in env_overrides.items():
+        os.environ[key] = value
+
+    if not bool(getattr(args, "preserve_optimized_env", False)):
+        for key in (
+            "NANOVLLM_VERIFY_DISABLE_RUNTIME_METADATA",
+            "NANOVLLM_VERIFY_SKIP_METADATA_OFFLOAD",
+            "NANOVLLM_VERIFY_SYNC_METADATA_PROFILE_READBACK",
+            "NANOVLLM_VERIFY_OP_EVENT_TIMING",
+            "NANOVLLM_VERIFY_DEEP_PROFILE_SYNC",
+            "NANOVLLM_VERIFY_BREAKDOWN_SYNC",
+        ):
+            os.environ.pop(key, None)
+    return env_overrides
 
 
 def _dataset_names(dataset_arg: str, request_mode: str = "dataset") -> list[str]:
@@ -416,6 +537,7 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                                 cases.append(
                                     {
                                         "dataset": dataset,
+                                        "optimized_config": str(args.optimized_config),
                                         "max_output_tokens": int(max_output_tokens),
                                         "ignore_eos": bool(
                                             using_output_lens and int(max_output_tokens) > 0
@@ -424,6 +546,15 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                                         "max_draft_tokens": int(max_draft_tokens),
                                         "segment_size": int(segment_size),
                                         "allocation_mode": allocation_mode,
+                                        "draft_stop_policy": str(args.draft_stop_policy),
+                                        "verify_prefetch_max_per_boundary": int(
+                                            args.verify_prefetch_max_per_boundary
+                                        ),
+                                        "verify_prefetch_rank_multiplier": (
+                                            int(args.verify_prefetch_rank_multiplier)
+                                            if args.verify_prefetch_rank_multiplier is not None
+                                            else None
+                                        ),
                                         "repeat": int(repeat),
                                     }
                                 )
@@ -434,13 +565,32 @@ def case_name(case: dict[str, Any]) -> str:
     ratio_pct = int(round(float(case["cache_ratio"]) * 10000))
     dataset = _safe_name(str(case["dataset"]))
     alloc = _safe_name(str(case["allocation_mode"]))
+    opt_config = _safe_name(str(case.get("optimized_config", "none")))
+    opt_label = "" if opt_config == "none" else f"_{opt_config}"
+    draft_stop_policy = str(case.get("draft_stop_policy", ""))
+    verify_prefetch_budget = int(case.get("verify_prefetch_max_per_boundary", 0) or 0)
+    rank_multiplier = case.get("verify_prefetch_rank_multiplier")
+    stop_label = ""
+    include_tuning_label = (
+        opt_config != "none"
+        or (draft_stop_policy and draft_stop_policy != "tpot")
+        or verify_prefetch_budget not in {0, 4}
+        or rank_multiplier is not None
+    )
+    if include_tuning_label:
+        stop_label = (
+            f"_stop{_safe_name(draft_stop_policy)}"
+            f"_vpb{verify_prefetch_budget}"
+        )
+        if rank_multiplier is not None:
+            stop_label += f"_rank{int(rank_multiplier)}"
     max_out = int(case["max_output_tokens"])
     out_label = "eos" if max_out <= 0 else str(max_out)
     ignore_eos_label = "ieos1" if bool(case.get("ignore_eos", False)) else "ieos0"
     return (
-        f"{dataset}_{alloc}_seg{int(case['segment_size'])}_"
+        f"{dataset}_{alloc}{opt_label}_seg{int(case['segment_size'])}_"
         f"ratio{ratio_pct:04d}_maxout{out_label}_{ignore_eos_label}_"
-        f"k{int(case['max_draft_tokens'])}_r{int(case['repeat'])}"
+        f"k{int(case['max_draft_tokens'])}{stop_label}_r{int(case['repeat'])}"
     )
 
 
@@ -483,12 +633,15 @@ def grouped_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         key = (
             row["dataset"],
+            row.get("optimized_config", "none"),
             row["allocation_mode"],
             int(row["segment_size"]),
             round(float(row["cache_ratio"]), 6),
             int(row["max_output_tokens"]),
             bool(row.get("ignore_eos", False)),
             int(row["max_draft_tokens"]),
+            row.get("draft_stop_policy", ""),
+            int(row.get("verify_prefetch_max_per_boundary", 0) or 0),
             int(row["repeat"]),
         )
         groups.setdefault(key, []).append(row)
@@ -497,24 +650,32 @@ def grouped_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for key, group_rows in sorted(groups.items()):
         (
             dataset,
+            optimized_config,
             allocation_mode,
             segment_size,
             cache_ratio,
             max_output_tokens,
             ignore_eos,
             max_draft_tokens,
+            draft_stop_policy,
+            verify_prefetch_max_per_boundary,
             repeat,
         ) = key
         summary = summarize_rows(group_rows)
         summary.update(
             {
                 "dataset": dataset,
+                "optimized_config": optimized_config,
                 "allocation_mode": allocation_mode,
                 "segment_size": int(segment_size),
                 "cache_ratio": float(cache_ratio),
                 "max_output_tokens": int(max_output_tokens),
                 "ignore_eos": bool(ignore_eos),
                 "max_draft_tokens": int(max_draft_tokens),
+                "draft_stop_policy": str(draft_stop_policy),
+                "verify_prefetch_max_per_boundary": int(
+                    verify_prefetch_max_per_boundary
+                ),
                 "repeat": int(repeat),
             }
         )
@@ -793,12 +954,27 @@ def run_case(
                 "sample_index": sample_index,
                 "source_index": sample.source_index,
                 "sample_id": sample.sample_id,
+                "optimized_config": str(case.get("optimized_config", "none")),
                 "allocation_mode": str(case["allocation_mode"]),
                 "segment_size": int(case["segment_size"]),
                 "cache_ratio": float(case["cache_ratio"]),
                 "max_output_tokens": int(case["max_output_tokens"]),
                 "ignore_eos": bool(case.get("ignore_eos", False)),
                 "max_draft_tokens": int(case["max_draft_tokens"]),
+                "draft_stop_policy": str(
+                    case.get("draft_stop_policy", args.draft_stop_policy)
+                ),
+                "verify_prefetch_max_per_boundary": int(
+                    case.get(
+                        "verify_prefetch_max_per_boundary",
+                        args.verify_prefetch_max_per_boundary,
+                    )
+                ),
+                "verify_prefetch_rank_multiplier": (
+                    int(case["verify_prefetch_rank_multiplier"])
+                    if case.get("verify_prefetch_rank_multiplier") is not None
+                    else None
+                ),
                 "repeat": int(case["repeat"]),
                 **prompt_info,
                 "metadata": sample.metadata,
@@ -910,12 +1086,16 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "sample_index",
         "source_index",
         "sample_id",
+        "optimized_config",
         "allocation_mode",
         "segment_size",
         "cache_ratio",
         "max_output_tokens",
         "ignore_eos",
         "max_draft_tokens",
+        "draft_stop_policy",
+        "verify_prefetch_max_per_boundary",
+        "verify_prefetch_rank_multiplier",
         "repeat",
         "prompt_tokens_original",
         "prompt_tokens",
@@ -947,12 +1127,15 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
 def write_summary_csv(summaries: list[dict[str, Any]], path: Path) -> None:
     fieldnames = [
         "dataset",
+        "optimized_config",
         "allocation_mode",
         "segment_size",
         "cache_ratio",
         "max_output_tokens",
         "ignore_eos",
         "max_draft_tokens",
+        "draft_stop_policy",
+        "verify_prefetch_max_per_boundary",
         "repeat",
         "sample_count",
         "ok_count",
@@ -981,23 +1164,29 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         f"- model: `{metadata['model_path']}`",
         f"- request mode: `{metadata['request_mode']}`",
         f"- datasets: `{', '.join(metadata['datasets'])}`",
+        f"- optimized config: `{metadata.get('optimized_config', 'none')}`",
+        f"- optimized env: `{metadata.get('optimized_env_overrides', {})}`",
         f"- batch size: `1`",
         f"- output directory: `{metadata['output_dir']}`",
         f"- profile enabled: `false`",
         "",
         "## Summary",
         "",
-        "| dataset | alloc | seg | ratio | max out | ignore EOS | K | rep | ok/sample | TPOT mean ms | P50 | P90 | P99 | decode tok/s mean | e2e tok/s mean | prompt tok mean |",
-        "|:---|:---|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| dataset | opt | alloc | seg | ratio | max out | ignore EOS | K | stop | vpb | rep | ok/sample | TPOT mean ms | P50 | P90 | P99 | decode tok/s mean | e2e tok/s mean | prompt tok mean |",
+        "|:---|:---|:---|---:|---:|---:|:---:|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary["summaries"]:
         lines.append(
             "| "
-            f"{row['dataset']} | {row['allocation_mode']} | "
+            f"{row['dataset']} | {row.get('optimized_config', 'none')} | "
+            f"{row['allocation_mode']} | "
             f"{row['segment_size']} | {row['cache_ratio']:.4f} | "
             f"{'EOS' if int(row['max_output_tokens']) <= 0 else row['max_output_tokens']} | "
             f"{'true' if row.get('ignore_eos', False) else 'false'} | "
-            f"{row['max_draft_tokens']} | {row['repeat']} | "
+            f"{row['max_draft_tokens']} | "
+            f"{row.get('draft_stop_policy', '')} | "
+            f"{row.get('verify_prefetch_max_per_boundary', 0)} | "
+            f"{row['repeat']} | "
             f"{row['ok_count']}/{row['sample_count']} | "
             f"{row['tpot_ms_mean']:.3f} | {row['tpot_ms_p50']:.3f} | "
             f"{row['tpot_ms_p90']:.3f} | {row['tpot_ms_p99']:.3f} | "
@@ -1030,8 +1219,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     os.environ["PYTHONPATH"] = str(repo_root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    optimized_env_overrides = configure_optimized_env(args)
 
     cases = build_cases(args)
+    if bool(getattr(args, "dry_run", False)):
+        output = {
+            "metadata": {
+                "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+                "argv": sys.argv,
+                "model_path": args.model_path,
+                "output_dir": str(output_dir),
+                "request_mode": _effective_request_mode(args),
+                "datasets": _dataset_names(args.dataset, args.request_mode),
+                "optimized_config": str(args.optimized_config),
+                "optimized_config_applied": getattr(
+                    args, "_optimized_config_applied", {}
+                ),
+                "optimized_env_overrides": optimized_env_overrides,
+                "case_count": len(cases),
+            },
+            "cases": cases,
+        }
+        dry_run_json = output_dir / "dry_run_summary.json"
+        dry_run_json.write_text(
+            json.dumps(output, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(output, ensure_ascii=True, indent=2))
+        print(f"dry_run_summary_json={dry_run_json}")
+        return output
+
     case_summaries: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     for case_index, case in enumerate(cases):
@@ -1062,6 +1279,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "output_dir": str(output_dir),
             "request_mode": _effective_request_mode(args),
             "datasets": _dataset_names(args.dataset, args.request_mode),
+            "optimized_config": str(args.optimized_config),
+            "optimized_config_applied": getattr(
+                args, "_optimized_config_applied", {}
+            ),
+            "optimized_env_overrides": optimized_env_overrides,
             "num_samples": _num_samples_label(int(args.num_samples)),
             "sample_offset": int(args.sample_offset),
             "shuffle": bool(args.shuffle),
@@ -1075,6 +1297,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "output_lens_compat_mode": bool(str(args.output_lens).strip()),
             "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int),
             "segment_sizes": _parse_csv(args.segment_sizes, int),
+            "draft_stop_policy": str(args.draft_stop_policy),
+            "verify_prefetch_max_per_boundary": int(
+                args.verify_prefetch_max_per_boundary
+            ),
+            "verify_prefetch_rank_multiplier": (
+                int(args.verify_prefetch_rank_multiplier)
+                if args.verify_prefetch_rank_multiplier is not None
+                else None
+            ),
+            "verify_cuda_graph_bucket_steps": _parse_csv(
+                args.verify_cuda_graph_bucket_steps, int
+            ),
+            "kt_num_threads": int(args.kt_num_threads),
             "batch_size": 1,
             "engine_profile": False,
             "spec_profile": False,
@@ -1108,6 +1343,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--profile-artifact", default=DEFAULT_PROFILE)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--optimized-config",
+        choices=OPTIMIZED_CONFIG_CHOICES,
+        default="none",
+        help=(
+            "Apply an optimized inference preset. k4_verify uses the verified "
+            "K=4 low-latency settings; k12_decode uses the best observed K=12 "
+            "decode-throughput settings. Explicit CLI options override preset values."
+        ),
+    )
+    parser.add_argument(
+        "--preserve-optimized-env",
+        type=str2bool,
+        default=False,
+        help=(
+            "When using an optimized config, keep externally set debug/profile "
+            "environment variables instead of clearing known conflicting ones."
+        ),
+    )
+    parser.add_argument(
+        "--optimized-segment-event-timing",
+        type=str2bool,
+        default=False,
+        help=(
+            "Enable NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING during optimized "
+            "runs. Off by default because workload TPOT should measure the fast path."
+        ),
+    )
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default="sharegpt")
     parser.add_argument(
         "--request-mode",
@@ -1194,7 +1457,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
     parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=16)
     parser.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
-    parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
+    parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
+    parser.add_argument(
+        "--verify-prefetch-rank-multiplier",
+        type=int,
+        default=None,
+        help=(
+            "Set NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER. Optimized presets "
+            "default to 1 unless this option is explicitly provided."
+        ),
+    )
 
     parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=327680)
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)
@@ -1219,11 +1491,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-fast", type=str2bool, default=True)
     parser.add_argument("--save-token-ids", type=str2bool, default=False)
     parser.add_argument("--save-text", type=str2bool, default=False)
+    parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    argv = sys.argv[1:]
+    args = build_parser().parse_args(argv)
+    args._optimized_config_applied = apply_optimized_config(args, argv)
     if args.num_samples < 0:
         raise ValueError("--num-samples must be >= 0 or all")
     if args.repeats < 1:

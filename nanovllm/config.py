@@ -118,7 +118,7 @@ class Config:
     verify_prefetch_segment_size: int = 12
     verify_prefetch_visible_budget_ms: float = 12.0
     verify_prefetch_min_per_boundary: int = 0
-    verify_prefetch_max_per_boundary: int = 16
+    verify_prefetch_max_per_boundary: int = 4
     perf_profile_level: str = "basic"
     # On-GPU theoretical-acceptance predictor for the draft path. When enabled, a
     # lightweight MLP (trained by random_cache_srdp_scripts-1) predicts per-step

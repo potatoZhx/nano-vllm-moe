@@ -741,7 +741,19 @@ def run_single_case(args: argparse.Namespace) -> None:
     ]
 
     warmup_params = SamplingParams(temperature=args.temperature, ignore_eos=True, max_tokens=4)
-    llm.generate(["Warmup request for verify layer profile."], warmup_params, use_tqdm=False)
+    profile_env_keys = (
+        "NANOVLLM_DRAFT_TORCH_PROFILE_DIR",
+        "NANOVLLM_VERIFY_TORCH_PROFILE_DIR",
+    )
+    saved_profile_env = {
+        key: os.environ.pop(key)
+        for key in profile_env_keys
+        if key in os.environ
+    }
+    try:
+        llm.generate(["Warmup request for verify layer profile."], warmup_params, use_tqdm=False)
+    finally:
+        os.environ.update(saved_profile_env)
     llm.get_profile(reset=True)
     DRAFT_LAYER_EVENTS.clear()
     VERIFY_LAYER_EVENTS.clear()
@@ -1260,7 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify-prefetch-segment-size", type=int, default=12)
     p.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
     p.add_argument("--verify-prefetch-min-per-boundary", type=int, default=0)
-    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
+    p.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
     p.add_argument("--dist-port", type=int, default=12345)
     p.add_argument("--dist-port-base", type=int, default=26500)
     p.add_argument("--seed", type=int, default=0)

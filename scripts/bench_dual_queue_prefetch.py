@@ -759,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
     parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=16)
     parser.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
-    parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=16)
+    parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
 
     parser.add_argument("--cpu-expert-workspace-max-routes", type=int, default=327680)
     parser.add_argument("--cpu-expert-num-threads", type=int, default=4)

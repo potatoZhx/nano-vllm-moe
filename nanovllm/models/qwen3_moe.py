@@ -44,6 +44,7 @@ from nanovllm.scheduling.draft_reroute import ROUND_ROBIN, DraftReroutePolicy
 from nanovllm.scheduling.draft_reroute_profile import DraftRerouteProfile
 from nanovllm.scheduling.draft_scheduler import DraftScheduler
 from nanovllm.utils.context import get_context
+from nanovllm.utils.verify_op_events import verify_op_event
 
 if TYPE_CHECKING:
     from nanovllm.expert.runtime_meta import ModelRuntimeMetaRecorder
@@ -111,14 +112,22 @@ class Qwen3MoeAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        with verify_op_event("attn.qkv_proj", layer_idx):
+            qkv = self.qkv_proj(hidden_states)
+        with verify_op_event("attn.qkv_split", layer_idx):
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        with verify_op_event("attn.q_norm", layer_idx):
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
+        with verify_op_event("attn.k_norm", layer_idx):
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
+        with verify_op_event("attn.rope", layer_idx):
+            q, k = self.rotary_emb(positions, q, k)
+        with verify_op_event("attn.flash_kvcache", layer_idx):
+            o = self.attn(q, k, v)
+        with verify_op_event("attn.o_proj", layer_idx):
+            output = self.o_proj(o.flatten(1, -1))
         return output
 
 
@@ -702,6 +711,18 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             profile["pre_transfer_cache_miss_sum"] = 0.0
         if "pre_transfer_active_count_sum" not in profile:
             profile["pre_transfer_active_count_sum"] = 0.0
+        layer_prefix = f"layer_{int(self.layer_idx)}_"
+        profile[f"{layer_prefix}realized_cpu_expert_count_sum"] = float(
+            profile.get("realized_cpu_expert_count_sum", 0.0)
+        )
+        profile[f"{layer_prefix}cpu_routes_sum"] = float(profile.get("cpu_routes_sum", 0.0))
+        profile[f"{layer_prefix}active_expert_count_sum"] = float(
+            profile.get("activated_expert_set_size_sum", 0.0)
+        )
+        profile[f"{layer_prefix}active_routes_sum"] = float(
+            profile.get("pre_transfer_active_count_sum", 0.0)
+        )
+        profile[f"{layer_prefix}moe_profile_count"] = 1.0
 
         self._last_profile = profile
         return out
@@ -709,57 +730,69 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
     @torch.no_grad()
     def forward_verify_kt_hybrid(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Graph-capturable verify: GPU cached experts + kt_direct miss experts."""
-        router_logits = self.gate(hidden_states)
-        router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(
-            router_probs, self.num_selected, dim=-1,
-        )
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        layer_idx = int(self.layer_idx)
+        with verify_op_event("moe.router_gate", layer_idx):
+            router_logits = self.gate(hidden_states)
+        with verify_op_event("moe.softmax_topk", layer_idx):
+            router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+            routing_weights, selected_experts = torch.topk(
+                router_probs, self.num_selected, dim=-1,
+            )
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
 
-        plan = build_verify_graph_safe_plan_gpu(
-            layer_idx=self.layer_idx,
-            selected_experts=selected_experts,
-            routing_weights=routing_weights,
-            expert_cache=self.expert_cache,
-            num_experts=self.num_experts,
-        )
-
-        if self.runtime_meta_recorder is not None:
-            self.runtime_meta_recorder.record_layer(
+        with verify_op_event("moe.plan", layer_idx):
+            plan = build_verify_graph_safe_plan_gpu(
                 layer_idx=self.layer_idx,
                 selected_experts=selected_experts,
                 routing_weights=routing_weights,
-                uncached_route_mask=plan.cpu_route_mask,
+                expert_cache=self.expert_cache,
+                num_experts=self.num_experts,
             )
 
-        self.cpu_backend.begin_forward_graph_verify(
-            hidden_states, selected_experts, routing_weights,
-        )
+        if self.runtime_meta_recorder is not None:
+            with verify_op_event("moe.runtime_metadata_record", layer_idx):
+                self.runtime_meta_recorder.record_layer(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    uncached_route_mask=plan.cpu_route_mask,
+                )
+
+        with verify_op_event("moe.cpu_submit", layer_idx):
+            self.cpu_backend.begin_forward_graph_verify(
+                hidden_states, selected_experts, routing_weights,
+            )
 
         top_k = routing_weights.size(1)
         gpu_route_indices = plan.gpu_route_indices
-        gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
-        gpu_hidden = hidden_states[gpu_token_indices]
-        gpu_weights = plan.gpu_route_weights.index_select(0, gpu_route_indices)
+        with verify_op_event("moe.gpu_gather", layer_idx):
+            gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
+            gpu_hidden = hidden_states[gpu_token_indices]
+            gpu_weights = plan.gpu_route_weights.index_select(0, gpu_route_indices)
 
         gate_up_buffer, down_buffer = self.expert_cache.get_layer_buffers()
-        gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.gpu_m_sizes)
-        gpu_expert_out = fused_moe_linear(self.act_fn(gate_up), down_buffer, plan.gpu_m_sizes)
-        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+        with verify_op_event("moe.gpu_gate_up", layer_idx):
+            gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, plan.gpu_m_sizes)
+        with verify_op_event("moe.gpu_down", layer_idx):
+            gpu_expert_out = fused_moe_linear(self.act_fn(gate_up), down_buffer, plan.gpu_m_sizes)
+        with verify_op_event("moe.gpu_weight_mul", layer_idx):
+            gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
 
-        kt_output = self.cpu_backend.finish_forward_graph_verify(hidden_states)
+        with verify_op_event("moe.cpu_sync_copy", layer_idx):
+            kt_output = self.cpu_backend.finish_forward_graph_verify(hidden_states)
 
-        num_tokens, hidden_dim = hidden_states.shape
-        num_routes = num_tokens * top_k
-        route_buffer = torch.zeros(
-            num_routes, hidden_dim, dtype=gpu_expert_out.dtype, device=hidden_states.device,
-        )
-        route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
-        token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
-        output = token_output.to(dtype=hidden_states.dtype)
-        output.add_(kt_output.to(dtype=hidden_states.dtype, device=hidden_states.device))
+        with verify_op_event("moe.accumulate", layer_idx):
+            num_tokens, hidden_dim = hidden_states.shape
+            num_routes = num_tokens * top_k
+            route_buffer = torch.zeros(
+                num_routes, hidden_dim, dtype=gpu_expert_out.dtype, device=hidden_states.device,
+            )
+            route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
+            token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
+            output = token_output.to(dtype=hidden_states.dtype)
+            output.add_(kt_output.to(dtype=hidden_states.dtype, device=hidden_states.device))
         return output
 
     def consume_profile(self) -> dict[str, float]:
@@ -835,6 +868,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
             )
+        setattr(self.self_attn, "layer_idx", int(layer_idx))
         self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -934,16 +968,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Full graph-capturable verify forward: attn + hybrid MoE (GPU cached + kt_direct miss)."""
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = residual + hidden_states
+        layer_idx = int(self.layer_idx)
+        with verify_op_event("layer.total", layer_idx):
+            residual = hidden_states
+            with verify_op_event("layer.input_layernorm", layer_idx):
+                hidden_states = self.input_layernorm(hidden_states)
+            with verify_op_event("layer.attention", layer_idx):
+                hidden_states = self.self_attn(positions, hidden_states)
+            with verify_op_event("layer.attn_residual_add", layer_idx):
+                hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp.forward_verify_kt_hybrid(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+            residual = hidden_states
+            with verify_op_event("layer.post_attention_layernorm", layer_idx):
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            with verify_op_event("layer.moe", layer_idx):
+                hidden_states = self.mlp.forward_verify_kt_hybrid(hidden_states)
+            with verify_op_event("layer.moe_residual_add", layer_idx):
+                hidden_states = residual + hidden_states
+            return hidden_states
 
 
 class Qwen3MoeModel(nn.Module):
@@ -998,7 +1040,8 @@ class Qwen3MoeModel(nn.Module):
             if controller is not None:
                 controller.after_verify_layer(layer_idx)
         if apply_norm:
-            hidden_states = self.norm(hidden_states)
+            with verify_op_event("model.final_norm", -1):
+                hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def forward_verify_prefix_suffix(
@@ -1053,7 +1096,8 @@ class Qwen3MoeModel(nn.Module):
             else:
                 hidden_states = decoder_layer(hidden_states, position_ids)
         if apply_norm:
-            hidden_states = self.norm(hidden_states)
+            with verify_op_event("model.final_norm", -1):
+                hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def forward_verify_kt_hybrid_segment(
@@ -1078,7 +1122,8 @@ class Qwen3MoeModel(nn.Module):
             else:
                 hidden_states = decoder_layer(hidden_states, position_ids)
         if apply_norm:
-            hidden_states = self.norm(hidden_states)
+            with verify_op_event("model.final_norm", -1):
+                hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
