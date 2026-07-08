@@ -71,8 +71,6 @@ def heterogeneous_moe_forward(
     flat_selected = selected_experts.reshape(-1)
     flat_weights = routing_weights.reshape(-1)
 
-    with verify_op_event("moe.output_zero", layer_idx):
-        output = torch.zeros_like(hidden_states)
     if plan is None:
         plan = build_moe_execution_plan(selected_experts, expert_cache)
 
@@ -177,8 +175,18 @@ def heterogeneous_moe_forward(
     else:
         can_overlap_cpu_gpu = False
 
+    output: torch.Tensor | None = None
+
+    def _zero_output() -> torch.Tensor:
+        nonlocal output
+        if output is None:
+            with verify_op_event("moe.output_zero", layer_idx):
+                output = torch.zeros_like(hidden_states)
+        return output
+
     if graph_cpu_enabled:
         t_parallel0 = perf_counter()
+        output = _zero_output()
         cpu_graph_state = None
         graph_async = bool(getattr(plan, "cpu_graph_async", False))
         async_sidecar_enabled = os.getenv(
@@ -255,6 +263,7 @@ def heterogeneous_moe_forward(
 
     if can_overlap_cpu_gpu:
         t_parallel0 = perf_counter()
+        output = _zero_output()
         if cpu_gpu_parallel_stream is not None:
             gpu_stream = cpu_gpu_parallel_stream
         else:
@@ -363,18 +372,23 @@ def heterogeneous_moe_forward(
         if not has_cpu_work:
             t_scatter0 = perf_counter()
             with verify_op_event("moe.accumulate", layer_idx):
-                _accumulate_gpu_routes_deterministic(
-                    output=output,
+                out = _accumulate_gpu_routes_full(
+                    num_tokens=int(hidden_states.shape[0]),
+                    hidden_dim=int(hidden_states.shape[-1]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
                     gpu_route_indices=gpu_route_indices_save,
                     gpu_expert_out=gpu_expert_out_save,
                     top_k=top_k,
                 )
             _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
+            return out
 
     # CPU path for uncached experts.
     cpu_route_indices_save: torch.Tensor | None = None
     cpu_outputs_save: torch.Tensor | None = None
     if has_cpu_work:
+        output = _zero_output()
         if cpu_expert_execution_enabled and active_cpu_backend is not None:
             cpu_result = active_cpu_backend.forward(
                 hidden_states=hidden_states,
@@ -445,6 +459,8 @@ def heterogeneous_moe_forward(
         merge_ms = (perf_counter() - t_scatter0) * 1000.0
         _prof_add(profile, "cpu_to_gpu_merge_ms", merge_ms / 1000.0)
 
+    if output is None:
+        output = _zero_output()
     return output
 
 
@@ -464,6 +480,28 @@ def _accumulate_gpu_routes_deterministic(
     route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
     token_output = route_buffer.view(num_tokens, top_k, hidden_dim).sum(dim=1)
     output.add_(token_output.to(dtype=output.dtype))
+
+
+def _accumulate_gpu_routes_full(
+    *,
+    num_tokens: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    gpu_route_indices: torch.Tensor,
+    gpu_expert_out: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Return token outputs for a GPU-only plan covering every token/top-k route."""
+    num_routes = int(num_tokens) * int(top_k)
+    route_buffer = _get_route_buffer_cache().get_uninitialized(
+        num_routes,
+        int(hidden_dim),
+        gpu_expert_out.dtype,
+        device,
+    )
+    route_buffer.index_copy_(0, gpu_route_indices.to(torch.int64), gpu_expert_out)
+    return route_buffer.view(int(num_tokens), int(top_k), int(hidden_dim)).sum(dim=1).to(dtype=dtype)
 
 
 class _RouteBufferCache:
@@ -494,6 +532,25 @@ class _RouteBufferCache:
         # Reuse: zero only the rows that will be read by view().sum().
         # index_copy_ overwrites filled positions; unfilled positions must be zero.
         b[:num_routes].zero_()
+        return b[:num_routes]
+
+    def get_uninitialized(
+        self,
+        num_routes: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        b = self._buffer
+        if (
+            b is None
+            or b.size(0) < num_routes
+            or b.size(1) != hidden_dim
+            or b.dtype != dtype
+            or b.device != device
+        ):
+            self._buffer = torch.empty((num_routes, hidden_dim), dtype=dtype, device=device)
+            return self._buffer
         return b[:num_routes]
 
 

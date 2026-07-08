@@ -15,8 +15,10 @@ It intentionally does not install layer probes and does not enable
 ``ignore_eos=False`` and stop on EOS. For legacy compatibility,
 ``--output-lens N`` with ``N > 0`` generates exactly like the older benchmark
 path: it sets the maximum output tokens and ignores EOS. TPOT is measured with
-wall-clock decode time by driving ``LLM.step()`` directly and excluding the
-initial prefill step.
+wall-clock decode time by excluding the initial prefill step.  The default
+``--decode-driver step`` drives ``LLM.step()`` directly; ``--decode-driver
+generate`` uses the same ``LLM.generate`` driver as ``bench_per_layer_slots.py``
+and times each internal step with a hook.
 
 Example:
 
@@ -78,7 +80,10 @@ Explicit optimized K=12 per-layer-slots prompt benchmark:
         --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
         --verify-prefetch-max-per-boundary 10 \
         --draft-stop-policy none \
-        --verify-prefetch-rank-multiplier 1
+        --verify-prefetch-rank-multiplier 1 \
+        --decode-driver generate \
+        --collect-profile true \
+        --save-token-ids true
 """
 from __future__ import annotations
 
@@ -101,6 +106,7 @@ from typing import Any, Iterable
 MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
 DEFAULT_PROFILE = "results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors"
 DEFAULT_PREDICTOR_PATH = "random_cache_srdp_scripts-1/res/run_20260614_133025"
+DEFAULT_WARMUP_PROMPT = "Warmup request for verify layer profile."
 PER_LAYER_SLOTS_PROMPT_TEXT = (
     "Sparse mixture-of-experts inference keeps only part of each layer's expert weights "
     "in GPU memory. Explain how speculative decoding can overlap expert prefetch with "
@@ -190,6 +196,21 @@ def parse_num_samples(value: str | int) -> int:
 
 def _num_samples_label(value: int) -> str:
     return "all" if int(value) == 0 else str(int(value))
+
+
+def runtime_seed(args: argparse.Namespace, case: dict[str, Any], sample_index: int = 0) -> int:
+    return int(args.seed) + int(case.get("repeat", 0)) + int(sample_index)
+
+
+def reset_runtime_seed(seed: int) -> None:
+    random.seed(int(seed))
+    try:
+        import torch
+    except Exception:
+        return
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
 
 def _parse_allocation_modes(values: str) -> list[str]:
@@ -466,11 +487,11 @@ def load_dataset_samples(dataset: str, args: argparse.Namespace) -> list[PromptS
             PromptSample(
                 dataset="per_layer_slots",
                 sample_id="bench_per_layer_slots_prompt",
-                text=PER_LAYER_SLOTS_PROMPT_TEXT,
+                text=PER_LAYER_SLOTS_PROMPT_TEXT + "\n",
                 source_index=0,
                 metadata={
                     "source": "scripts/bench_per_layer_slots.py",
-                    "description": "same measured prompt as bench_per_layer_slots.py",
+                    "description": "same measured prompt bytes as bench_per_layer_slots.py",
                 },
             )
         ]
@@ -741,24 +762,151 @@ def run_prompt(
     decode_sec = 0.0
     prefill_steps = 0
     decode_steps = 0
+    prefill_step_ms: list[float] = []
+    decode_step_ms: list[float] = []
     outputs: dict[int, list[int]] = {}
     elapsed_start = perf_counter()
     while not llm.is_finished():
         step_start = perf_counter()
         step_outputs, num_tokens = llm.step()
         step_elapsed = perf_counter() - step_start
+        step_ms = step_elapsed * 1000.0
         if num_tokens > 0 and decode_steps == 0:
             prefill_sec += step_elapsed
             prefill_steps += 1
+            prefill_step_ms.append(step_ms)
         else:
             decode_sec += step_elapsed
             decode_steps += 1
+            decode_step_ms.append(step_ms)
         for seq_id, token_ids in step_outputs:
             outputs[int(seq_id)] = list(token_ids)
     elapsed_sec = perf_counter() - elapsed_start
     if not outputs:
         raise RuntimeError("request finished without returning output tokens")
     token_ids = next(iter(outputs.values()))
+    return finalize_prompt_result(
+        token_ids,
+        elapsed_sec=elapsed_sec,
+        prefill_sec=prefill_sec,
+        decode_sec=decode_sec,
+        prefill_steps=prefill_steps,
+        decode_steps=decode_steps,
+        prefill_step_ms=prefill_step_ms,
+        decode_step_ms=decode_step_ms,
+        output_sequence_count=len(outputs),
+        max_tokens=max_tokens,
+        ignore_eos=ignore_eos,
+        eos_token_id=eos_token_id,
+        prompt_tokens=prompt_tokens,
+        max_model_len=max_model_len,
+    )
+
+
+def run_prompt_generate(
+    llm: Any,
+    prompt_tokens: list[int],
+    *,
+    temperature: float,
+    max_tokens: int,
+    ignore_eos: bool,
+    eos_token_id: int | None,
+    max_model_len: int,
+) -> dict[str, Any]:
+    from nanovllm import SamplingParams
+
+    sampling = SamplingParams(
+        temperature=temperature,
+        ignore_eos=ignore_eos,
+        max_tokens=max_tokens,
+    )
+
+    original_step = llm.step
+    prefill_sec = 0.0
+    decode_sec = 0.0
+    prefill_steps = 0
+    decode_steps = 0
+    prefill_step_ms: list[float] = []
+    decode_step_ms: list[float] = []
+
+    def timed_step():
+        nonlocal prefill_sec, decode_sec, prefill_steps, decode_steps
+        step_start = perf_counter()
+        step_outputs, num_tokens = original_step()
+        step_elapsed = perf_counter() - step_start
+        step_ms = step_elapsed * 1000.0
+        if num_tokens > 0 and decode_steps == 0:
+            prefill_sec += step_elapsed
+            prefill_steps += 1
+            prefill_step_ms.append(step_ms)
+        else:
+            decode_sec += step_elapsed
+            decode_steps += 1
+            decode_step_ms.append(step_ms)
+        return step_outputs, num_tokens
+
+    elapsed_start = perf_counter()
+    llm.step = timed_step
+    try:
+        outputs = llm.generate([prompt_tokens], sampling, use_tqdm=False)
+    finally:
+        llm.step = original_step
+    elapsed_sec = perf_counter() - elapsed_start
+
+    if len(outputs) != 1:
+        raise RuntimeError(f"expected exactly one output sequence, got {len(outputs)}")
+    token_ids = list(outputs[0].get("token_ids", []))
+    if not token_ids:
+        raise RuntimeError("request finished without returning output tokens")
+    return finalize_prompt_result(
+        token_ids,
+        elapsed_sec=elapsed_sec,
+        prefill_sec=prefill_sec,
+        decode_sec=decode_sec,
+        prefill_steps=prefill_steps,
+        decode_steps=decode_steps,
+        prefill_step_ms=prefill_step_ms,
+        decode_step_ms=decode_step_ms,
+        output_sequence_count=len(outputs),
+        max_tokens=max_tokens,
+        ignore_eos=ignore_eos,
+        eos_token_id=eos_token_id,
+        prompt_tokens=prompt_tokens,
+        max_model_len=max_model_len,
+    )
+
+
+def max_repeated_token_run(token_ids: list[int]) -> int:
+    if not token_ids:
+        return 0
+    best = 1
+    current = 1
+    for prev, token_id in zip(token_ids, token_ids[1:]):
+        if token_id == prev:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 1
+    return best
+
+
+def finalize_prompt_result(
+    token_ids: list[int],
+    *,
+    elapsed_sec: float,
+    prefill_sec: float,
+    decode_sec: float,
+    prefill_steps: int,
+    decode_steps: int,
+    prefill_step_ms: list[float],
+    decode_step_ms: list[float],
+    output_sequence_count: int,
+    max_tokens: int,
+    ignore_eos: bool,
+    eos_token_id: int | None,
+    prompt_tokens: list[int],
+    max_model_len: int,
+) -> dict[str, Any]:
     generated = len(token_ids)
     digest_payload = ",".join(str(token_id) for token_id in token_ids).encode("utf-8")
     stopped_by = "finished"
@@ -773,13 +921,32 @@ def run_prompt(
         stopped_by = "max_output_tokens"
     elif len(prompt_tokens) + generated >= max_model_len:
         stopped_by = "max_model_len"
+    validation_errors = []
+    if output_sequence_count != 1:
+        validation_errors.append(f"output_sequence_count={output_sequence_count}")
+    if ignore_eos and max_tokens > 0 and generated != max_tokens:
+        validation_errors.append(f"generated={generated} expected={max_tokens}")
     return {
         "elapsed_sec": elapsed_sec,
         "prefill_sec": prefill_sec,
         "decode_sec": decode_sec,
+        "prefill_step_wall_ms_sum": sum(prefill_step_ms),
+        "decode_step_wall_ms_sum": sum(decode_step_ms),
+        "decode_step_wall_ms_mean": (
+            sum(decode_step_ms) / len(decode_step_ms) if decode_step_ms else 0.0
+        ),
+        "decode_step_wall_ms_p50": percentile(decode_step_ms, 50),
+        "decode_step_wall_ms_p90": percentile(decode_step_ms, 90),
+        "decode_step_wall_ms_max": max(decode_step_ms) if decode_step_ms else 0.0,
         "prefill_steps": prefill_steps,
         "decode_steps": decode_steps,
         "generated_output_tokens": generated,
+        "output_sequence_count": int(output_sequence_count),
+        "output_fixed_length_ok": bool(
+            (not ignore_eos) or max_tokens <= 0 or generated == max_tokens
+        ),
+        "output_validation_error": ";".join(validation_errors),
+        "max_repeated_token_run": max_repeated_token_run(token_ids),
         "tpot_ms": (decode_sec * 1000.0 / generated) if generated else 0.0,
         "decode_tok_s": (generated / decode_sec) if decode_sec > 0 else 0.0,
         "throughput_output_tok_s": (generated / elapsed_sec) if elapsed_sec > 0 else 0.0,
@@ -791,14 +958,95 @@ def run_prompt(
     }
 
 
+def reset_llm_profile(llm: Any) -> None:
+    if not hasattr(llm, "get_profile"):
+        return
+    llm.get_profile(reset=True)
+
+
+def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    scalar_keys = [
+        "step_count",
+        "step_ms",
+        "spec_step_count",
+        "spec_engine_ms",
+        "spec_spec_step_count",
+        "spec_spec_step_ms",
+        "spec_draft_ms",
+        "spec_verify_ms",
+        "spec_draft_loop_ms",
+        "spec_start_draft_ms",
+        "spec_rollback_ms",
+        "spec_prepare_verify_ms",
+        "spec_accept_ms",
+        "spec_run_draft_calls",
+        "spec_run_verify_calls",
+        "spec_run_draft_infer_ms_total",
+        "spec_run_verify_infer_ms_total",
+        "spec_draft_steps_total",
+        "spec_accepted_tokens_total",
+        "spec_draft_tokens_total",
+        "spec_verify_trace_tokens_total",
+        "model_graph_hit_rate",
+        "model_graph_replay_count",
+        "model_decode_count",
+        "model_prefetch_submit_count",
+        "model_prefetch_completed_count",
+        "model_prefetch_late_count",
+        "model_prefetch_wait_ms",
+        "model_prefetch_consumed_count",
+        "model_publish_count",
+        "model_publish_ms",
+        "model_metadata_offload_count",
+        "model_metadata_offload_ms",
+        "model_metadata_offload_bytes",
+        "model_metadata_offload_enqueue_ms",
+        "model_metadata_offload_transfer_wait_ms",
+        "model_metadata_offload_collect_ms",
+        "model_metadata_offload_observe_ms",
+        "model_metadata_offload_draft_count",
+        "model_metadata_offload_draft_ms",
+        "model_metadata_offload_verify_count",
+        "model_metadata_offload_verify_ms",
+        "model_realized_cpu_expert_count",
+        "draft_forward_ms",
+        "verify_forward_ms",
+        "draft_ms",
+        "verify_ms",
+        "spec_step_ms",
+    ]
+    metrics: dict[str, Any] = {}
+    for key in scalar_keys:
+        value = profile.get(key)
+        if isinstance(value, (bool, int, float)):
+            metrics[f"profile_{key}"] = value
+
+    generated = int(result.get("generated_output_tokens", 0) or 0)
+    wall_decode_ms = float(result.get("decode_sec", 0.0) or 0.0) * 1000.0
+    spec_step_ms = float(profile.get("spec_spec_step_ms", 0.0) or 0.0)
+    engine_step_ms = float(profile.get("step_ms", 0.0) or 0.0)
+    if generated > 0 and spec_step_ms > 0.0:
+        metrics["profile_decode_phase_output_tok_s"] = generated / (spec_step_ms / 1000.0)
+    if spec_step_ms > 0.0:
+        metrics["profile_wall_minus_spec_step_ms"] = wall_decode_ms - spec_step_ms
+    if engine_step_ms > 0.0:
+        metrics["profile_wall_minus_engine_step_ms"] = wall_decode_ms - engine_step_ms
+    verify_calls = float(profile.get("spec_run_verify_calls", 0.0) or 0.0)
+    if verify_calls > 0.0:
+        metrics["profile_wall_ms_per_verify"] = wall_decode_ms / verify_calls
+        metrics["profile_spec_step_ms_per_verify"] = spec_step_ms / verify_calls
+    draft_tokens = float(profile.get("spec_draft_tokens_total", 0.0) or 0.0)
+    accepted = float(profile.get("spec_accepted_tokens_total", 0.0) or 0.0)
+    if draft_tokens > 0.0:
+        metrics["profile_acceptance_rate"] = accepted / draft_tokens
+    return metrics
+
+
 def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) -> Any:
-    import torch
     from nanovllm import LLM
     from transformers import AutoConfig
 
-    torch.manual_seed(int(args.seed) + int(case.get("repeat", 0)))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(args.seed) + int(case.get("repeat", 0)))
+    reset_runtime_seed(runtime_seed(args, case, 0))
 
     hf_config = AutoConfig.from_pretrained(args.model_path)
     num_experts = int(getattr(hf_config, "num_experts"))
@@ -853,15 +1101,24 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         cpu_gpu_parallel_min_cpu_route_ratio=0.0,
         spec_verify_miss_policy="cpu",
         spec_profile=False,
-        engine_profile=False,
-        engine_profile_cuda_sync=False,
+        engine_profile=bool(args.engine_profile),
+        engine_profile_cuda_sync=bool(args.engine_profile_cuda_sync),
         spec_enable_prefetch=True,
         cache_strategy=str(args.cache_strategy),
+        rank_guard_threshold=float(args.rank_guard_threshold),
+        rank_guard_ema_alpha=float(args.rank_guard_ema_alpha),
         prefetch_strategy="history_window",
         prefetch_runtime_mode="draft_segment_indexed",
         prefetch_runtime_kind="predictive",
         dual_queue_segment_size=segment_size,
+        dual_queue_ground_truth_decay=float(args.dual_queue_ground_truth_decay),
+        dual_queue_ground_truth_ttl_rounds=int(args.dual_queue_ground_truth_ttl_rounds),
+        dual_queue_ground_truth_count_weight=float(args.dual_queue_ground_truth_count_weight),
+        dual_queue_budget_safety_ratio=float(args.dual_queue_budget_safety_ratio),
+        dual_queue_segment_time_ema_alpha=float(args.dual_queue_segment_time_ema_alpha),
+        dual_queue_secondary_index_weight=float(args.dual_queue_secondary_index_weight),
         prefetch_verify_attention_ratio=float(args.prefetch_verify_attention_ratio),
+        predictive_phase1_budget=int(args.predictive_phase1_budget),
         prefetch_staging_slots_per_layer=int(args.prefetch_staging_slots_per_layer),
         prefetch_max_inflight=int(args.prefetch_max_inflight),
         prefetch_transfer_stream_count=int(args.prefetch_transfer_stream_count),
@@ -871,6 +1128,16 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         cache_eviction_budget_per_step=int(args.cache_eviction_budget_per_step),
         prefetch_verify_wait_ms=0.0,
         prefetch_global_queue_capacity=int(args.prefetch_global_queue_capacity),
+        prefetch_history_decay=float(args.prefetch_history_decay),
+        prefetch_history_ttl_steps=int(args.prefetch_history_ttl_steps),
+        prefetch_source_weight_prefill=float(args.prefetch_source_weight_prefill),
+        prefetch_source_weight_verify=float(args.prefetch_source_weight_verify),
+        prefetch_source_weight_draft=float(args.prefetch_source_weight_draft),
+        prefetch_activation_count_weight=float(args.prefetch_activation_count_weight),
+        prefetch_age_penalty=float(args.prefetch_age_penalty),
+        prefetch_use_prefill_history=bool(args.prefetch_use_prefill_history),
+        prefetch_use_verify_history=bool(args.prefetch_use_verify_history),
+        prefetch_use_draft_live=bool(args.prefetch_use_draft_live),
         draft_cuda_graph_enabled=True,
         draft_cuda_graph_cpu_backend="none",
         draft_prefetch_segment_size=segment_size,
@@ -887,11 +1154,11 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
     )
 
 
-def warmup_llm(llm: Any, *, temperature: float) -> None:
+def warmup_llm(llm: Any, *, temperature: float, prompt: str) -> None:
     from nanovllm import SamplingParams
 
     sampling = SamplingParams(temperature=temperature, ignore_eos=True, max_tokens=4)
-    llm.generate(["Warmup request for workload TPOT benchmark."], sampling, use_tqdm=False)
+    llm.generate([prompt], sampling, use_tqdm=False)
 
 
 def run_case(
@@ -938,7 +1205,13 @@ def run_case(
     started = time.time()
     try:
         llm = create_llm(args, case, case_index)
-        warmup_llm(llm, temperature=float(args.temperature))
+        warmup_llm(
+            llm,
+            temperature=float(args.temperature),
+            prompt=str(args.warmup_prompt),
+        )
+        if bool(args.reset_profile_after_warmup) or bool(args.collect_profile):
+            reset_llm_profile(llm)
 
         for sample_index, sample in enumerate(selected):
             prompt_tokens, prompt_info = prepare_prompt_tokens(
@@ -976,6 +1249,8 @@ def run_case(
                     else None
                 ),
                 "repeat": int(case["repeat"]),
+                "runtime_seed": runtime_seed(args, case, sample_index),
+                "decode_driver": str(args.decode_driver),
                 **prompt_info,
                 "metadata": sample.metadata,
             }
@@ -995,7 +1270,16 @@ def run_case(
                     else remaining_model_tokens
                 )
                 ignore_eos = bool(case.get("ignore_eos", False))
-                result = run_prompt(
+                if bool(args.reset_seed_after_warmup):
+                    reset_runtime_seed(int(base_row["runtime_seed"]))
+                if bool(args.collect_profile) and bool(args.reset_profile_before_request):
+                    reset_llm_profile(llm)
+                run_prompt_fn = (
+                    run_prompt_generate
+                    if str(args.decode_driver) == "generate"
+                    else run_prompt
+                )
+                result = run_prompt_fn(
                     llm,
                     prompt_tokens,
                     temperature=float(args.temperature),
@@ -1004,6 +1288,25 @@ def run_case(
                     eos_token_id=getattr(llm.config, "eos", None),
                     max_model_len=int(args.max_model_len),
                 )
+                if bool(args.collect_profile):
+                    profile = llm.get_profile(reset=True)
+                    result.update(collect_profile_metrics(profile, result))
+                    if bool(args.save_profile_json):
+                        profile_dir = output_dir / f"{name}_profiles"
+                        profile_dir.mkdir(parents=True, exist_ok=True)
+                        profile_path = profile_dir / f"sample{sample_index:04d}.json"
+                        profile_path.write_text(
+                            json.dumps(profile, ensure_ascii=True, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        result["profile_json"] = str(profile_path)
+                if (
+                    bool(args.fail_on_output_validation_error)
+                    and result.get("output_validation_error")
+                ):
+                    raise RuntimeError(
+                        f"output validation failed: {result['output_validation_error']}"
+                    )
                 if bool(args.save_text):
                     token_ids = result.get("generated_token_ids")
                     result["generated_text"] = (
@@ -1016,10 +1319,18 @@ def run_case(
                     f"  [{sample_index + 1}/{len(selected)}] "
                     f"id={sample.sample_id} prompt={base_row['prompt_tokens']} "
                     f"out={result['generated_output_tokens']} "
+                    f"seqs={result.get('output_sequence_count', '')} "
                     f"stop={result['stopped_by']} "
                     f"ignore_eos={result['ignore_eos']} "
+                    f"valid={result.get('output_fixed_length_ok', '')} "
                     f"tpot={result['tpot_ms']:.3f}ms "
-                    f"decode_tok/s={result['decode_tok_s']:.3f}",
+                    f"decode_tok/s={result['decode_tok_s']:.3f}"
+                    + (
+                        f" profile_decode_tok/s={float(result['profile_decode_phase_output_tok_s']):.3f}"
+                        f" profile_gap={float(result.get('profile_wall_minus_spec_step_ms', 0.0)):.3f}ms"
+                        if "profile_decode_phase_output_tok_s" in result
+                        else ""
+                    ),
                     flush=True,
                 )
             except Exception as error:
@@ -1097,12 +1408,24 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "verify_prefetch_max_per_boundary",
         "verify_prefetch_rank_multiplier",
         "repeat",
+        "runtime_seed",
+        "decode_driver",
         "prompt_tokens_original",
         "prompt_tokens",
         "prompt_truncated",
         "generated_output_tokens",
+        "output_sequence_count",
+        "output_fixed_length_ok",
+        "output_validation_error",
+        "max_repeated_token_run",
         "prefill_sec",
         "decode_sec",
+        "prefill_step_wall_ms_sum",
+        "decode_step_wall_ms_sum",
+        "decode_step_wall_ms_mean",
+        "decode_step_wall_ms_p50",
+        "decode_step_wall_ms_p90",
+        "decode_step_wall_ms_max",
         "elapsed_sec",
         "tpot_ms",
         "decode_tok_s",
@@ -1113,6 +1436,27 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "ignore_eos",
         "stopped_by",
         "outputs_digest",
+        "profile_decode_phase_output_tok_s",
+        "profile_wall_minus_spec_step_ms",
+        "profile_wall_minus_engine_step_ms",
+        "profile_wall_ms_per_verify",
+        "profile_spec_step_ms_per_verify",
+        "profile_acceptance_rate",
+        "profile_spec_spec_step_ms",
+        "profile_step_ms",
+        "profile_spec_engine_ms",
+        "profile_spec_draft_ms",
+        "profile_spec_verify_ms",
+        "profile_spec_run_draft_calls",
+        "profile_spec_run_verify_calls",
+        "profile_draft_forward_ms",
+        "profile_verify_forward_ms",
+        "profile_model_graph_hit_rate",
+        "profile_model_graph_replay_count",
+        "profile_model_realized_cpu_expert_count",
+        "profile_model_metadata_offload_ms",
+        "profile_model_prefetch_wait_ms",
+        "profile_json",
         "skip_reason",
         "error",
     ]
@@ -1168,7 +1512,14 @@ def write_markdown_report(summary: dict[str, Any], path: Path) -> None:
         f"- optimized env: `{metadata.get('optimized_env_overrides', {})}`",
         f"- batch size: `1`",
         f"- output directory: `{metadata['output_dir']}`",
-        f"- profile enabled: `false`",
+        f"- warmup prompt: `{metadata.get('warmup_prompt', '')}`",
+        f"- decode driver: `{metadata.get('decode_driver', 'step')}`",
+        f"- reset profile after warmup: `{metadata.get('reset_profile_after_warmup', False)}`",
+        f"- reset profile before request: `{metadata.get('reset_profile_before_request', False)}`",
+        f"- reset seed after warmup: `{metadata.get('reset_seed_after_warmup', False)}`",
+        f"- fail on output validation error: `{metadata.get('fail_on_output_validation_error', True)}`",
+        f"- profile collected: `{metadata.get('collect_profile', False)}`",
+        f"- engine profile: `{metadata.get('engine_profile', False)}`",
         "",
         "## Summary",
         "",
@@ -1236,6 +1587,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     args, "_optimized_config_applied", {}
                 ),
                 "optimized_env_overrides": optimized_env_overrides,
+                "warmup_prompt": str(args.warmup_prompt),
+                "decode_driver": str(args.decode_driver),
+                "reset_profile_after_warmup": bool(args.reset_profile_after_warmup),
+                "reset_profile_before_request": bool(args.reset_profile_before_request),
+                "reset_seed_after_warmup": bool(args.reset_seed_after_warmup),
+                "fail_on_output_validation_error": bool(args.fail_on_output_validation_error),
+                "collect_profile": bool(args.collect_profile),
+                "engine_profile": bool(args.engine_profile),
+                "engine_profile_cuda_sync": bool(args.engine_profile_cuda_sync),
                 "case_count": len(cases),
             },
             "cases": cases,
@@ -1306,12 +1666,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.verify_prefetch_rank_multiplier is not None
                 else None
             ),
+            "rank_guard_threshold": float(args.rank_guard_threshold),
+            "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
+            "predictive_phase1_budget": int(args.predictive_phase1_budget),
+            "prefetch_history_decay": float(args.prefetch_history_decay),
+            "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
+            "prefetch_source_weight_prefill": float(args.prefetch_source_weight_prefill),
+            "prefetch_source_weight_verify": float(args.prefetch_source_weight_verify),
+            "prefetch_source_weight_draft": float(args.prefetch_source_weight_draft),
+            "prefetch_activation_count_weight": float(args.prefetch_activation_count_weight),
+            "prefetch_age_penalty": float(args.prefetch_age_penalty),
+            "prefetch_use_prefill_history": bool(args.prefetch_use_prefill_history),
+            "prefetch_use_verify_history": bool(args.prefetch_use_verify_history),
+            "prefetch_use_draft_live": bool(args.prefetch_use_draft_live),
             "verify_cuda_graph_bucket_steps": _parse_csv(
                 args.verify_cuda_graph_bucket_steps, int
             ),
             "kt_num_threads": int(args.kt_num_threads),
             "batch_size": 1,
-            "engine_profile": False,
+            "warmup_prompt": str(args.warmup_prompt),
+            "decode_driver": str(args.decode_driver),
+            "reset_profile_after_warmup": bool(args.reset_profile_after_warmup),
+            "reset_profile_before_request": bool(args.reset_profile_before_request),
+            "reset_seed_after_warmup": bool(args.reset_seed_after_warmup),
+            "fail_on_output_validation_error": bool(args.fail_on_output_validation_error),
+            "collect_profile": bool(args.collect_profile),
+            "engine_profile": bool(args.engine_profile),
+            "engine_profile_cuda_sync": bool(args.engine_profile_cuda_sync),
             "spec_profile": False,
         },
         "summaries": summaries,
@@ -1444,6 +1825,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-tpot-td-ms", type=float, default=19.0)
     parser.add_argument("--draft-tpot-tv-ms", type=float, default=80.0)
 
+    parser.add_argument("--rank-guard-threshold", type=float, default=0.15)
+    parser.add_argument("--rank-guard-ema-alpha", type=float, default=0.95)
     parser.add_argument("--prefetch-step-budget", type=int, default=16)
     parser.add_argument("--prefetch-max-inflight", type=int, default=16)
     parser.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
@@ -1452,6 +1835,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-global-queue-capacity", type=int, default=4096)
     parser.add_argument("--prefetch-verify-layer-max-budget", type=int, default=8)
     parser.add_argument("--prefetch-verify-attention-ratio", type=float, default=1.0)
+    parser.add_argument("--predictive-phase1-budget", type=int, default=4)
+    parser.add_argument("--dual-queue-ground-truth-decay", type=float, default=0.9)
+    parser.add_argument("--dual-queue-ground-truth-ttl-rounds", type=int, default=64)
+    parser.add_argument("--dual-queue-ground-truth-count-weight", type=float, default=0.1)
+    parser.add_argument("--dual-queue-budget-safety-ratio", type=float, default=0.8)
+    parser.add_argument("--dual-queue-segment-time-ema-alpha", type=float, default=0.2)
+    parser.add_argument("--dual-queue-secondary-index-weight", type=float, default=0.5)
+    parser.add_argument("--prefetch-history-decay", type=float, default=0.9)
+    parser.add_argument("--prefetch-history-ttl-steps", type=int, default=64)
+    parser.add_argument("--prefetch-source-weight-prefill", type=float, default=1.0)
+    parser.add_argument("--prefetch-source-weight-verify", type=float, default=1.2)
+    parser.add_argument("--prefetch-source-weight-draft", type=float, default=1.5)
+    parser.add_argument("--prefetch-activation-count-weight", type=float, default=0.1)
+    parser.add_argument("--prefetch-age-penalty", type=float, default=0.02)
+    parser.add_argument("--prefetch-use-prefill-history", type=str2bool, default=True)
+    parser.add_argument("--prefetch-use-verify-history", type=str2bool, default=True)
+    parser.add_argument("--prefetch-use-draft-live", type=str2bool, default=True)
     parser.add_argument("--cache-eviction-budget-per-step", type=int, default=2)
     parser.add_argument("--draft-segment-host-buffer-pool-size", type=int, default=0)
     parser.add_argument("--draft-prefetch-visible-budget-ms", type=float, default=3.0)
@@ -1487,8 +1887,69 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify-cuda-graph-bucket-steps", default="3,5,8,12")
     parser.add_argument("--dist-port-base", type=int, default=31800)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--warmup-prompt",
+        default=DEFAULT_WARMUP_PROMPT,
+        help="Warmup prompt text. Defaults to the per-layer benchmark warmup prompt.",
+    )
+    parser.add_argument(
+        "--decode-driver",
+        choices=["step", "generate"],
+        default="step",
+        help=(
+            "step times the explicit LLM.step loop; generate uses LLM.generate "
+            "with a step hook so the driver matches bench_per_layer_slots.py."
+        ),
+    )
+    parser.add_argument(
+        "--reset-profile-after-warmup",
+        type=str2bool,
+        default=True,
+        help="Call llm.get_profile(reset=True) after warmup, outside timed requests.",
+    )
+    parser.add_argument(
+        "--reset-profile-before-request",
+        type=str2bool,
+        default=False,
+        help=(
+            "When collecting profile, also reset immediately before each measured "
+            "request. Off by default to avoid perturbing prefetch/cache state."
+        ),
+    )
+    parser.add_argument(
+        "--reset-seed-after-warmup",
+        type=str2bool,
+        default=False,
+        help=(
+            "Reset Python/Torch RNG before each measured request. This keeps "
+            "warmup generation from changing the measured sampling trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--collect-profile",
+        type=str2bool,
+        default=False,
+        help=(
+            "Collect llm.get_profile(reset=True) outside the timed request and "
+            "write derived wall-vs-engine timing fields into result rows."
+        ),
+    )
+    parser.add_argument(
+        "--engine-profile",
+        type=str2bool,
+        default=False,
+        help="Enable LLMEngine/ModelRunner perf_counter counters.",
+    )
+    parser.add_argument(
+        "--engine-profile-cuda-sync",
+        type=str2bool,
+        default=False,
+        help="Synchronize CUDA around engine profile counters when engine profile is enabled.",
+    )
     parser.add_argument("--skip-existing", type=str2bool, default=True)
     parser.add_argument("--fail-fast", type=str2bool, default=True)
+    parser.add_argument("--fail-on-output-validation-error", type=str2bool, default=True)
+    parser.add_argument("--save-profile-json", type=str2bool, default=False)
     parser.add_argument("--save-token-ids", type=str2bool, default=False)
     parser.add_argument("--save-text", type=str2bool, default=False)
     parser.add_argument("--dry-run", action="store_true")

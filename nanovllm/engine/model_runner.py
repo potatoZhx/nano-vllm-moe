@@ -1540,6 +1540,16 @@ class ModelRunner:
         layer_start_idx: int,
         layer_end_idx: int,
     ) -> None:
+        defer_segment_metadata = os.getenv(
+            "NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if defer_segment_metadata:
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["draft_segment_metadata_deferred_count"] += 1
+            return
+
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         if prefetch_runtime is None or runtime_meta_recorder is None:
@@ -1799,10 +1809,15 @@ class ModelRunner:
             self._flush_pending_prefetch_metadata(block=False)
 
         mode_set_t0 = perf_counter()
-        self._set_speculative_execution_mode("draft")
-        draft_cpu_graph_mode = self._can_use_draft_cpu_cudagraph()
-        if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
-            self.model.set_draft_cpu_graph_mode(True)
+        draft_graph_replay_mode = self._can_use_draft_cudagraph(len(seqs))
+        draft_cpu_graph_mode = False
+        if not draft_graph_replay_mode:
+            self._set_speculative_execution_mode("draft")
+            draft_cpu_graph_mode = self._can_use_draft_cpu_cudagraph()
+            if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
+                self.model.set_draft_cpu_graph_mode(True)
+        elif self.profile_enabled and self.rank == 0:
+            self._profile["run_draft_graph_mode_set_skipped_count"] += 1
         self._decode_graph_policy = "draft"
         self._active_draft_prefetch_step_id = int(step_id)
         self._draft_segment_metadata_enqueued_step_id = -1
@@ -1951,7 +1966,8 @@ class ModelRunner:
             self._draft_segment_metadata_enqueued_step_id = -1
             if draft_cpu_graph_mode and hasattr(self.model, "set_draft_cpu_graph_mode"):
                 self.model.set_draft_cpu_graph_mode(False)
-            self._set_speculative_execution_mode("normal")
+            if not draft_graph_replay_mode:
+                self._set_speculative_execution_mode("normal")
             if self.profile_enabled:
                 if self.profile_cuda_sync:
                     torch.cuda.synchronize()

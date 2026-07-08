@@ -83,6 +83,25 @@ def _build_grouped_layout(
     return m_sizes, sorted_gpu_route_indices
 
 
+def _build_grouped_layout_for_contiguous_routes(
+    gpu_slots: torch.Tensor,
+    num_slots: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group a full route range [0, N) by slot.
+
+    Draft cached routing builds the route indices as a contiguous arange.  The
+    generic helper first sorts that arange before sorting slots; this specialized
+    path keeps the same stable tie-break by original route index while avoiding
+    one argsort and two gathers inside the captured draft graph.
+    """
+    sorted_gpu_route_indices = torch.argsort(gpu_slots, stable=True)
+    sorted_slots = gpu_slots.index_select(0, sorted_gpu_route_indices)
+    m_sizes = torch.zeros(num_slots, dtype=torch.int32, device=sorted_slots.device)
+    ones = torch.ones_like(sorted_slots, dtype=torch.int32)
+    m_sizes.scatter_add_(0, sorted_slots.to(torch.int64), ones)
+    return m_sizes, sorted_gpu_route_indices
+
+
 def _select_verify_cache_fill_slot(
     expert_cache: LayerExpertCache,
     active_expert_ids: set[int],
@@ -862,14 +881,10 @@ def build_draft_plan_gpu(
         )
         flat_effective = substitution_lut.index_select(0, flat_selected)
         gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_effective)
-        gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
-        m_sizes, gpu_route_indices = _build_grouped_layout(
+        m_sizes, gpu_route_indices = _build_grouped_layout_for_contiguous_routes(
             gpu_slots,
-            gpu_route_indices,
             expert_cache.num_slots,
         )
-        gpu_route_mask = torch.ones_like(flat_selected, dtype=torch.bool)
-        cpu_route_mask = torch.zeros_like(flat_selected, dtype=torch.bool)
         return MoEExecutionPlan(
             layer_idx=layer_idx,
             gpu_route_indices=gpu_route_indices,
@@ -885,8 +900,8 @@ def build_draft_plan_gpu(
             cpu_graph_enabled=False,
             cpu_graph_async=False,
             substitution_lut=substitution_lut,
-            gpu_route_mask=gpu_route_mask,
-            cpu_route_mask=cpu_route_mask,
+            gpu_route_mask=None,
+            cpu_route_mask=None,
         )
 
     slot_indices, gpu_mask = expert_cache.remap_experts_to_slots(flat_selected)
@@ -963,10 +978,8 @@ def build_draft_plan_gpu(
             )
             flat_gpu_effective = topc0_lut.index_select(0, flat_selected)
             gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_gpu_effective)
-            gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
-            m_sizes, gpu_route_indices = _build_grouped_layout(
+            m_sizes, gpu_route_indices = _build_grouped_layout_for_contiguous_routes(
                 gpu_slots,
-                gpu_route_indices,
                 expert_cache.num_slots,
             )
             gpu_route_mask = torch.ones_like(flat_selected, dtype=torch.bool)
@@ -1003,10 +1016,8 @@ def build_draft_plan_gpu(
             dummy_gpu_mask = dummy_gpu_mask | (~active_route_mask)
         flat_gpu_effective = torch.where(dummy_gpu_mask, cpu_gpu_fallback, flat_effective)
         gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_gpu_effective)
-        gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=device)
-        m_sizes, gpu_route_indices = _build_grouped_layout(
+        m_sizes, gpu_route_indices = _build_grouped_layout_for_contiguous_routes(
             gpu_slots,
-            gpu_route_indices,
             expert_cache.num_slots,
         )
         gpu_route_weights = torch.where(
@@ -1086,10 +1097,8 @@ def build_cached_draft_plan_gpu(
     flat_selected = _flatten_experts(selected_experts)
     _ = routing_weights
     gpu_slots = expert_cache.expert_to_slot_lut.index_select(0, flat_selected)
-    gpu_route_indices = torch.arange(flat_selected.numel(), dtype=torch.int64, device=flat_selected.device)
-    m_sizes, gpu_route_indices = _build_grouped_layout(
+    m_sizes, gpu_route_indices = _build_grouped_layout_for_contiguous_routes(
         gpu_slots,
-        gpu_route_indices,
         expert_cache.num_slots,
     )
     return MoEExecutionPlan(
@@ -1107,8 +1116,8 @@ def build_cached_draft_plan_gpu(
         cpu_graph_enabled=False,
         cpu_graph_async=False,
         substitution_lut=None,
-        gpu_route_mask=torch.ones_like(flat_selected, dtype=torch.bool),
-        cpu_route_mask=torch.zeros_like(flat_selected, dtype=torch.bool),
+        gpu_route_mask=None,
+        cpu_route_mask=None,
     )
 
 

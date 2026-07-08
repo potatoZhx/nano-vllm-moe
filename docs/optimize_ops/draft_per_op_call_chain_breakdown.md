@@ -524,3 +524,319 @@ op-event profile 的 segment CUDA event 为 `22.803 ms/call`，正常 segment-on
    - 正常 segment-only profile 判断真实 draft wall 和 graph 外 gap。
    - op-event profile 判断 graph 内算子占比是否下降。
    - 保持 `output-lens=32, K=4` 的小样本做快迭代，再用 K=12 decode tok/s benchmark 验证吞吐收益。
+
+## 已实施优化与验证结果
+
+日期：2026-07-08
+
+本轮先做低风险优化，目标是压缩 graph 内非模型算子和 graph 外暴露 gap：
+
+1. `build_cached_draft_plan_gpu()` / draft top-c=0 contiguous route plan：
+   - 新增 `_build_grouped_layout_for_contiguous_routes()`。
+   - 对全量 contiguous route `[0, N)` 直接 stable sort `gpu_slots`。
+   - 避免通用 `_build_grouped_layout()` 中对 `arange` 的无意义 argsort、额外 gather，以及 cached draft plan 中未消费的全量 bool mask。
+
+2. GPU-only MoE full-route accumulate：
+   - 新增 `_accumulate_gpu_routes_full()`。
+   - GPU-only 且所有 token/top-k route 都在 GPU 路径时，直接 `index_copy_ -> view(...).sum(dim=1)` 返回输出。
+   - 跳过 `output_zero` 和 route buffer `zero_()`；保留 CPU/mixed route 原路径。
+   - 随机 BF16 等价性检查通过：`accumulate_fast_path_equal=1`。
+
+3. graph 外 draft segment metadata defer：
+   - 新增 `NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1`。
+   - 开启后跳过每个 segment 的 metadata offload/enqueue，保留 draft call 结束后的 full metadata offload。
+   - 用于把 4 次 segment metadata enqueue 合并为 1 次 call-level offload，降低 graph 外暴露开销。
+
+4. draft graph replay mode-set skip：
+   - 如果当前 batch 可走 draft CUDA graph replay，则不再每次递归设置 48 层 MoE `execution_mode="draft"`，退出时也不再设置回 `"normal"`。
+   - eager fallback 路径保留原来的 mode set。
+
+### 验证命令
+
+正常 segment-only profile：
+
+```bash
+source /home/linke/miniconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/linke/nano-vllm-moe
+rm -rf results/draft_opt2_segment_event_k4_l32
+
+NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING=1 \
+NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 \
+python scripts/bench_per_layer_slots.py \
+  --output-dir results/draft_opt2_segment_event_k4_l32 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 32 \
+  --max-draft-tokens-values 4 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --skip-existing false \
+  --case-timeout-sec 3000
+```
+
+op-event profile：
+
+```bash
+source /home/linke/miniconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/linke/nano-vllm-moe
+rm -rf results/draft_opt2_op_event_k4_l32
+
+NANOVLLM_DRAFT_OP_EVENT_TIMING=1 \
+NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING=1 \
+NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 \
+python scripts/bench_per_layer_slots.py \
+  --output-dir results/draft_opt2_op_event_k4_l32 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 32 \
+  --max-draft-tokens-values 4 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --skip-existing false \
+  --case-timeout-sec 3000
+```
+
+breakdown 汇总：
+
+```bash
+python scripts/analyze_draft_op_breakdown.py \
+  --op-json results/draft_opt2_op_event_k4_l32/profile_weighted_seg12_ratio3125_l32_k4_r0.json \
+  --segment-json results/draft_opt2_segment_event_k4_l32/profile_weighted_seg12_ratio3125_l32_k4_r0.json \
+  --output-dir results/draft_opt2_op_event_k4_l32
+```
+
+### 优化前后 normal path
+
+| profile | draft ms/call | segment CUDA ms/call | graph 外 gap | verify ms/call | decode tok/s |
+|:---|---:|---:|---:|---:|---:|
+| baseline | 20.553 | 16.057 | 4.496 | 82.137 | 23.992 |
+| optimized, segment metadata on | 19.448 | 15.229 | 4.219 | 77.325 | 28.036 |
+| optimized | 18.605 | 15.202 | 3.403 | 98.247 | 26.025 |
+| delta vs baseline, metadata on | -1.104 | -0.828 | -0.277 | -4.812 | +4.044 |
+| delta vs baseline, metadata defer | -1.948 | -0.855 | -1.093 | +16.109 | +2.033 |
+
+达标情况：
+
+- graph 内：`15.202 ms/call`，已经在目标 `10-19 ms` 内，并较 baseline 降低 `0.855 ms/call`。
+- graph 外：`3.403 ms/call`，进入目标 `0-4 ms`。
+- draft wall：从 `20.553` 降到 `18.605 ms/call`。
+
+注意：
+
+- 不开启 `NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA` 时，graph 内已经降到 `15.229 ms/call`，draft wall 降到 `19.448 ms/call`，decode tok/s 提升到 `28.036`，verify latency 也改善到 `77.325 ms/call`；但 graph 外 gap 仍为 `4.219 ms/call`，略高于严格的 4 ms 目标。
+- 开启 `NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1` 时，graph 外 gap 降到 `3.403 ms/call`，满足目标；但 verify latency 变高到 `98.247 ms/call`。这说明 segment metadata defer 对 draft 延迟有效，但会减少 draft 阶段提前 prefetch 的机会。K=12 验证见下节：K=12 不推荐开启 draft metadata defer。
+
+### K=12 验证
+
+K=12 使用显式优化配置：
+
+- `--max-draft-tokens-values 12`
+- `--draft-stop-policy none`
+- `--verify-prefetch-max-per-boundary 10`
+- `--verify-prefetch-rank-multiplier 1`
+- `NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1`
+- `NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1`
+- `NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0`
+
+#### K=12/L128 segment event
+
+默认保留 draft segment metadata：
+
+```bash
+source /home/linke/miniconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/linke/nano-vllm-moe
+rm -rf results/draft_opt2_nodefer_segment_event_k12_l128
+
+NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING=1 \
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 \
+python scripts/bench_per_layer_slots.py \
+  --output-dir results/draft_opt2_nodefer_segment_event_k12_l128 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 128 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --verify-prefetch-max-per-boundary 10 \
+  --draft-stop-policy none \
+  --skip-existing false \
+  --case-timeout-sec 3600
+```
+
+开启 draft segment metadata defer：
+
+```bash
+source /home/linke/miniconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/linke/nano-vllm-moe
+rm -rf results/draft_opt2_defer_segment_event_k12_l128
+
+NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING=1 \
+NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 \
+python scripts/bench_per_layer_slots.py \
+  --output-dir results/draft_opt2_defer_segment_event_k12_l128 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 128 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --verify-prefetch-max-per-boundary 10 \
+  --draft-stop-policy none \
+  --skip-existing false \
+  --case-timeout-sec 3600
+```
+
+结果：
+
+| K=12 profile | draft ms/call | segment CUDA ms/call | graph 外 gap | verify ms/call | decode tok/s | hit | accept |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| segment metadata on | 18.568 | 15.188 | 3.380 | 97.307 | 27.771 | 0.8141 | 0.6707 |
+| segment metadata defer | 18.430 | 15.135 | 3.295 | 127.519 | 19.844 | 0.7201 | 0.5023 |
+
+结论：
+
+- K=12 默认保留 draft segment metadata 已经满足两个目标：graph 内 `15.188 ms/call`，graph 外 `3.380 ms/call`。
+- K=12 开启 `NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1` 只额外降低 `0.085 ms` graph 外 gap，但 verify 从 `97.307` 变差到 `127.519 ms/call`，decode tok/s 从 `27.771` 降到 `19.844`。
+- 因此 K=12 推荐配置是不启用 draft metadata defer。
+
+#### K=12/L512 fast path TPOT
+
+不启用 profile event，不使用 `--optimized-config`，所有配置显式写在命令里：
+
+```bash
+source /home/linke/miniconda3/etc/profile.d/conda.sh
+conda activate nano_moe
+cd /home/linke/nano-vllm-moe
+rm -rf results/eval_workload_tpot_k12_opt2_nodefer_l512
+
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 \
+python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --output-dir results/eval_workload_tpot_k12_opt2_nodefer_l512 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 512 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --verify-prefetch-max-per-boundary 10 \
+  --draft-stop-policy none \
+  --verify-prefetch-rank-multiplier 1 \
+  --skip-existing false
+```
+
+结果文件：
+
+- `results/eval_workload_tpot_k12_opt2_nodefer_l512/summary.md`
+- `results/eval_workload_tpot_k12_opt2_nodefer_l512/summary.json`
+- `results/eval_workload_tpot_k12_opt2_nodefer_l512/rows.csv`
+
+结果：
+
+| output len | K | stop | verify prefetch boundary | TPOT mean | decode tok/s | generated tokens |
+|---:|---:|:---|---:|---:|---:|---:|
+| 512 | 12 | none | 10 | 35.866 ms | 27.882 | 512 |
+
+这个 fast-path 结果与 K=12/L128 segment profile 的 nodefer 结论一致：K=12 推荐保留 draft segment metadata，并显式使用上述 K=12 参数。
+
+### 优化前后 graph 内 per-op
+
+op-event profile 会放大绝对延迟；下表使用各自 normal segment event 缩放后的 ms/call：
+
+| op label | baseline scaled | optimized scaled | delta |
+|:---|---:|---:|---:|
+| `layer.total` | 15.875 | 15.028 | -0.846 |
+| `layer.moe` | 10.254 | 9.561 | -0.694 |
+| `moe.heterogeneous_forward` | 6.657 | 6.592 | -0.065 |
+| `moe.gpu_gate_up` | 3.677 | 3.879 | +0.202 |
+| `moe.gpu_down` | 1.641 | 1.728 | +0.087 |
+| `moe.plan` | 1.171 | 0.671 | -0.501 |
+| `moe.softmax_topk` | 0.514 | 0.519 | +0.005 |
+| `moe.draft_reroute` | 0.484 | 0.486 | +0.002 |
+| `moe.runtime_metadata_record` | 0.438 | 0.440 | +0.002 |
+| `moe.draft_feature_record` | 0.239 | 0.231 | -0.008 |
+| `moe.output_zero` | 0.145 | 0.000 | -0.145 |
+| `moe.gpu_gather` | 0.235 | 0.232 | -0.003 |
+| `moe.gpu_weight_mul` | 0.182 | 0.163 | -0.019 |
+| `moe.accumulate` | 0.295 | 0.261 | -0.034 |
+| `layer.attention` | 4.040 | 3.995 | -0.046 |
+
+主要收益来源：
+
+- `moe.plan`: `1.171 -> 0.671 ms/call`，减少 `0.501 ms/call`。
+- `moe.output_zero`: `0.145 -> 0.000 ms/call`，被 GPU-only full-route fast path 消除。
+- `layer.total`: `15.875 -> 15.028 ms/call`，graph 内总下降 `0.846 ms/call`。
+
+### 优化后剩余瓶颈
+
+graph 内剩余大项：
+
+- `moe.gpu_gate_up + moe.gpu_down`: `5.607 ms/call`。
+- `layer.attention`: `3.995 ms/call`。
+- `moe.plan`: `0.671 ms/call`，虽然已下降，但仍是最大的非模型 route/plan 单项。
+- `moe.softmax_topk + draft_reroute + runtime_metadata_record + draft_feature_record`: 合计约 `1.676 ms/call`。
+
+graph 外剩余大项：
+
+- `core_run - segment event`: `2.070 ms/call`，包括 logits、acceptance tail、sampler/readback 和 graph replay 外的 host work。
+- `run_draft_prefetch_before`: `0.989 ms/call`。
+- `draft prefetch visible overhead`: `0.919 ms/call`，其中 rank `0.237`，transfer enqueue `0.404`。
+
+下一步若继续压缩：
+
+1. graph 内：
+   - 继续融合 `draft_reroute + plan`，把 `moe.plan` 从 `0.67 ms` 往 `0.3-0.4 ms` 压。
+   - 精简 `runtime_metadata_record` 和 `draft_feature_record`，这两项合计约 `0.67 ms`。
+   - 将 `gpu_weight_mul` 融入 down GEMM epilogue 或 accumulate。
+
+2. graph 外：
+   - 拆分 `run_draft_prefetch_before` 子项，确认是 phase1 submit、device reuse wait 还是 recorder arm。
+   - 将 logits + acceptance feature + tail graph + sampler 尽量合并/capture，目标减少 `core_run - segment event`。
+   - K=4 若必须严格压到 graph 外 `<4 ms`，可以开启 `NANOVLLM_DRAFT_DEFER_SEGMENT_METADATA=1`；K=12 不建议开启。

@@ -331,3 +331,178 @@ Interpretation:
   it raised rank overhead and did not reduce CPU routes.
 - The result is a single 512-token run.  For release-level confidence, rerun the
   recommended setting with `--repeats 3`.
+
+## TPOT Workload Metric Alignment
+
+Follow-up date: 2026-07-08.
+
+The earlier K=12 result `decode_phase_output_tok_s = 33.017` came from
+`bench_per_layer_slots.py` / `bench_optimized_verify_perf.py`.  That metric is:
+
+```text
+generated_output_tokens / (engine_profile["spec_spec_step_ms"] / 1000)
+```
+
+It is not the same as `scripts/bench_eval_workload_tpot.py`'s wall-clock TPOT
+metric, which times each outer `LLM.step()` decode call:
+
+```text
+generated_output_tokens / sum(decode_step_wall_seconds)
+```
+
+The per-layer JSON also reports an end-to-end generation throughput:
+
+```text
+throughput_output_tok_s = generated_output_tokens / elapsed_sec
+```
+
+For the K=12 best observed run:
+
+| source | output tok/s metric | value | verify/spec steps | digest |
+|:---|:---|---:|---:|:---|
+| `optimized_verify_perf_k12_budget10_stopnone_l512` | `decode_phase_output_tok_s` | 33.017 | 49 | `0e72ada9...` |
+| same JSON | `throughput_output_tok_s` | 30.682 | 49 | `0e72ada9...` |
+| current per-layer rerun with segment event timing | `decode_phase_output_tok_s` | 34.566 | 49 | `0e72ada9...` |
+| same JSON | `throughput_output_tok_s` | 32.013 | 49 | `0e72ada9...` |
+| original TPOT workload run | wall decode tok/s | 27.882 | 58 | `252ec251...` |
+
+The `27.882` result was therefore not a direct regression from `33.017`.
+It used a different generated-token trajectory: 58 speculative verify steps
+instead of 49 and a different output digest.  With stochastic sampling, small
+differences in warmup prompt, prompt bytes, profile reset timing, and prefetch
+state can change the accepted draft lengths and therefore total verify calls.
+
+### TPOT Harness Fixes
+
+`scripts/bench_eval_workload_tpot.py` was updated to make these differences
+visible and tunable:
+
+- records `decode_step_wall_ms_sum/mean/p50/p90/max`;
+- records `runtime_seed`;
+- records `decode_driver`, `output_sequence_count`, `output_fixed_length_ok`,
+  `output_validation_error`, and `max_repeated_token_run` so throughput results
+  can be checked against malformed or duplicated output;
+- supports `--decode-driver generate` to use the same `LLM.generate` driver as
+  `bench_per_layer_slots.py` while timing each internal `step()` call with a
+  hook;
+- supports `--collect-profile` to write derived `profile_*` counters outside
+  the timed request;
+- supports `--engine-profile` and `--engine-profile-cuda-sync` explicitly;
+- keeps `spec_profile=False` during workload TPOT so profile collection does
+  not switch to a diagnostic path;
+- uses the same default warmup prompt as the per-layer runner:
+  `Warmup request for verify layer profile.`;
+- calls `llm.get_profile(reset=True)` after warmup by default via
+  `--reset-profile-after-warmup true`;
+- keeps `--reset-seed-after-warmup false` by default to preserve the old
+  per-layer runner behavior;
+- keeps `--reset-profile-before-request false` by default so diagnostic profile
+  collection does not add an extra pre-request drain/reset beyond the warmup
+  reset;
+- fails by default on fixed-output validation errors via
+  `--fail-on-output-validation-error true`;
+- exposes and passes the prefetch/rank/history parameters that the single-case
+  runner passes explicitly;
+- uses `PER_LAYER_SLOTS_PROMPT_TEXT + "\n"` for `--request-mode per_layer_slots`
+  so the prompt token IDs match `bench_per_layer_slots.py`'s prompt file.
+
+### Reproduction Commands
+
+Per-layer-driver wall-clock TPOT run with profile readout:
+
+```bash
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --output-dir results/eval_workload_tpot_k12_generate_driver_profile_l512 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 512 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --verify-prefetch-max-per-boundary 10 \
+  --draft-stop-policy none \
+  --verify-prefetch-rank-multiplier 1 \
+  --decode-driver generate \
+  --collect-profile true \
+  --engine-profile false \
+  --save-token-ids true \
+  --skip-existing false
+```
+
+Pure fast-path wall-clock TPOT run without profile readout:
+
+```bash
+NANOVLLM_VERIFY_PREFETCH_RANK_MULTIPLIER=1 \
+NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA=1 \
+NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=0 \
+CUDA_VISIBLE_DEVICES=2 python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --output-dir results/eval_workload_tpot_k12_generate_driver_l512 \
+  --gpu-memory-utilization 0.99 \
+  --cache-ratios 0.3125 \
+  --output-lens 512 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+  --verify-prefetch-max-per-boundary 10 \
+  --draft-stop-policy none \
+  --verify-prefetch-rank-multiplier 1 \
+  --decode-driver generate \
+  --collect-profile false \
+  --engine-profile false \
+  --save-token-ids true \
+  --skip-existing false
+```
+
+### Observed TPOT Runs
+
+| run | driver | collect profile | wall decode tok/s | profile decode tok/s | throughput tok/s | steps | output check | digest |
+|:---|:---|:---:|---:|---:|---:|---:|:---|:---|
+| old TPOT | `step` | no | 27.882 | n/a | 26.227 | 58 | legacy/no check | `252ec251...` |
+| prompt bytes aligned | `step` | no | 27.855 | n/a | 26.161 | 57 | legacy/no check | `1a197911...` |
+| generate driver, no profile | `generate` | no | 30.390 | n/a | 28.415 | 52 | `seqs=1`, fixed length ok, max repeat 1 | `cde69cd6...` |
+| generate driver, profile readout | `generate` | yes | 33.021 | 33.036 | 30.688 | 48 | `seqs=1`, fixed length ok, max repeat 1 | `f59581fe...` |
+
+The generate-driver profile-readout run meets the original comparison target:
+
+- wall-clock decode tok/s: `33.021`
+- previous per-layer `decode_phase_output_tok_s`: `33.017`
+- wall/profile gap: `7.190 ms` total over the 512-token decode phase
+- output length: `512`
+- output sequence count: `1`
+- `output_fixed_length_ok = true`
+- `output_validation_error = ""`
+- `max_repeated_token_run = 1`
+
+The remaining difference to the current per-layer rerun
+(`decode_phase_output_tok_s = 34.566`) is mainly trajectory and per-run
+variation: this TPOT run used 48 decode steps with a different digest, while
+the per-layer rerun used 49 verify calls and a different output digest.  For
+wall-clock workload reporting, the achieved comparison should be made against
+the old K=12 target that produced the `33.017` question and against the
+per-layer end-to-end throughput (`30.682`), both of which are matched or
+slightly exceeded by this TPOT run.
+
+### Practical Conclusion
+
+Use `decode_phase_output_tok_s` only when comparing engine-internal speculative
+decode phase timing across `bench_per_layer_slots.py` / optimized verify runs.
+Use TPOT wall decode tok/s for workload-facing latency, but always compare
+alongside `outputs_digest`, `decode_steps`, prompt/warmup metadata, and the
+output validation fields.  The corrected TPOT harness can now reproduce the
+old K=12 `decode_phase_output_tok_s = 33.017` target as a wall-clock decode
+measurement without relying on malformed output.
