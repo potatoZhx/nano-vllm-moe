@@ -497,27 +497,31 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         if self.expert_cache is None:
             raise RuntimeError("Heterogeneous MoE block is not initialized with expert cache.")
 
+        layer_idx = int(self.layer_idx)
         profile: dict[str, float] = {}
         t_route0 = perf_counter()
-        router_logits = self.gate(hidden_states)
-        router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
-        routing_weights, selected_experts = torch.topk(router_probs, self.num_selected, dim=-1)
-        reroute_active = self.execution_mode == "draft" and self.draft_reroute_policy is not None
-        selected_weights = routing_weights if reroute_active else None
-        if self.norm_topk_prob:
-            if reroute_active:
-                routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-            else:
-                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        with verify_op_event("moe.router_gate", layer_idx):
+            router_logits = self.gate(hidden_states)
+        with verify_op_event("moe.softmax_topk", layer_idx):
+            router_probs = nn.functional.softmax(router_logits, dim=1, dtype=torch.float32)
+            routing_weights, selected_experts = torch.topk(router_probs, self.num_selected, dim=-1)
+            reroute_active = self.execution_mode == "draft" and self.draft_reroute_policy is not None
+            selected_weights = routing_weights if reroute_active else None
+            if self.norm_topk_prob:
+                if reroute_active:
+                    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+                else:
+                    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
         profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
 
         if self.runtime_meta_recorder is not None:
-            self.runtime_meta_recorder.record_layer(
-                layer_idx=self.layer_idx,
-                selected_experts=selected_experts,
-                routing_weights=routing_weights,
-            )
+            with verify_op_event("moe.runtime_metadata_record", layer_idx):
+                self.runtime_meta_recorder.record_layer(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                )
 
         t_plan0 = perf_counter()
         execution_experts = selected_experts
@@ -527,23 +531,25 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 raise RuntimeError("Draft execution requires a draft scheduler.")
             if self.draft_reroute_policy is not None:
                 assert selected_weights is not None
-                execution_experts, execution_weights = self.draft_reroute_policy(
-                    router_logits,
-                    router_probs,
-                    selected_experts,
-                    selected_weights,
-                    hidden_states.dtype,
-                )
+                with verify_op_event("moe.draft_reroute", layer_idx):
+                    execution_experts, execution_weights = self.draft_reroute_policy(
+                        router_logits,
+                        router_probs,
+                        selected_experts,
+                        selected_weights,
+                        hidden_states.dtype,
+                    )
             if self.draft_feature_recorder is not None:
                 # Capture-safe per-layer routing for the acceptance predictor:
                 # original (target) vs draft-modified (reroute) top-k experts/weights.
-                self.draft_feature_recorder.record_layer(
-                    self.layer_idx,
-                    selected_experts,
-                    routing_weights,
-                    execution_experts,
-                    execution_weights,
-                )
+                with verify_op_event("moe.draft_feature_record", layer_idx):
+                    self.draft_feature_recorder.record_layer(
+                        self.layer_idx,
+                        selected_experts,
+                        routing_weights,
+                        execution_experts,
+                        execution_weights,
+                    )
             graph_safe_cpu = (
                 self.draft_cpu_graph_mode
                 and self.draft_top_c > 0
@@ -564,26 +570,27 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             use_graph_cpu_plan = graph_safe_cpu and (
                 self.draft_cuda_graph_cpu_backend == "fused_sync" or async_sidecar_enabled
             )
-            if self.draft_reroute_policy is not None:
-                plan = build_cached_draft_plan_gpu(
-                    layer_idx=self.layer_idx,
-                    selected_experts=execution_experts,
-                    routing_weights=execution_weights,
-                    expert_cache=self.expert_cache,
-                )
-            else:
-                plan = build_draft_plan_gpu(
-                    layer_idx=self.layer_idx,
-                    selected_experts=selected_experts,
-                    routing_weights=routing_weights,
-                    expert_cache=self.expert_cache,
-                    draft_scheduler=self.draft_scheduler,
-                    num_experts=self.num_experts,
-                    top_c=self.draft_top_c if use_graph_cpu_plan else 0,
-                    graph_safe_cpu=use_graph_cpu_plan,
-                    graph_async_cpu=(self.draft_cuda_graph_cpu_backend == "fused" and async_sidecar_enabled),
-                    active_token_mask=active_token_mask if use_graph_cpu_plan else None,
-                )
+            with verify_op_event("moe.plan", layer_idx):
+                if self.draft_reroute_policy is not None:
+                    plan = build_cached_draft_plan_gpu(
+                        layer_idx=self.layer_idx,
+                        selected_experts=execution_experts,
+                        routing_weights=execution_weights,
+                        expert_cache=self.expert_cache,
+                    )
+                else:
+                    plan = build_draft_plan_gpu(
+                        layer_idx=self.layer_idx,
+                        selected_experts=selected_experts,
+                        routing_weights=routing_weights,
+                        expert_cache=self.expert_cache,
+                        draft_scheduler=self.draft_scheduler,
+                        num_experts=self.num_experts,
+                        top_c=self.draft_top_c if use_graph_cpu_plan else 0,
+                        graph_safe_cpu=use_graph_cpu_plan,
+                        graph_async_cpu=(self.draft_cuda_graph_cpu_backend == "fused" and async_sidecar_enabled),
+                        active_token_mask=active_token_mask if use_graph_cpu_plan else None,
+                    )
         elif self.execution_mode == "verify":
             # ── pre-transfer measurement (shared across all verify miss policies) ──
             _flat_sel = selected_experts.reshape(-1)
@@ -661,25 +668,26 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             else:
                 profile["activated_expert_set_size_sum"] = float(torch.unique(flat_selected).numel())
 
-        out = heterogeneous_moe_forward(
-            hidden_states=hidden_states,
-            selected_experts=execution_experts,
-            routing_weights=execution_weights,
-            expert_cache=self.expert_cache,
-            cpu_expert_pool=self.cpu_expert_pool,
-            act_fn=self.act_fn,
-            plan=plan,
-            cpu_expert_execution_enabled=self.cpu_expert_execution_enabled,
-            cpu_expert_parallel_mode=self.cpu_expert_parallel_mode,
-            cpu_expert_num_threads=self.cpu_expert_num_threads,
-            cpu_gpu_parallel_execution_enabled=self.cpu_gpu_parallel_execution_enabled,
-            cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
-            cpu_gpu_parallel_stream=self._get_parallel_stream(),
-            cpu_backend=self.cpu_backend,
-            cpu_backend_min_routes=self.cpu_expert_packed_min_routes,
-            gpu_fallback_workspace=self.gpu_fallback_workspace,
-            profile=profile,
-        )
+        with verify_op_event("moe.heterogeneous_forward", layer_idx):
+            out = heterogeneous_moe_forward(
+                hidden_states=hidden_states,
+                selected_experts=execution_experts,
+                routing_weights=execution_weights,
+                expert_cache=self.expert_cache,
+                cpu_expert_pool=self.cpu_expert_pool,
+                act_fn=self.act_fn,
+                plan=plan,
+                cpu_expert_execution_enabled=self.cpu_expert_execution_enabled,
+                cpu_expert_parallel_mode=self.cpu_expert_parallel_mode,
+                cpu_expert_num_threads=self.cpu_expert_num_threads,
+                cpu_gpu_parallel_execution_enabled=self.cpu_gpu_parallel_execution_enabled,
+                cpu_gpu_parallel_min_cpu_route_ratio=self.cpu_gpu_parallel_min_cpu_route_ratio,
+                cpu_gpu_parallel_stream=self._get_parallel_stream(),
+                cpu_backend=self.cpu_backend,
+                cpu_backend_min_routes=self.cpu_expert_packed_min_routes,
+                gpu_fallback_workspace=self.gpu_fallback_workspace,
+                profile=profile,
+            )
         if (
             "cpu_route_ratio_sum" not in profile
             or "cpu_weight_mass_ratio_sum" not in profile
@@ -877,18 +885,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = residual + hidden_states
+        layer_idx = int(self.layer_idx)
+        with verify_op_event("layer.total", layer_idx):
+            residual = hidden_states
+            with verify_op_event("layer.input_layernorm", layer_idx):
+                hidden_states = self.input_layernorm(hidden_states)
+            with verify_op_event("layer.attention", layer_idx):
+                hidden_states = self.self_attn(positions, hidden_states)
+            with verify_op_event("layer.attn_residual_add", layer_idx):
+                hidden_states = residual + hidden_states
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+            residual = hidden_states
+            with verify_op_event("layer.post_attention_layernorm", layer_idx):
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            with verify_op_event("layer.moe", layer_idx):
+                hidden_states = self.mlp(hidden_states)
+            with verify_op_event("layer.moe_residual_add", layer_idx):
+                hidden_states = residual + hidden_states
+            return hidden_states
 
     def forward_verify_prefix(
         self,

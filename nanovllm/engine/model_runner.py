@@ -162,6 +162,7 @@ class ModelRunner:
         self._verify_layer_active_timing: dict[int, object] = {}
         self._dual_queue_segment_timing_events: list[tuple[str, int, object, object]] = []
         self._verify_op_event_records: list[dict[str, object]] = []
+        self._draft_op_event_records: list[dict[str, object]] = []
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
 
@@ -1256,6 +1257,7 @@ class ModelRunner:
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
             out["verify_op_event_records"] = list(getattr(self, "_verify_op_event_records", []))
+            out["draft_op_event_records"] = list(getattr(self, "_draft_op_event_records", []))
         decode_count = int(self._profile.get("decode_count", 0))
         graph_hit_count = int(self._profile.get("graph_hit_count", 0))
         out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
@@ -1290,6 +1292,7 @@ class ModelRunner:
                 self._profile.clear()
                 self._prefetch_trace_events.clear()
                 self._verify_op_event_records.clear()
+                self._draft_op_event_records.clear()
             pending = getattr(self, "_pending_prefetch_metadata", None)
             if pending is not None:
                 pending.clear()
@@ -1578,6 +1581,8 @@ class ModelRunner:
             self._flush_pending_prefetch_metadata(block=True)
 
     def _replay_draft_segment_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        from nanovllm.utils.verify_op_events import draft_op_event_enabled
+
         bs = input_ids.size(0)
         context = get_context()
         bucket = next(x for x in self.draft_graph_bs if x >= bs)
@@ -1596,6 +1601,7 @@ class ModelRunner:
         step_id = int(getattr(self, "_active_draft_prefetch_step_id", -1))
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         dual_queue = self._dual_queue_prefetch_enabled()
+        op_event_profile = draft_op_event_enabled()
         for segment_id, (graph, (layer_start, layer_end)) in enumerate(
             zip(graphs, boundaries, strict=True)
         ):
@@ -1615,6 +1621,20 @@ class ModelRunner:
                 with self._prefetch_profile_lock:
                     self._profile["draft_segment_graph_replay_count"] += 1
                     self._profile["draft_segment_graph_replay_enqueue_ms"] += segment_enqueue_ms
+            if op_event_profile:
+                sync_t0 = perf_counter()
+                torch.cuda.synchronize()
+                sync_ms = (perf_counter() - sync_t0) * 1000.0
+                if self.profile_enabled and self.rank == 0:
+                    with self._prefetch_profile_lock:
+                        self._profile["draft_op_event_sync_count"] += 1.0
+                        self._profile["draft_op_event_sync_ms"] += sync_ms
+                self._collect_draft_op_event_timings(
+                    bucket=int(bucket),
+                    segment_id=int(segment_id),
+                    step_id=int(step_id),
+                    token_count=int(bs),
+                )
             if step_id >= 0:
                 self._enqueue_draft_segment_metadata(
                     step_id=step_id,
@@ -1990,10 +2010,14 @@ class ModelRunner:
         self._verify_layer_timing_events = remaining
 
     def _start_dual_queue_segment_timing(self):
-        force_timing = os.getenv(
-            "NANOVLLM_SEGMENT_CUDA_EVENT_TIMING",
-            os.getenv("NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING", ""),
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        force_timing = any(
+            os.getenv(key, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+            for key in (
+                "NANOVLLM_SEGMENT_CUDA_EVENT_TIMING",
+                "NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING",
+                "NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING",
+            )
+        )
         if not self._dual_queue_prefetch_enabled() and not force_timing:
             return None
         if torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
@@ -2087,6 +2111,50 @@ class ModelRunner:
                     self._profile[f"verify_op_layer_{layer_idx}_{safe_label}_count"] += 1.0
                     self._profile[f"verify_op_layer_{layer_idx}_{safe_label}_ms"] += elapsed_ms
                 self._verify_op_event_records.append(
+                    {
+                        "step_id": int(step_id),
+                        "bucket": int(bucket),
+                        "segment": int(segment_id),
+                        "token_count": int(token_count),
+                        "layer_idx": int(layer_idx),
+                        "label": label,
+                        "elapsed_ms": elapsed_ms,
+                        "error": str(error or ""),
+                    }
+                )
+
+    def _collect_draft_op_event_timings(
+        self,
+        *,
+        bucket: int,
+        segment_id: int,
+        step_id: int,
+        token_count: int,
+    ) -> None:
+        from nanovllm.utils.verify_op_events import collect_verify_op_events, draft_op_event_enabled
+
+        if not draft_op_event_enabled() or self.rank != 0:
+            return
+        rows = collect_verify_op_events(int(bucket), int(segment_id), phase="draft")
+        if not rows:
+            return
+        with self._prefetch_profile_lock:
+            for row in rows:
+                label = str(row["label"])
+                layer_idx = int(row["layer_idx"])
+                elapsed_ms = float(row["elapsed_ms"])
+                safe_label = "".join(ch if ch.isalnum() else "_" for ch in label)
+                error = row.get("error")
+                if error:
+                    self._profile["draft_op_event_error_count"] += 1.0
+                self._profile["draft_op_event_count"] += 1.0
+                self._profile["draft_op_event_ms"] += elapsed_ms
+                self._profile[f"draft_op_{safe_label}_count"] += 1.0
+                self._profile[f"draft_op_{safe_label}_ms"] += elapsed_ms
+                if layer_idx >= 0:
+                    self._profile[f"draft_op_layer_{layer_idx}_{safe_label}_count"] += 1.0
+                    self._profile[f"draft_op_layer_{layer_idx}_{safe_label}_ms"] += elapsed_ms
+                self._draft_op_event_records.append(
                     {
                         "step_id": int(step_id),
                         "bucket": int(bucket),
@@ -2555,6 +2623,7 @@ class ModelRunner:
         ]
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         draft_cpu_graph = self._can_use_draft_cpu_cudagraph()
+        from nanovllm.utils.verify_op_events import verify_op_capture_context
 
         self._set_speculative_execution_mode("draft")
         if hasattr(self.model, "set_draft_cpu_graph_mode"):
@@ -2600,25 +2669,26 @@ class ModelRunner:
                         torch.cuda.synchronize()
                         if hasattr(self.model, "check_draft_cpu_graph_errors"):
                             self.model.check_draft_cpu_graph_errors()
-                    with torch.cuda.graph(graph, self.draft_graph_pool):
-                        if segment_idx == 0:
-                            segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
-                                input_ids[:bs],
-                                None,
-                                positions[:bs],
-                                start_layer=int(layer_start),
-                                end_layer=int(layer_end),
-                                apply_norm=apply_norm,
-                            )
-                        else:
-                            segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
-                                None,
-                                segment_outputs[segment_idx - 1][:bs],
-                                positions[:bs],
-                                start_layer=int(layer_start),
-                                end_layer=int(layer_end),
-                                apply_norm=apply_norm,
-                            )
+                    with verify_op_capture_context(bs, segment_idx, phase="draft"):
+                        with torch.cuda.graph(graph, self.draft_graph_pool):
+                            if segment_idx == 0:
+                                segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                                    input_ids[:bs],
+                                    None,
+                                    positions[:bs],
+                                    start_layer=int(layer_start),
+                                    end_layer=int(layer_end),
+                                    apply_norm=apply_norm,
+                                )
+                            else:
+                                segment_outputs[segment_idx][:bs] = self.model.forward_draft_segment(
+                                    None,
+                                    segment_outputs[segment_idx - 1][:bs],
+                                    positions[:bs],
+                                    start_layer=int(layer_start),
+                                    end_layer=int(layer_end),
+                                    apply_norm=apply_norm,
+                                )
                     if self.draft_graph_pool is None:
                         self.draft_graph_pool = graph.pool()
                     graphs.append(graph)

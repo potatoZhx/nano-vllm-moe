@@ -10,6 +10,7 @@ import torch
 
 @dataclass
 class VerifyOpEvent:
+    phase: str
     bucket: int
     segment: int
     label: str
@@ -18,12 +19,33 @@ class VerifyOpEvent:
     end: torch.cuda.Event
 
 
-_capture_stack: list[tuple[int, int]] = []
-_events_by_graph: dict[tuple[int, int], list[VerifyOpEvent]] = {}
+_capture_stack: list[tuple[str, int, int]] = []
+_events_by_graph: dict[tuple[str, int, int], list[VerifyOpEvent]] = {}
 
 
 def verify_op_event_enabled() -> bool:
-    return os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
+    return (
+        os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        or os.getenv("NANOVLLM_DRAFT_OP_EVENT_TIMING", "").strip().lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    )
+
+
+def draft_op_event_enabled() -> bool:
+    return os.getenv("NANOVLLM_DRAFT_OP_EVENT_TIMING", "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -33,11 +55,21 @@ def verify_op_event_enabled() -> bool:
 
 
 @contextmanager
-def verify_op_capture_context(bucket: int, segment: int) -> Iterator[None]:
-    if not verify_op_event_enabled():
+def verify_op_capture_context(bucket: int, segment: int, phase: str = "verify") -> Iterator[None]:
+    if str(phase) == "draft":
+        enabled = draft_op_event_enabled()
+    else:
+        enabled = os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    if not enabled:
         yield
         return
-    _capture_stack.append((int(bucket), int(segment)))
+    _capture_stack.append((str(phase), int(bucket), int(segment)))
     try:
         yield
     finally:
@@ -56,7 +88,7 @@ def verify_op_event(label: str, layer_idx: int = -1):
             yield
         return
 
-    bucket, segment = _capture_stack[-1]
+    phase, bucket, segment = _capture_stack[-1]
     start = torch.cuda.Event(enable_timing=True, external=True)
     end = torch.cuda.Event(enable_timing=True, external=True)
     start.record(torch.cuda.current_stream())
@@ -64,8 +96,9 @@ def verify_op_event(label: str, layer_idx: int = -1):
         yield
     finally:
         end.record(torch.cuda.current_stream())
-        _events_by_graph.setdefault((bucket, segment), []).append(
+        _events_by_graph.setdefault((phase, bucket, segment), []).append(
             VerifyOpEvent(
+                phase=str(phase),
                 bucket=int(bucket),
                 segment=int(segment),
                 label=str(label),
@@ -76,8 +109,12 @@ def verify_op_event(label: str, layer_idx: int = -1):
         )
 
 
-def collect_verify_op_events(bucket: int, segment: int) -> list[dict[str, float | int | str]]:
-    events = _events_by_graph.get((int(bucket), int(segment)), [])
+def collect_verify_op_events(
+    bucket: int,
+    segment: int,
+    phase: str = "verify",
+) -> list[dict[str, float | int | str]]:
+    events = _events_by_graph.get((str(phase), int(bucket), int(segment)), [])
     rows: list[dict[str, float | int | str]] = []
     for event in events:
         try:
@@ -85,6 +122,7 @@ def collect_verify_op_events(bucket: int, segment: int) -> list[dict[str, float 
         except Exception as exc:
             rows.append(
                 {
+                    "phase": str(event.phase),
                     "bucket": int(event.bucket),
                     "segment": int(event.segment),
                     "layer_idx": int(event.layer_idx),
@@ -96,6 +134,7 @@ def collect_verify_op_events(bucket: int, segment: int) -> list[dict[str, float 
             continue
         rows.append(
             {
+                "phase": str(event.phase),
                 "bucket": int(event.bucket),
                 "segment": int(event.segment),
                 "layer_idx": int(event.layer_idx),

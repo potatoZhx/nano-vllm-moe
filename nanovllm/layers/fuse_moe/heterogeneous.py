@@ -12,6 +12,7 @@ from nanovllm.expert.placement import MoEExecutionPlan, build_moe_execution_plan
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend, get_cpu_expert_weights
 from nanovllm.layers.fuse_moe.functional import fused_moe_linear
+from nanovllm.utils.verify_op_events import verify_op_event
 
 
 class GpuFallbackWorkspace:
@@ -65,11 +66,13 @@ def heterogeneous_moe_forward(
     profile: dict | None = None,
 ) -> torch.Tensor:
     """Run MoE with GPU cached experts + fallback path for uncached experts."""
+    layer_idx = int(getattr(expert_cache, "layer_idx", -1))
     top_k = routing_weights.size(1)
     flat_selected = selected_experts.reshape(-1)
     flat_weights = routing_weights.reshape(-1)
 
-    output = torch.zeros_like(hidden_states)
+    with verify_op_event("moe.output_zero", layer_idx):
+        output = torch.zeros_like(hidden_states)
     if plan is None:
         plan = build_moe_execution_plan(selected_experts, expert_cache)
 
@@ -359,12 +362,13 @@ def heterogeneous_moe_forward(
 
         if not has_cpu_work:
             t_scatter0 = perf_counter()
-            _accumulate_gpu_routes_deterministic(
-                output=output,
-                gpu_route_indices=gpu_route_indices_save,
-                gpu_expert_out=gpu_expert_out_save,
-                top_k=top_k,
-            )
+            with verify_op_event("moe.accumulate", layer_idx):
+                _accumulate_gpu_routes_deterministic(
+                    output=output,
+                    gpu_route_indices=gpu_route_indices_save,
+                    gpu_expert_out=gpu_expert_out_save,
+                    top_k=top_k,
+                )
             _prof_add(profile, "scatter_ms", perf_counter() - t_scatter0)
 
     # CPU path for uncached experts.
@@ -582,17 +586,22 @@ def _run_gpu_cached_expert_path(
     expert_cache: LayerExpertCache,
     act_fn: SiluAndMul,
 ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    layer_idx = int(getattr(expert_cache, "layer_idx", -1))
     t_gather0 = perf_counter()
-    gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
-    gpu_hidden = hidden_states[gpu_token_indices]
-    gpu_weights = flat_weights.index_select(0, gpu_route_indices)
+    with verify_op_event("moe.gpu_gather", layer_idx):
+        gpu_token_indices = torch.div(gpu_route_indices, top_k, rounding_mode="floor")
+        gpu_hidden = hidden_states[gpu_token_indices]
+        gpu_weights = flat_weights.index_select(0, gpu_route_indices)
     gather_ms = (perf_counter() - t_gather0) * 1000.0
 
     gate_up_buffer, down_buffer = expert_cache.get_layer_buffers()
     t_comp0 = perf_counter()
-    gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, gpu_m_sizes)
-    gpu_expert_out = fused_moe_linear(act_fn(gate_up), down_buffer, gpu_m_sizes)
-    gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
+    with verify_op_event("moe.gpu_gate_up", layer_idx):
+        gate_up = fused_moe_linear(gpu_hidden, gate_up_buffer, gpu_m_sizes)
+    with verify_op_event("moe.gpu_down", layer_idx):
+        gpu_expert_out = fused_moe_linear(act_fn(gate_up), down_buffer, gpu_m_sizes)
+    with verify_op_event("moe.gpu_weight_mul", layer_idx):
+        gpu_expert_out.mul_(gpu_weights.unsqueeze(-1))
     compute_ms = (perf_counter() - t_comp0) * 1000.0
     return gpu_token_indices, gpu_expert_out, gather_ms, compute_ms
 
