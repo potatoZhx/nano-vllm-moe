@@ -58,10 +58,24 @@ class SpeculativeEngine:
         self.draft_stop_policy = str(getattr(config, "draft_stop_policy", "none")).strip().lower()
         self.draft_tpot_td_ms = float(getattr(config, "draft_tpot_td_ms", 19.0))
         self.draft_tpot_tv_ms = float(getattr(config, "draft_tpot_tv_ms", 80.0))
+        self.draft_tpot_cost_model = str(getattr(config, "draft_tpot_cost_model", "static")).strip().lower()
+        self.draft_tpot_history_alpha = float(getattr(config, "draft_tpot_history_alpha", 0.2))
+        self.draft_tpot_min_steps = int(getattr(config, "draft_tpot_min_steps", 0))
+        self.draft_tpot_stop_margin = float(getattr(config, "draft_tpot_stop_margin", 0.0))
+        self.draft_tpot_short_verify_penalty_ms = float(
+            getattr(config, "draft_tpot_short_verify_penalty_ms", 0.0)
+        )
+        self.draft_tpot_verify_cost_floor_ms = float(
+            getattr(config, "draft_tpot_verify_cost_floor_ms", 0.0)
+        )
+        self.draft_tpot_stop_rule = str(getattr(config, "draft_tpot_stop_rule", "first_increase")).strip().lower()
         self.profile_enabled = getattr(config, "spec_profile", False)
         self._profile = defaultdict(float)
         self._draft_steps_per_step: list[int] = []
         self._step_traces: list[dict] = []
+        self._tpot_draft_ms_ema: float | None = None
+        self._tpot_verify_ms_ema: float | None = None
+        self._tpot_verify_ms_by_len: dict[int, float] = {}
 
     def get_profile(self, reset: bool = False) -> dict:
         out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
@@ -78,13 +92,72 @@ class SpeculativeEngine:
         if verify_calls > 0:
             out["verify_forward_ms"] = float(out.get("run_verify_infer_ms_total", 0.0) / verify_calls)
 
+        if self._tpot_draft_ms_ema is not None:
+            out["draft_tpot_draft_ms_ema"] = float(self._tpot_draft_ms_ema)
+        if self._tpot_verify_ms_ema is not None:
+            out["draft_tpot_verify_ms_ema"] = float(self._tpot_verify_ms_ema)
+        out["draft_tpot_verify_ms_by_len"] = dict(self._tpot_verify_ms_by_len)
         out["draft_steps_per_step"] = list(self._draft_steps_per_step)
         out["step_traces"] = deepcopy(self._step_traces)
         if reset:
             self._profile.clear()
             self._draft_steps_per_step.clear()
             self._step_traces.clear()
+            self._tpot_draft_ms_ema = None
+            self._tpot_verify_ms_ema = None
+            self._tpot_verify_ms_by_len.clear()
         return out
+
+    def _update_ema(self, current: float | None, value: float) -> float:
+        alpha = min(1.0, max(1e-6, self.draft_tpot_history_alpha))
+        value = float(value)
+        return value if current is None else (1.0 - alpha) * float(current) + alpha * value
+
+    def _record_tpot_draft_cost(self, draft_ms: float) -> None:
+        if self.draft_tpot_cost_model != "history":
+            return
+        self._tpot_draft_ms_ema = self._update_ema(self._tpot_draft_ms_ema, max(0.0, float(draft_ms)))
+
+    def _record_tpot_verify_cost(self, verify_tokens: int, verify_ms: float) -> None:
+        if self.draft_tpot_cost_model != "history":
+            return
+        verify_tokens = max(1, int(verify_tokens))
+        verify_ms = max(0.0, float(verify_ms))
+        self._tpot_verify_ms_ema = self._update_ema(self._tpot_verify_ms_ema, verify_ms)
+        self._tpot_verify_ms_by_len[verify_tokens] = self._update_ema(
+            self._tpot_verify_ms_by_len.get(verify_tokens),
+            verify_ms,
+        )
+
+    def _tpot_draft_cost_ms(self) -> float:
+        if self.draft_tpot_cost_model == "history" and self._tpot_draft_ms_ema is not None:
+            return max(1e-6, float(self._tpot_draft_ms_ema))
+        return max(1e-6, self.draft_tpot_td_ms)
+
+    def _tpot_verify_cost_ms(self, draft_len: int) -> float:
+        if self.draft_tpot_cost_model != "history":
+            return max(1e-6, self.draft_tpot_tv_ms)
+        verify_len = max(1, int(draft_len) + 1)
+        observed = self._tpot_verify_ms_by_len.get(verify_len)
+        if observed is None:
+            observed = self._tpot_verify_ms_ema
+        base = float(observed) if observed is not None else self.draft_tpot_tv_ms
+        if self.draft_tpot_verify_cost_floor_ms > 0.0:
+            base = max(base, self.draft_tpot_verify_cost_floor_ms)
+        # Short verify segments have worse CPU expert batching and expose more
+        # graph-outside metadata work; model that as an additive opportunity cost.
+        full_draft = max(0, int(self.max_draft_tokens))
+        missing_draft = max(0, full_draft - int(draft_len))
+        base += self.draft_tpot_short_verify_penalty_ms * float(missing_draft)
+        return max(1e-6, base)
+
+    def _expected_tpot_ms_for_len(self, step_alphas, num_seqs: int, draft_len: int) -> float:
+        return expected_tpot_ms(
+            step_alphas,
+            num_seqs,
+            self._tpot_draft_cost_ms(),
+            self._tpot_verify_cost_ms(draft_len),
+        )
 
     def _budget_draft_steps(self, seqs) -> int:
         limits = [self.max_draft_tokens]
@@ -156,14 +229,18 @@ class SpeculativeEngine:
         # TPOT-policy running state (cost-aware dynamic draft length).
         tpot_alpha_history: list[list[float]] = []   # per-step per-seq alpha
         # T(0): no draft, just the guaranteed verify token (one per seq).
-        tpot_prev = expected_tpot_ms([], len(seqs), self.draft_tpot_td_ms, self.draft_tpot_tv_ms)
+        tpot_prev = self._expected_tpot_ms_for_len([], len(seqs), 0)
+        tpot_best = tpot_prev
         tpot_series: list[float] = []
+        tpot_cost_series: list[dict[str, float]] = []
 
         t0 = perf_counter()
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
             draft_result = self.model_runner.call("run_draft", seqs, return_logits)
-            self._profile["run_draft_infer_ms_total"] += (perf_counter() - infer_t0) * 1000.0
+            draft_call_ms = (perf_counter() - infer_t0) * 1000.0
+            self._profile["run_draft_infer_ms_total"] += draft_call_ms
+            self._record_tpot_draft_cost(draft_call_ms)
             draft_logits = None
             step_alpha = None
             if isinstance(draft_result, tuple):
@@ -198,17 +275,28 @@ class SpeculativeEngine:
                         stop = True
                 elif self.draft_stop_policy == "tpot":
                     tpot_alpha_history.append([float(a) for a in step_alpha])
-                    tpot_now = expected_tpot_ms(
-                        tpot_alpha_history, len(seqs),
-                        self.draft_tpot_td_ms, self.draft_tpot_tv_ms,
+                    candidate_len = len(tpot_alpha_history)
+                    tpot_now = self._expected_tpot_ms_for_len(
+                        tpot_alpha_history, len(seqs), candidate_len,
                     )
                     tpot_series.append(tpot_now)
-                    # T(k) is unimodal in k; stop once it stops decreasing.
-                    if tpot_now > tpot_prev:
+                    tpot_cost_series.append({
+                        "draft_ms": float(self._tpot_draft_cost_ms()),
+                        "verify_ms": float(self._tpot_verify_cost_ms(candidate_len)),
+                    })
+                    can_stop = candidate_len >= max(0, self.draft_tpot_min_steps)
+                    if self.draft_tpot_stop_rule == "best_margin":
+                        threshold = tpot_best * (1.0 + self.draft_tpot_stop_margin)
+                        should_stop = tpot_now > threshold
+                        tpot_best = min(tpot_best, tpot_now)
+                    else:
+                        threshold = tpot_prev * (1.0 + self.draft_tpot_stop_margin)
+                        should_stop = tpot_now > threshold
+                        if not (can_stop and should_stop):
+                            tpot_prev = tpot_now
+                    if can_stop and should_stop:
                         self._profile["draft_tpot_early_stop_count"] += 1
                         stop = True
-                    else:
-                        tpot_prev = tpot_now
             if stop:
                 break
 
@@ -260,6 +348,7 @@ class SpeculativeEngine:
         infer_t0 = perf_counter()
         verify_results = self.model_runner.call("run_verify", seqs, verify_lengths, return_logits)
         infer_ms = (perf_counter() - infer_t0) * 1000.0
+        self._record_tpot_verify_cost(sum(verify_lengths), infer_ms)
         self._profile["verify_ms"] += infer_ms
         self._profile["run_verify_infer_ms_total"] += infer_ms
         self._profile["run_verify_calls"] += 1
@@ -324,6 +413,9 @@ class SpeculativeEngine:
                     predicted_alpha = draft_alpha_map.get(seq.seq_id)
                     if predicted_alpha:
                         seq_trace["predicted_alpha"] = list(predicted_alpha)
+                    accept_probs = accept_result.get("accept_probs")
+                    if accept_probs is not None:
+                        seq_trace["accept_probs"] = [float(x) for x in accept_probs]
                     break
 
             self.scheduler.accept_draft_kv(seq, keep_after_start)
@@ -353,6 +445,9 @@ class SpeculativeEngine:
         step_trace["draft_stop_policy"] = self.draft_stop_policy
         if tpot_series:
             step_trace["draft_tpot"] = list(tpot_series)
+            step_trace["draft_tpot_costs"] = list(tpot_cost_series)
+            step_trace["draft_tpot_cost_model"] = self.draft_tpot_cost_model
+            step_trace["draft_tpot_stop_rule"] = self.draft_tpot_stop_rule
         self._step_traces.append(step_trace)
 
         return final_token_ids

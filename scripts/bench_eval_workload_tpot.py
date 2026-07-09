@@ -984,6 +984,10 @@ def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> 
         "spec_run_draft_infer_ms_total",
         "spec_run_verify_infer_ms_total",
         "spec_draft_steps_total",
+        "spec_draft_tpot_early_stop_count",
+        "spec_draft_alpha_early_stop_count",
+        "spec_draft_tpot_draft_ms_ema",
+        "spec_draft_tpot_verify_ms_ema",
         "spec_accepted_tokens_total",
         "spec_draft_tokens_total",
         "spec_verify_trace_tokens_total",
@@ -1009,6 +1013,18 @@ def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> 
         "model_metadata_offload_verify_count",
         "model_metadata_offload_verify_ms",
         "model_realized_cpu_expert_count",
+        "model_verify_kt_hybrid_segment_graph_replay_count",
+        "model_verify_cpu_routes_sum",
+        "model_verify_realized_cpu_expert_count_sum",
+        "model_verify_pre_transfer_cache_miss_sum",
+        "model_verify_pre_transfer_active_count_sum",
+        "model_run_verify_kt_hybrid_metadata_wait_ms",
+        "model_run_verify_kt_hybrid_metadata_collect_ms",
+        "model_run_verify_kt_hybrid_metadata_observe_ms",
+        "model_verify_segment_graph_replay_enqueue_ms",
+        "model_verify_tpot_dynamic_budget_applied_count",
+        "model_verify_tpot_dynamic_budget_token_sum",
+        "model_verify_tpot_dynamic_budget_value_sum",
         "draft_forward_ms",
         "verify_forward_ms",
         "draft_ms",
@@ -1020,6 +1036,8 @@ def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> 
         value = profile.get(key)
         if isinstance(value, (bool, int, float)):
             metrics[f"profile_{key}"] = value
+        elif key.endswith("_count"):
+            metrics[f"profile_{key}"] = 0
 
     generated = int(result.get("generated_output_tokens", 0) or 0)
     wall_decode_ms = float(result.get("decode_sec", 0.0) or 0.0) * 1000.0
@@ -1084,6 +1102,13 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         draft_stop_policy=str(args.draft_stop_policy),
         draft_tpot_td_ms=float(args.draft_tpot_td_ms),
         draft_tpot_tv_ms=float(args.draft_tpot_tv_ms),
+        draft_tpot_cost_model=str(args.draft_tpot_cost_model),
+        draft_tpot_history_alpha=float(args.draft_tpot_history_alpha),
+        draft_tpot_min_steps=int(args.draft_tpot_min_steps),
+        draft_tpot_stop_margin=float(args.draft_tpot_stop_margin),
+        draft_tpot_short_verify_penalty_ms=float(args.draft_tpot_short_verify_penalty_ms),
+        draft_tpot_verify_cost_floor_ms=float(args.draft_tpot_verify_cost_floor_ms),
+        draft_tpot_stop_rule=str(args.draft_tpot_stop_rule),
         cpu_expert_execution_enabled=True,
         cpu_expert_pin_memory=True,
         cpu_expert_backend="kt_direct",
@@ -1109,7 +1134,7 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         rank_guard_ema_alpha=float(args.rank_guard_ema_alpha),
         prefetch_strategy="history_window",
         prefetch_runtime_mode="draft_segment_indexed",
-        prefetch_runtime_kind="predictive",
+        prefetch_runtime_kind=str(args.prefetch_runtime_kind),
         dual_queue_segment_size=segment_size,
         dual_queue_ground_truth_decay=float(args.dual_queue_ground_truth_decay),
         dual_queue_ground_truth_ttl_rounds=int(args.dual_queue_ground_truth_ttl_rounds),
@@ -1151,6 +1176,11 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         verify_prefetch_visible_budget_ms=float(args.verify_prefetch_visible_budget_ms),
         verify_prefetch_min_per_boundary=0,
         verify_prefetch_max_per_boundary=int(args.verify_prefetch_max_per_boundary),
+        verify_prefetch_tpot_dynamic_budget_enabled=bool(args.verify_prefetch_tpot_dynamic_budget_enabled),
+        verify_prefetch_tpot_dynamic_budget_token_threshold=int(
+            args.verify_prefetch_tpot_dynamic_budget_token_threshold
+        ),
+        verify_prefetch_tpot_dynamic_budget_small=int(args.verify_prefetch_tpot_dynamic_budget_small),
     )
 
 
@@ -1449,11 +1479,27 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "profile_spec_verify_ms",
         "profile_spec_run_draft_calls",
         "profile_spec_run_verify_calls",
+        "profile_spec_draft_tpot_early_stop_count",
+        "profile_spec_draft_alpha_early_stop_count",
+        "profile_spec_draft_tpot_draft_ms_ema",
+        "profile_spec_draft_tpot_verify_ms_ema",
         "profile_draft_forward_ms",
         "profile_verify_forward_ms",
         "profile_model_graph_hit_rate",
         "profile_model_graph_replay_count",
         "profile_model_realized_cpu_expert_count",
+        "profile_model_verify_kt_hybrid_segment_graph_replay_count",
+        "profile_model_verify_cpu_routes_sum",
+        "profile_model_verify_realized_cpu_expert_count_sum",
+        "profile_model_verify_pre_transfer_cache_miss_sum",
+        "profile_model_verify_pre_transfer_active_count_sum",
+        "profile_model_run_verify_kt_hybrid_metadata_wait_ms",
+        "profile_model_run_verify_kt_hybrid_metadata_collect_ms",
+        "profile_model_run_verify_kt_hybrid_metadata_observe_ms",
+        "profile_model_verify_segment_graph_replay_enqueue_ms",
+        "profile_model_verify_tpot_dynamic_budget_applied_count",
+        "profile_model_verify_tpot_dynamic_budget_token_sum",
+        "profile_model_verify_tpot_dynamic_budget_value_sum",
         "profile_model_metadata_offload_ms",
         "profile_model_prefetch_wait_ms",
         "profile_json",
@@ -1658,8 +1704,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int),
             "segment_sizes": _parse_csv(args.segment_sizes, int),
             "draft_stop_policy": str(args.draft_stop_policy),
+            "draft_tpot_td_ms": float(args.draft_tpot_td_ms),
+            "draft_tpot_tv_ms": float(args.draft_tpot_tv_ms),
+            "draft_tpot_cost_model": str(args.draft_tpot_cost_model),
+            "draft_tpot_history_alpha": float(args.draft_tpot_history_alpha),
+            "draft_tpot_min_steps": int(args.draft_tpot_min_steps),
+            "draft_tpot_stop_margin": float(args.draft_tpot_stop_margin),
+            "draft_tpot_short_verify_penalty_ms": float(args.draft_tpot_short_verify_penalty_ms),
+            "draft_tpot_verify_cost_floor_ms": float(args.draft_tpot_verify_cost_floor_ms),
+            "draft_tpot_stop_rule": str(args.draft_tpot_stop_rule),
             "verify_prefetch_max_per_boundary": int(
                 args.verify_prefetch_max_per_boundary
+            ),
+            "verify_prefetch_tpot_dynamic_budget_enabled": bool(
+                args.verify_prefetch_tpot_dynamic_budget_enabled
+            ),
+            "verify_prefetch_tpot_dynamic_budget_token_threshold": int(
+                args.verify_prefetch_tpot_dynamic_budget_token_threshold
+            ),
+            "verify_prefetch_tpot_dynamic_budget_small": int(
+                args.verify_prefetch_tpot_dynamic_budget_small
             ),
             "verify_prefetch_rank_multiplier": (
                 int(args.verify_prefetch_rank_multiplier)
@@ -1668,6 +1732,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "rank_guard_threshold": float(args.rank_guard_threshold),
             "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
+            "prefetch_runtime_kind": str(args.prefetch_runtime_kind),
             "predictive_phase1_budget": int(args.predictive_phase1_budget),
             "prefetch_history_decay": float(args.prefetch_history_decay),
             "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
@@ -1824,10 +1889,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--draft-tpot-td-ms", type=float, default=19.0)
     parser.add_argument("--draft-tpot-tv-ms", type=float, default=80.0)
+    parser.add_argument(
+        "--draft-tpot-cost-model",
+        choices=["static", "history"],
+        default="static",
+    )
+    parser.add_argument("--draft-tpot-history-alpha", type=float, default=0.2)
+    parser.add_argument("--draft-tpot-min-steps", type=int, default=0)
+    parser.add_argument("--draft-tpot-stop-margin", type=float, default=0.0)
+    parser.add_argument("--draft-tpot-short-verify-penalty-ms", type=float, default=0.0)
+    parser.add_argument("--draft-tpot-verify-cost-floor-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--draft-tpot-stop-rule",
+        choices=["first_increase", "best_margin"],
+        default="first_increase",
+    )
 
     parser.add_argument("--rank-guard-threshold", type=float, default=0.15)
     parser.add_argument("--rank-guard-ema-alpha", type=float, default=0.95)
     parser.add_argument("--prefetch-step-budget", type=int, default=16)
+    parser.add_argument(
+        "--prefetch-runtime-kind",
+        choices=["predictive", "dual_queue"],
+        default="predictive",
+    )
     parser.add_argument("--prefetch-max-inflight", type=int, default=16)
     parser.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
     parser.add_argument("--prefetch-staging-slots-per-layer", type=int, default=2)
@@ -1858,6 +1943,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=16)
     parser.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
     parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
+    parser.add_argument("--verify-prefetch-tpot-dynamic-budget-enabled", type=str2bool, default=False)
+    parser.add_argument("--verify-prefetch-tpot-dynamic-budget-token-threshold", type=int, default=10)
+    parser.add_argument("--verify-prefetch-tpot-dynamic-budget-small", type=int, default=4)
     parser.add_argument(
         "--verify-prefetch-rank-multiplier",
         type=int,

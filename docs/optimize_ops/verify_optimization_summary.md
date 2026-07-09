@@ -497,6 +497,16 @@ the old K=12 target that produced the `33.017` question and against the
 per-layer end-to-end throughput (`30.682`), both of which are matched or
 slightly exceeded by this TPOT run.
 
+### Draft TPOT Stop Policy Follow-Up
+
+`--draft-stop-policy tpot` was tested separately for K=12 with default,
+higher verify/draft ratio, near-full-K, and no-stop sanity configurations.
+None exceeded the best `none` run.  The best TPOT result was `31.505`
+decode tok/s (`td=1,tv=1000`), while the current best `none` run remains
+`33.021`.  Details, commands, output validation checks, and root-cause analysis
+are in
+[`draft_tpot_stop_policy_analysis.md`](draft_tpot_stop_policy_analysis.md).
+
 ### Practical Conclusion
 
 Use `decode_phase_output_tok_s` only when comparing engine-internal speculative

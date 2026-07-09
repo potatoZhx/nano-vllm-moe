@@ -2286,12 +2286,38 @@ class ModelRunner:
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs)
         self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
+        token_count = int(input_ids.numel())
+        _original_verify_prefetch_max = None
+        _dynamic_verify_prefetch_budget_applied = False
+        if (
+            bool(getattr(self.config, "verify_prefetch_tpot_dynamic_budget_enabled", False))
+            and str(getattr(self.config, "draft_stop_policy", "")).strip().lower() == "tpot"
+            and token_count <= int(getattr(
+                self.config,
+                "verify_prefetch_tpot_dynamic_budget_token_threshold",
+                10,
+            ))
+        ):
+            _original_verify_prefetch_max = int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
+            small_budget = max(0, int(getattr(
+                self.config,
+                "verify_prefetch_tpot_dynamic_budget_small",
+                _original_verify_prefetch_max,
+            )))
+            self.config.verify_prefetch_max_per_boundary = min(_original_verify_prefetch_max, small_budget)
+            _dynamic_verify_prefetch_budget_applied = True
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_tpot_dynamic_budget_applied_count"] += 1.0
+                    self._profile["verify_tpot_dynamic_budget_token_sum"] += float(token_count)
+                    self._profile["verify_tpot_dynamic_budget_value_sum"] += float(
+                        self.config.verify_prefetch_max_per_boundary
+                    )
 
         _use_kt_hybrid = bool(getattr(self.config, "verify_cuda_graph_kt_hybrid", False))
         _verify_meta_mode = "verify_kt_hybrid" if _use_kt_hybrid else "verify"
         skip_verify_metadata = self._skip_verify_metadata_offload()
         if prefetch_runtime is not None and runtime_meta_recorder is not None and not skip_verify_metadata:
-            token_count = int(input_ids.numel())
             _meta_capacity = max(self.verify_graph_bs) if (_use_kt_hybrid and self.verify_graph_bs) else token_count
             self._wait_for_prefetch_device_reuse(mode=_verify_meta_mode, token_capacity=_meta_capacity)
             if not _use_kt_hybrid:
@@ -2411,6 +2437,8 @@ class ModelRunner:
                 torch.cuda.synchronize()
             self._record_profile("verify_forward_ms", perf_counter() - t0)
         finally:
+            if _dynamic_verify_prefetch_budget_applied and _original_verify_prefetch_max is not None:
+                self.config.verify_prefetch_max_per_boundary = _original_verify_prefetch_max
             if verify_layer_prefetch_enabled:
                 self.model.set_verify_prefetch_controller(None)
                 self._verify_prefetch_active = False

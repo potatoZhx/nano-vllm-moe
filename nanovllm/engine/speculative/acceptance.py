@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+import os
 
 import torch
 
@@ -143,6 +144,18 @@ class StandardSamplingAcceptance(AcceptanceStrategy):
             raise ValueError("draft_data must include one logits row per draft token")
 
         draft_probs = _temperature_probs(draft_data[: len(draft_tokens)], temperature)
+        trace_probs = bool(os.getenv("NANOVLLM_ACCEPTANCE_TRACE_PROBS", "").strip())
+        accept_probs_trace: list[float] | None = None
+        if trace_probs:
+            accept_probs_trace = []
+            for i, tok in enumerate(draft_tokens):
+                if i >= target_probs.size(0):
+                    break
+                target_p = target_probs[i, tok].clamp_min(0.0)
+                draft_q = draft_probs[i, tok].clamp_min(1e-20)
+                accept_prob = torch.minimum(target_p / draft_q, torch.ones_like(target_p))
+                accept_probs_trace.append(float(accept_prob.item()))
+
         num_accepted = 0
         for i, tok in enumerate(draft_tokens):
             if i >= target_probs.size(0):
@@ -152,7 +165,7 @@ class StandardSamplingAcceptance(AcceptanceStrategy):
             accept_prob = torch.minimum(target_p / draft_q, torch.ones_like(target_p))
             if torch.rand((), device=target_probs.device) > accept_prob:
                 residual = (target_probs[i] - draft_probs[i]).clamp_min_(0.0)
-                return {
+                out = {
                     "num_accepted": num_accepted,
                     "next_token": _sample_from_probs(residual),
                     "mode": "standard_sampling",
@@ -160,26 +173,35 @@ class StandardSamplingAcceptance(AcceptanceStrategy):
                     "reject_position": i,
                     "accept_prob": float(accept_prob.item()),
                 }
+                if accept_probs_trace is not None:
+                    out["accept_probs"] = accept_probs_trace
+                return out
             num_accepted += 1
 
         if num_accepted >= len(draft_tokens):
             next_pos = min(num_accepted, target_probs.size(0) - 1)
-            return {
+            out = {
                 "num_accepted": num_accepted,
                 "next_token": _sample_from_probs(target_probs[next_pos]),
                 "mode": "standard_sampling",
                 "rejected": False,
                 "reject_position": None,
             }
+            if accept_probs_trace is not None:
+                out["accept_probs"] = accept_probs_trace
+            return out
 
         next_pos = min(num_accepted, target_probs.size(0) - 1)
-        return {
+        out = {
             "num_accepted": num_accepted,
             "next_token": _sample_from_probs(target_probs[next_pos]),
             "mode": "standard_sampling",
             "rejected": False,
             "reject_position": None,
         }
+        if accept_probs_trace is not None:
+            out["accept_probs"] = accept_probs_trace
+        return out
 
 
 def create_acceptance_strategy(name: str, threshold: float = 0.7) -> AcceptanceStrategy:

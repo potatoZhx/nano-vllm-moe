@@ -135,6 +135,16 @@ class Config:
     draft_stop_policy: str = "tpot"
     draft_tpot_td_ms: float = 19.0         # fixed per-draft-step time (v1)
     draft_tpot_tv_ms: float = 80.0         # fixed per-verify time (v1)
+    draft_tpot_cost_model: str = "static"  # "static" | "history"
+    draft_tpot_history_alpha: float = 0.2
+    draft_tpot_min_steps: int = 0
+    draft_tpot_stop_margin: float = 0.0
+    draft_tpot_short_verify_penalty_ms: float = 0.0
+    draft_tpot_verify_cost_floor_ms: float = 0.0
+    draft_tpot_stop_rule: str = "first_increase"  # "first_increase" | "best_margin"
+    verify_prefetch_tpot_dynamic_budget_enabled: bool = False
+    verify_prefetch_tpot_dynamic_budget_token_threshold: int = 10
+    verify_prefetch_tpot_dynamic_budget_small: int = 4
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -282,6 +292,15 @@ class Config:
         if self.acceptance_predictor_enabled:
             assert self.inference_mode == "spec", "acceptance predictor requires spec mode"
             assert self.acceptance_predictor_path, "acceptance_predictor_enabled requires acceptance_predictor_path"
+        assert self.draft_tpot_cost_model in {"static", "history"}
+        assert 0.0 < self.draft_tpot_history_alpha <= 1.0
+        assert self.draft_tpot_min_steps >= 0
+        assert self.draft_tpot_stop_margin >= 0.0
+        assert self.draft_tpot_short_verify_penalty_ms >= 0.0
+        assert self.draft_tpot_verify_cost_floor_ms >= 0.0
+        assert self.draft_tpot_stop_rule in {"first_increase", "best_margin"}
+        assert self.verify_prefetch_tpot_dynamic_budget_token_threshold >= 1
+        assert self.verify_prefetch_tpot_dynamic_budget_small >= 0
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if self.prefetch_runtime_kind == "dual_queue":
