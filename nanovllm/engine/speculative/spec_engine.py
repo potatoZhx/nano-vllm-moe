@@ -39,6 +39,20 @@ def expected_tpot_ms(step_alphas, num_seqs: int, td_ms: float, tv_ms: float) -> 
     return (k * td_ms + tv_ms) / denom
 
 
+def expected_output_tokens(step_alphas, num_seqs: int) -> float:
+    """Expected output count for one speculative round."""
+    if num_seqs <= 0:
+        return 0.0
+    cumprod = [1.0] * int(num_seqs)
+    accepted = 0.0
+    for alphas in step_alphas:
+        for seq_idx in range(int(num_seqs)):
+            alpha = min(1.0, max(0.0, float(alphas[seq_idx])))
+            cumprod[seq_idx] *= alpha
+            accepted += cumprod[seq_idx]
+    return accepted + float(num_seqs)
+
+
 class SpeculativeEngine:
     """Minimal Phase 2 speculative entry point.
 
@@ -78,6 +92,15 @@ class SpeculativeEngine:
         )
         self.draft_tpot_verify_cost_floor_ms = float(
             getattr(config, "draft_tpot_verify_cost_floor_ms", 0.0)
+        )
+        self.draft_tpot_alpha_error_p90 = float(
+            getattr(config, "draft_tpot_alpha_error_p90", 0.05)
+        )
+        self.draft_tpot_draft_error_p90_ms = float(
+            getattr(config, "draft_tpot_draft_error_p90_ms", 1.0)
+        )
+        self.draft_tpot_uncertainty_scale = float(
+            getattr(config, "draft_tpot_uncertainty_scale", 1.0)
         )
         self.draft_tpot_stop_rule = str(getattr(config, "draft_tpot_stop_rule", "first_increase")).strip().lower()
         self.draft_tpot_verify_model_mode = str(
@@ -258,6 +281,10 @@ class SpeculativeEngine:
     def speculative_step(self, seqs):
         if not seqs:
             return []
+        if self.draft_tpot_stop_rule == "transfer_aware_step" and len(seqs) != 1:
+            raise ValueError(
+                "transfer_aware_step is validated only for batch size 1"
+            )
 
         has_sampling = any(getattr(seq, "temperature", 1.0) > 1e-10 for seq in seqs)
         expected_verify_temperature = getattr(
@@ -346,7 +373,8 @@ class SpeculativeEngine:
             else []
         )
         track_verify_cost = (
-            self.draft_tpot_verify_model_mode == "shadow"
+            bool(getattr(self.config, "transfer_aware_profile", False))
+            or self.draft_tpot_verify_model_mode == "shadow"
             or (
                 self.draft_tpot_verify_model_mode == "active"
                 and self.draft_stop_policy == "tpot"
@@ -356,7 +384,8 @@ class SpeculativeEngine:
             initial_verify_cost = self.model_runner.call(
                 "start_verify_cost_round",
                 len(seqs),
-                self.draft_tpot_stop_rule != "bucket_lookahead",
+                self.draft_tpot_stop_rule
+                not in {"bucket_lookahead", "transfer_aware_step"},
             )
         initial_verify_prediction_ms = None
         if isinstance(initial_verify_cost, dict):
@@ -405,20 +434,32 @@ class SpeculativeEngine:
                     None,
                 )
             boundary_prediction_needed = lookahead_candidate_len is not None
-            predict_verify_cost = (
-                self.draft_tpot_verify_model_mode == "shadow"
-                or (
-                    track_verify_cost
-                    and (
-                        boundary_prediction_needed
-                        if self.draft_tpot_stop_rule == "bucket_lookahead"
-                        else (
-                            candidate_len >= max(1, self.draft_tpot_min_steps)
-                            and candidate_len < draft_steps
+            transfer_step_prediction_needed = bool(
+                self.draft_tpot_stop_rule == "transfer_aware_step"
+                and candidate_len >= 6
+                and candidate_len < min(12, draft_steps)
+            )
+            if self.draft_tpot_stop_rule == "transfer_aware_step":
+                # Shadow must exercise precisely the same one-step hot path as
+                # active mode, but it must not predict at K1-K5 or forced K12.
+                predict_verify_cost = bool(
+                    track_verify_cost and transfer_step_prediction_needed
+                )
+            else:
+                predict_verify_cost = (
+                    self.draft_tpot_verify_model_mode == "shadow"
+                    or (
+                        track_verify_cost
+                        and (
+                            boundary_prediction_needed
+                            if self.draft_tpot_stop_rule == "bucket_lookahead"
+                            else (
+                                candidate_len >= max(1, self.draft_tpot_min_steps)
+                                and candidate_len < draft_steps
+                            )
                         )
                     )
                 )
-            )
             lookahead_verify_tokens = (
                 (int(lookahead_candidate_len) + 1) * len(seqs)
                 if boundary_prediction_needed
@@ -431,6 +472,7 @@ class SpeculativeEngine:
                 track_verify_cost,
                 predict_verify_cost,
                 lookahead_verify_tokens,
+                self._tpot_draft_cost_ms(),
             )
             draft_call_ms = (perf_counter() - infer_t0) * 1000.0
             draft_call_ms_series.append(float(draft_call_ms))
@@ -498,26 +540,220 @@ class SpeculativeEngine:
                         [float(a) for a in (calibrated_step_alpha or step_alpha)]
                     )
                     candidate_len = len(tpot_alpha_history)
-                    tpot_now = self._expected_tpot_ms_for_len(
-                        tpot_alpha_history,
-                        len(seqs),
-                        candidate_len,
-                        verify_cost_prediction_ms if use_predicted_verify_cost else None,
-                    )
-                    tpot_series.append(tpot_now)
-                    tpot_cost_series.append({
-                        "draft_ms": float(self._tpot_draft_cost_ms()),
-                        "verify_ms": float(
-                            self._tpot_verify_cost_ms(
-                                candidate_len,
-                                verify_cost_prediction_ms
-                                if use_predicted_verify_cost
-                                else None,
-                            )
-                        ),
-                    })
                     can_stop = candidate_len >= max(0, self.draft_tpot_min_steps)
-                    if self.draft_tpot_stop_rule == "bucket_lookahead":
+                    if self.draft_tpot_stop_rule == "transfer_aware_step":
+                        prediction_state = (
+                            draft_prefetch_state
+                            if isinstance(draft_prefetch_state, dict)
+                            else {}
+                        )
+                        next_verify_ms = prediction_state.get(
+                            "verify_cost_lookahead_prediction_ms"
+                        )
+                        current_error_ms = prediction_state.get(
+                            "verify_cost_error_p90_ms"
+                        )
+                        next_error_ms = prediction_state.get(
+                            "verify_cost_lookahead_error_p90_ms"
+                        )
+                        state_complete = bool(
+                            prediction_state.get(
+                                "verify_cost_state_complete", False
+                            )
+                        )
+                        prediction_complete = bool(
+                            can_stop
+                            and candidate_len < min(12, draft_steps)
+                            and verify_cost_prediction_ms is not None
+                            and next_verify_ms is not None
+                            and current_error_ms is not None
+                            and next_error_ms is not None
+                            and state_complete
+                            and use_predicted_verify_cost
+                        )
+                        boundary_can_stop = bool(
+                            prediction_complete
+                            and self.draft_tpot_verify_model_mode == "active"
+                        )
+                        should_stop = False
+                        raw_should_stop = False
+                        cost_row: dict[str, float] = {
+                            "draft_ms": float(sum(draft_call_ms_series)),
+                            "next_draft_ms": float(self._tpot_draft_cost_ms()),
+                            "prediction_complete": float(prediction_complete),
+                            "decision_enabled": float(
+                                self.draft_tpot_verify_model_mode == "active"
+                            ),
+                        }
+                        if prediction_complete:
+                            uncertainty = max(
+                                0.0, self.draft_tpot_uncertainty_scale
+                            )
+                            alpha_error = (
+                                uncertainty * self.draft_tpot_alpha_error_p90
+                            )
+                            current_low_alpha = [
+                                [
+                                    max(0.0, float(value) - alpha_error)
+                                    for value in row
+                                ]
+                                for row in tpot_alpha_history
+                            ]
+                            next_high_alpha = [
+                                [
+                                    min(1.0, float(value) + alpha_error)
+                                    for value in row
+                                ]
+                                for row in tpot_alpha_history
+                            ]
+                            forecast = [
+                                min(
+                                    1.0,
+                                    float(value) + alpha_error,
+                                )
+                                for value in tpot_alpha_history[-1]
+                            ]
+                            next_high_alpha.append(forecast)
+                            current_denom = expected_output_tokens(
+                                tpot_alpha_history, len(seqs)
+                            )
+                            current_low_denom = expected_output_tokens(
+                                current_low_alpha, len(seqs)
+                            )
+                            next_high_denom = expected_output_tokens(
+                                next_high_alpha, len(seqs)
+                            )
+                            cumulative_draft_ms = float(
+                                sum(draft_call_ms_series)
+                            )
+                            next_draft_ms = float(self._tpot_draft_cost_ms())
+                            draft_error_ms = (
+                                uncertainty
+                                * self.draft_tpot_draft_error_p90_ms
+                            )
+                            current_verify = float(
+                                verify_cost_prediction_ms
+                            )
+                            next_verify = float(next_verify_ms)
+                            current_verify_error = (
+                                uncertainty * float(current_error_ms)
+                            )
+                            next_verify_error = (
+                                uncertainty * float(next_error_ms)
+                            )
+                            tpot_now = (
+                                cumulative_draft_ms + current_verify
+                            ) / max(1e-8, current_denom)
+                            tpot_next = (
+                                cumulative_draft_ms
+                                + next_draft_ms
+                                + next_verify
+                            ) / max(
+                                1e-8,
+                                expected_output_tokens(
+                                    tpot_alpha_history
+                                    + [list(tpot_alpha_history[-1])],
+                                    len(seqs),
+                                ),
+                            )
+                            current_high = (
+                                cumulative_draft_ms
+                                + current_verify
+                                + current_verify_error
+                            ) / max(1e-8, current_low_denom)
+                            next_low = (
+                                cumulative_draft_ms
+                                + max(1e-6, next_draft_ms - draft_error_ms)
+                                + max(
+                                    1e-6,
+                                    next_verify - next_verify_error,
+                                )
+                            ) / max(1e-8, next_high_denom)
+                            threshold = current_high * (
+                                1.0 + self.draft_tpot_stop_margin
+                            )
+                            raw_should_stop = bool(next_low > threshold)
+                            should_stop = bool(
+                                raw_should_stop
+                                and self.draft_tpot_verify_model_mode == "active"
+                            )
+                            tpot_series.append(float(tpot_now))
+                            cost_row.update(
+                                {
+                                    "verify_ms": current_verify,
+                                    "verify_error_p90_ms": float(
+                                        current_error_ms
+                                    ),
+                                    "lookahead_tpot_ms": float(tpot_next),
+                                    "lookahead_verify_ms": next_verify,
+                                    "lookahead_verify_error_p90_ms": float(
+                                        next_error_ms
+                                    ),
+                                    "lookahead_draft_len": float(
+                                        candidate_len + 1
+                                    ),
+                                    "lookahead_horizon": 1.0,
+                                    "current_conservative_tpot_ms": float(
+                                        current_high
+                                    ),
+                                    "lookahead_optimistic_tpot_ms": float(
+                                        next_low
+                                    ),
+                                    "uncertainty_scale": float(uncertainty),
+                                }
+                            )
+                        elif (
+                            can_stop
+                            and candidate_len < min(12, draft_steps)
+                            and self.draft_tpot_verify_model_mode == "active"
+                        ):
+                            # Prediction uncertainty/state gaps are fail-open:
+                            # gather the next route and retry at the next boundary.
+                            self._profile[
+                                "draft_transfer_aware_fail_open_count"
+                            ] += 1
+                        tpot_stop_streak = int(
+                            boundary_can_stop and raw_should_stop
+                        )
+                        cost_row.update(
+                            {
+                                "stop_signal": float(raw_should_stop),
+                                "stop_streak": float(tpot_stop_streak),
+                                "stop_patience": 1.0,
+                                "stop_decision": float(
+                                    boundary_can_stop and should_stop
+                                ),
+                            }
+                        )
+                        tpot_cost_series.append(cost_row)
+                        can_stop = boundary_can_stop
+                    else:
+                        tpot_now = self._expected_tpot_ms_for_len(
+                            tpot_alpha_history,
+                            len(seqs),
+                            candidate_len,
+                            verify_cost_prediction_ms
+                            if use_predicted_verify_cost
+                            else None,
+                        )
+                        tpot_series.append(tpot_now)
+                        tpot_cost_series.append({
+                            "draft_ms": float(self._tpot_draft_cost_ms()),
+                            "verify_ms": float(
+                                self._tpot_verify_cost_ms(
+                                    candidate_len,
+                                    verify_cost_prediction_ms
+                                    if use_predicted_verify_cost
+                                    else None,
+                                )
+                            ),
+                        })
+                    if self.draft_tpot_stop_rule == "transfer_aware_step":
+                        # The complete one-step decision, including uncertainty,
+                        # was evaluated above.  Do not fall through to a legacy
+                        # static/history rule.
+                        pass
+                    elif self.draft_tpot_stop_rule == "bucket_lookahead":
                         lookahead_verify_ms = (
                             draft_prefetch_state.get(
                                 "verify_cost_lookahead_prediction_ms"
@@ -680,14 +916,15 @@ class SpeculativeEngine:
                         )
                     else:
                         tpot_stop_streak = int(can_stop and raw_should_stop)
-                    tpot_cost_series[-1].update(
-                        {
-                            "stop_signal": float(raw_should_stop),
-                            "stop_streak": float(tpot_stop_streak),
-                            "stop_patience": float(self.draft_tpot_stop_patience),
-                            "stop_decision": float(can_stop and should_stop),
-                        }
-                    )
+                    if self.draft_tpot_stop_rule != "transfer_aware_step":
+                        tpot_cost_series[-1].update(
+                            {
+                                "stop_signal": float(raw_should_stop),
+                                "stop_streak": float(tpot_stop_streak),
+                                "stop_patience": float(self.draft_tpot_stop_patience),
+                                "stop_decision": float(can_stop and should_stop),
+                            }
+                        )
                     if can_stop and should_stop:
                         self._profile["draft_tpot_early_stop_count"] += 1
                         stop = True

@@ -9,6 +9,208 @@ benchmark script.
 For the later `draft-stop-policy=tpot` investigation and per-verify cost model,
 see `docs/optimize_ops/verify_time_cost_model_tpot.md`.
 
+## 2026-07-19 Dense-Graph Target
+
+The final target is now the early-stop policy, not fixed K6. Fixed
+K6/vpb4 remains the formal paired control at `33.501 tok/s` and
+`29.877 ms` TPOT.
+
+The new `k12_transfer_step` preset captures exact batch-1 graph endpoints with
+`5,7,8,9,10,11,12,13`. At K6 through K11 it observes the newest route and live
+cache/transfer state, then compares only K with K+1. K12 is the forced maximum.
+The decision uses actual cumulative draft-call time, the current acceptance
+history, a one-step alpha forecast, and separate current/next verify
+predictions. It stops only when optimistic T(K+1) remains worse than
+conservative T(K); missing state or overlapping intervals continues drafting.
+The legacy cache-credit parameter is forbidden on this path.
+
+The benchmark reports steady draft mean/P50/P90 after dropping the first
+measured round. The first active TPOT screen uses the user-approved provisional
+mean gate `<21 ms`; returning it to `<19 ms` is retained as a hot-path TODO.
+Demand, CPU-workload, latency, and final TPOT accuracy are retained as soft
+diagnostics so a miss leads to residual attribution and tuning rather than an
+automatic fallback to fixed K.
+
+The dense profile, instrumentation-off shadow, and paired 512-token screen are
+now complete. All three 512-token screens used the same seed and protocol and
+passed output-length/degeneration checks:
+
+| policy | tok/s | TPOT | steady mean K | steady verify rounds | steady draft mean |
+|:---|---:|---:|---:|---:|---:|
+| fixed K6/vpb4 control | 28.398 | 35.214 ms | 5.95 | 97 | 18.227 ms |
+| early stop, uncertainty 0.10 | 24.976 | 40.039 ms | 10.75 | 67 | 19.839 ms |
+| early stop, uncertainty 0.00 | 29.075 | 34.393 ms | 6.96 | 79 | 19.924 ms |
+
+The tuned `uncertainty_scale=0` candidate improved same-seed throughput by
+`2.38%` and reduced TPOT by `2.33%` relative to its fixed-K6 control. It saved
+18 steady verify rounds and about `0.786 s` of verify time while adding about
+`0.441 s` of draft time. Its steady draft mean passes the provisional `<21
+ms` gate.
+
+This is not a formal promotion. The active verify prediction still had
+`11.472 ms` MAE and `19.023 ms` P90 absolute error, the apparently
+conservative `0.10` setting lost badly, and earlier independent-seed sweeps
+favored K6. The tuned result also remains below the existing five-seed K6/vpb4
+baseline of `33.501 tok/s` and `29.877 ms`. Per the predeclared experiment
+rule, no multi-seed run was added without stable evidence. The best current
+early-stop experiment is vpb4 with zero uncertainty scale, while fixed K6 is
+retained only as the formal comparison baseline.
+
+The remaining priorities are verify-demand/simulator residuals and reducing
+the boundary hot path enough to restore the `<19 ms` steady-mean gate. Online
+integer vpb sweeping was intentionally not performed; the offline model
+selected vpb4.
+
+## Reproduction Record: Historical Best and Early-Stop Best
+
+Both records below use
+`TPOT = decode_sec / (generated_output_tokens - 1)`. Replace `--output-dir`
+when rerunning if the recorded result directories must be preserved.
+
+### Historical throughput best: fixed K6/vpb4
+
+The retained result combines five independent processes. The first three K6
+rows came from the K-selection sweep and the last two from the frozen K6
+confirmation. This is the equivalent pure-K6 command for the five retained
+runtime seeds:
+
+```bash
+for seed in 20260771 20260773 20260775 20260779 20260781; do
+  python scripts/bench_eval_workload_tpot.py \
+    --model-path /data1/models/Qwen3-30B-A3B \
+    --request-mode per_layer_slots \
+    --output-dir "results/repro_k6_vpb4/seed_${seed}" \
+    --optimized-config k6_decode \
+    --gpu-memory-utilization 0.99 \
+    --cache-ratios 0.3125 \
+    --output-lens 512 \
+    --max-draft-tokens-values 6 \
+    --segment-sizes 12 \
+    --allocation-modes profile_weighted \
+    --slot-buckets 4 \
+    --slot-max-bucket-ratio 2.0 \
+    --slot-profile-csv \
+      pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+    --kt-num-threads 16 \
+    --kt-direct-backend avx2_bf16 \
+    --verify-cuda-graph-bucket-steps 3,5,7,10,13 \
+    --verify-prefetch-max-per-boundary 4 \
+    --verify-prefetch-rank-multiplier 1 \
+    --draft-stop-policy none \
+    --acceptance-predictor-enabled false \
+    --decode-driver generate \
+    --temperature 0.8 \
+    --acceptance-strategy standard_sampling \
+    --collect-profile false \
+    --engine-profile false \
+    --verify-cost-model-profile false \
+    --reset-seed-after-warmup true \
+    --seed "${seed}" \
+    --repeats 1 \
+    --repeat-index-offset 0 \
+    --reuse-engine-across-draft-lengths true \
+    --save-token-ids true \
+    --save-text true \
+    --skip-existing false \
+    --fail-fast true \
+    --fail-on-output-validation-error true
+done
+```
+
+Observed five-process result:
+
+| decode tok/s geomean | mean TPOT | P90 TPOT | valid outputs | quality failures |
+|---:|---:|---:|---:|---:|
+| 33.501395 | 29.876824 ms | 32.130604 ms | 5/5 | 0/5 |
+
+Recorded result paths:
+
+```text
+aggregate:
+  results/tpot_vpb4_final_analysis_20260713/policy_validation.json
+five retained rows:
+  results/tpot_vpb4_final_analysis_20260713/vpb4/repeat_{0..4}/summary.json
+original K-sweep sources:
+  results/tpot_target_fixed_k_vpb4_predictor_off_20260713/repeat_{0..2}/
+original confirmation sources:
+  results/tpot_vpb4_confirmation_20260713/vpb4/repeat_{3,4}/
+```
+
+### Best observed early stop: transfer-aware Kmax12/vpb4
+
+This is the exact command recorded by the best early-stop screen:
+
+```bash
+python scripts/bench_eval_workload_tpot.py \
+  --model-path /data1/models/Qwen3-30B-A3B \
+  --request-mode per_layer_slots \
+  --output-dir results/transfer_v3_active_screen_u000_20260719 \
+  --optimized-config k12_transfer_step \
+  --cache-ratios 0.3125 \
+  --output-lens 512 \
+  --max-draft-tokens-values 12 \
+  --segment-sizes 12 \
+  --allocation-modes profile_weighted \
+  --slot-buckets 4 \
+  --slot-max-bucket-ratio 2.0 \
+  --slot-profile-csv \
+    pre_exps/exp_and_figs/unique/unique_count_plot_summary_n1024.csv \
+  --kt-num-threads 16 \
+  --kt-direct-backend avx2_bf16 \
+  --verify-cuda-graph-bucket-steps 5,7,8,9,10,11,12,13 \
+  --verify-prefetch-max-per-boundary 4 \
+  --verify-prefetch-rank-multiplier 1 \
+  --draft-stop-policy tpot \
+  --draft-tpot-stop-rule transfer_aware_step \
+  --draft-tpot-min-steps 6 \
+  --draft-tpot-verify-model-mode active \
+  --draft-tpot-verify-model-path \
+    results/transfer_v3_artifact_20260719/verify_cost_v3.json \
+  --draft-tpot-uncertainty-scale 0.0 \
+  --acceptance-predictor-enabled true \
+  --decode-driver generate \
+  --reuse-engine-across-draft-lengths true \
+  --collect-profile true \
+  --engine-profile false \
+  --engine-profile-cuda-sync false \
+  --verify-cost-model-profile false \
+  --transfer-aware-profile false \
+  --save-profile-json true \
+  --save-token-ids true \
+  --save-text true \
+  --reset-seed-after-warmup true \
+  --reset-profile-before-request true \
+  --skip-existing false \
+  --fail-fast true \
+  --seed 20260719 \
+  --dist-port-base 37970
+```
+
+Observed single-process result:
+
+| tok/s | TPOT | steady mean K | steady K distribution | draft mean/P50/P90 |
+|---:|---:|---:|:---|:---|
+| 29.075308 | 34.393444 ms | 6.962 | `{6:8, 7:66, 10:1, 11:1, 12:1}` plus tail `{2:1, 5:1}` | 19.924/19.678/21.934 ms |
+
+The output contained exactly 512 tokens with no degeneration failure. Against
+the same-seed K6/vpb4 control, this run improved throughput by `2.38%` and
+reduced TPOT by `2.33%`; it remains a single-seed experimental result and is
+not the historical throughput best.
+
+Recorded result paths:
+
+```text
+benchmark summary:
+  results/transfer_v3_active_screen_u000_20260719/summary.json
+raw row and profile:
+  results/transfer_v3_active_screen_u000_20260719/
+same-seed fixed-K6 control:
+  results/transfer_v3_control_k6_vpb4_20260719/summary.json
+verify-cost artifact and fit report:
+  results/transfer_v3_artifact_20260719/verify_cost_v3.json
+  results/transfer_v3_artifact_20260719/verify_cost_v3.json.report.json
+```
+
 ## 2026-07-13 High-K Follow-Up
 
 The five-seed K6/vpb4 result below remains the current formal best, but it is

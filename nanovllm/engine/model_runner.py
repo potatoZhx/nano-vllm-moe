@@ -181,8 +181,10 @@ class ModelRunner:
         self._verify_stream_ms_by_step: dict[int, float] = {}
         self._verify_cost_model = None
         self._verify_cost_proxy = None
+        self._verify_cost_schema_version = 0
         self._verify_cost_round_active = False
         self._verify_cost_latest_prediction: dict[str, object] | None = None
+        self._transfer_aware_profile_routes: list[object] = []
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
         self._draft_perfect_trace_enabled = os.getenv(
@@ -504,10 +506,14 @@ class ModelRunner:
             self._verify_cost_model = None
         if not hasattr(self, "_verify_cost_proxy"):
             self._verify_cost_proxy = None
+        if not hasattr(self, "_verify_cost_schema_version"):
+            self._verify_cost_schema_version = 0
         if not hasattr(self, "_verify_cost_round_active"):
             self._verify_cost_round_active = False
         if not hasattr(self, "_verify_cost_latest_prediction"):
             self._verify_cost_latest_prediction = None
+        if not hasattr(self, "_transfer_aware_profile_routes"):
+            self._transfer_aware_profile_routes = []
         if not hasattr(self, "_draft_perfect_trace_enabled"):
             self._draft_perfect_trace_enabled = False
         if not hasattr(self, "_draft_perfect_refill_rejected"):
@@ -971,6 +977,9 @@ class ModelRunner:
         layer_execution_cpu_routes: dict[int, float] = {}
         layer_execution_cpu_route_counts: dict[int, list[int]] = {}
         layer_execution_route_counts: dict[int, list[int]] = {}
+        layer_logical_route_rows: dict[int, list[list[int]]] = {}
+        layer_execution_route_rows: dict[int, list[list[int]]] = {}
+        layer_execution_route_status: dict[int, list[list[int]]] = {}
         for _layer_idx, meta in runtime_meta.items():
             layer_idx = int(_layer_idx)
             layer_count += 1
@@ -1000,13 +1009,66 @@ class ModelRunner:
             else:
                 miss_experts = float(getattr(meta, "miss_count", 0.0) or 0.0)
             execution_counts = getattr(meta, "execution_activation_count", None)
+            execution_cpu_counts_override = None
+            if bool(getattr(self.config, "transfer_aware_profile", False)):
+                logical_rows = getattr(meta, "selected_experts", None)
+                execution_rows = getattr(
+                    meta, "execution_selected_experts", None
+                )
+                execution_status_rows = getattr(
+                    meta, "execution_route_status", None
+                )
+                if logical_rows is not None:
+                    layer_logical_route_rows[layer_idx] = [
+                        [int(value) for value in row]
+                        for row in logical_rows.tolist()
+                    ]
+                if execution_rows is not None:
+                    layer_execution_route_rows[layer_idx] = [
+                        [int(value) for value in row]
+                        for row in execution_rows.tolist()
+                    ]
+                if execution_status_rows is not None:
+                    layer_execution_route_status[layer_idx] = [
+                        [int(value) for value in row]
+                        for row in execution_status_rows.tolist()
+                    ]
+                if (
+                    execution_counts is None
+                    and execution_rows is not None
+                    and execution_status_rows is not None
+                ):
+                    flat_execution_ids = execution_rows.reshape(-1).to(
+                        dtype=torch.int64, device="cpu"
+                    )
+                    flat_execution_status = execution_status_rows.reshape(
+                        -1
+                    ).to(dtype=torch.int64, device="cpu")
+                    num_experts = int(
+                        getattr(
+                            getattr(self.config, "hf_config", None),
+                            "num_experts",
+                            0,
+                        )
+                    )
+                    execution_counts = torch.bincount(
+                        flat_execution_ids, minlength=num_experts
+                    )
+                    execution_cpu_counts_override = torch.bincount(
+                        flat_execution_ids[flat_execution_status == 2],
+                        minlength=num_experts,
+                    )
             if execution_counts is not None:
                 if execution_counts.device.type != "cpu":
                     execution_counts = execution_counts.to(device="cpu")
                 execution_counts = execution_counts.to(dtype=torch.int64)
                 execution_layer_count += 1
                 execution_total_routes = float(execution_counts.sum().item())
-                if status is not None:
+                if execution_cpu_counts_override is not None:
+                    execution_cpu_counts = (
+                        execution_cpu_counts_override.to(dtype=torch.int64)
+                    )
+                elif status is not None:
                     status_cpu = status
                     if status_cpu.device.type != "cpu":
                         status_cpu = status_cpu.to(device="cpu")
@@ -1132,6 +1194,33 @@ class ModelRunner:
                     )
                     layer_execution_all_route_counts_rec = step_rec.setdefault(
                         "metadata_layer_execution_route_counts", {}
+                    )
+                    logical_route_rows_rec = step_rec.setdefault(
+                        "metadata_layer_logical_route_rows", {}
+                    )
+                    execution_route_rows_rec = step_rec.setdefault(
+                        "metadata_layer_execution_route_rows", {}
+                    )
+                    execution_route_status_rec = step_rec.setdefault(
+                        "metadata_layer_execution_route_status", {}
+                    )
+                    logical_route_rows_rec.update(
+                        {
+                            str(layer_idx): rows
+                            for layer_idx, rows in layer_logical_route_rows.items()
+                        }
+                    )
+                    execution_route_rows_rec.update(
+                        {
+                            str(layer_idx): rows
+                            for layer_idx, rows in layer_execution_route_rows.items()
+                        }
+                    )
+                    execution_route_status_rec.update(
+                        {
+                            str(layer_idx): rows
+                            for layer_idx, rows in layer_execution_route_status.items()
+                        }
                     )
                     for layer_idx, cpu_experts in layer_cpu_experts.items():
                         key = str(int(layer_idx))
@@ -2073,6 +2162,9 @@ class ModelRunner:
                 self._verify_metadata_records_by_step.clear()
                 self._verify_stream_timing_events.clear()
                 self._verify_stream_ms_by_step.clear()
+            if prefetch_runtime is not None:
+                with self._prefetch_runtime_lock:
+                    _ = prefetch_runtime.get_profile(reset=True)
         if bool(getattr(self, "_draft_perfect_trace_enabled", False)):
             self._draft_perfect_profile.clear()
             self._draft_perfect_records.clear()
@@ -2081,9 +2173,6 @@ class ModelRunner:
             pending = getattr(self, "_pending_prefetch_metadata", None)
             if pending is not None:
                 pending.clear()
-            if prefetch_runtime is not None:
-                with self._prefetch_runtime_lock:
-                    _ = prefetch_runtime.get_profile(reset=True)
         return out
 
     def _run_model_eager(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -2581,7 +2670,37 @@ class ModelRunner:
         mode = str(
             getattr(self.config, "draft_tpot_verify_model_mode", "off")
         ).strip().lower()
-        if mode == "off" or self.rank != 0:
+        if self.rank != 0:
+            return
+        extractor = getattr(self, "_acceptance_extractor", None)
+        if mode == "off":
+            if bool(getattr(self.config, "transfer_aware_profile", False)):
+                if extractor is None:
+                    raise ValueError(
+                        "transfer-aware profile requires the acceptance predictor "
+                        "route recorder"
+                    )
+                extractor.original_route_readback_enabled = True
+            return
+
+        artifact_path = str(
+            getattr(self.config, "draft_tpot_verify_model_path", "")
+        )
+        stop_rule = str(
+            getattr(self.config, "draft_tpot_stop_rule", "")
+        ).strip().lower()
+        if stop_rule == "transfer_aware_step":
+            with open(artifact_path, encoding="utf-8") as stream:
+                artifact_header = json.load(stream)
+            schema_version = int(artifact_header.get("schema_version", 1))
+            if schema_version != 3:
+                raise ValueError(
+                    "transfer_aware_step cannot use a legacy v2 verify-cost artifact"
+                )
+            self._configure_transfer_aware_verify_model(
+                artifact_path=artifact_path,
+                mode=mode,
+            )
             return
         from nanovllm.engine.speculative.verify_cost_model import (
             DraftRouteCostProxy,
@@ -2589,7 +2708,7 @@ class ModelRunner:
         )
 
         model = VerifyTimeCostModel.load(
-            str(getattr(self.config, "draft_tpot_verify_model_path", ""))
+            artifact_path
         )
         hf_config = self.config.hf_config
         expected = (
@@ -2695,6 +2814,9 @@ class ModelRunner:
         )
         self._verify_cost_model = model
         self._verify_cost_proxy = DraftRouteCostProxy(model)
+        self._verify_cost_schema_version = int(
+            model.artifact.get("schema_version", 1)
+        )
         self._verify_cost_cache_masks = tuple(
             (int(layer_idx), cache.cached_expert_mask_host)
             for layer_idx, cache in getattr(self, "layer_caches", {}).items()
@@ -2710,6 +2832,135 @@ class ModelRunner:
                 == "tpot"
             )
 
+    def _configure_transfer_aware_verify_model(
+        self,
+        *,
+        artifact_path: str,
+        mode: str,
+    ) -> None:
+        from nanovllm.engine.speculative.transfer_aware_cost_model import (
+            TransferAwareVerifyCostModel,
+            bind_runtime_cache_host_matrices,
+        )
+
+        model = TransferAwareVerifyCostModel.load(artifact_path)
+        hf_config = self.config.hf_config
+        expected = (
+            int(hf_config.num_hidden_layers),
+            int(hf_config.num_experts),
+            int(hf_config.num_experts_per_tok),
+        )
+        calibrated = (model.num_layers, model.num_experts, model.top_k)
+        if calibrated != expected:
+            raise ValueError(
+                f"v3 verify model shape {calibrated} does not match runtime {expected}"
+            )
+        if mode == "active" and str(
+            getattr(self.config, "draft_tpot_stop_rule", "")
+        ).strip().lower() != "transfer_aware_step":
+            raise ValueError(
+                "a v3 active verify model requires transfer_aware_step"
+            )
+
+        slot_counts = [
+            int(getattr(cache, "num_slots", len(getattr(cache, "slot_to_expert", ()))))
+            for cache in self.layer_caches.values()
+        ]
+        cache_ratio = (
+            float(sum(slot_counts))
+            / float(max(1, len(slot_counts) * model.num_experts))
+            if slot_counts
+            else float(getattr(self.config, "heterogeneous_slots_per_layer", 0))
+            / float(max(1, model.num_experts))
+        )
+        protocol = model.artifact.get("protocol", {})
+        temperature = (
+            protocol.get("temperature")
+            if isinstance(protocol, dict)
+            else None
+        )
+        model.validate_runtime(
+            {
+                "batch_size": int(getattr(self.config, "max_num_seqs", 1)),
+                "acceptance_strategy": str(
+                    getattr(self.config, "acceptance_strategy", "")
+                ).strip().lower(),
+                # Per-request temperature is checked in SpeculativeEngine before
+                # the first draft. Bind the expected value here.
+                "temperature": temperature,
+                "cache_ratio": cache_ratio,
+                "max_draft_tokens": int(self.config.max_draft_tokens),
+                "prefetch_runtime_kind": str(
+                    getattr(self.config, "prefetch_runtime_kind", "")
+                ),
+                "buckets": tuple(
+                    int(value)
+                    for value in self.config.verify_cuda_graph_bucket_steps
+                ),
+            }
+        )
+
+        resolved_backend = str(getattr(self.config, "kt_direct_backend", "auto"))
+        resolved_threads = int(getattr(self.config, "kt_num_threads", 0))
+        for layer in getattr(getattr(self.model, "model", None), "layers", []):
+            backend = getattr(getattr(layer, "mlp", None), "cpu_backend", None)
+            if backend is None:
+                continue
+            resolved_backend = str(
+                getattr(backend, "kt_selected_backend", resolved_backend)
+            )
+            runtime = getattr(backend, "runtime", None)
+            resolved_threads = int(
+                getattr(runtime, "kt_num_threads", resolved_threads)
+            )
+            break
+        try:
+            kt_version = importlib.metadata.version("kt-kernel")
+        except importlib.metadata.PackageNotFoundError:
+            kt_version = "unknown"
+        model.validate_fingerprint(
+            {
+                "cpu_model": _cpu_model_name(),
+                "gpu_model": torch.cuda.get_device_name(
+                    torch.cuda.current_device()
+                ),
+                "kt_kernel_version": kt_version,
+                "kt_num_threads": resolved_threads,
+                "kt_backend": resolved_backend,
+            }
+        )
+        self._verify_cost_model = model
+        self._verify_cost_cache_host_matrices = (
+            bind_runtime_cache_host_matrices(
+                layer_caches=self.layer_caches,
+                num_layers=model.num_layers,
+                num_experts=model.num_experts,
+            )
+        )
+        # This marker also enables the already-compact original-route D2H slice.
+        self._verify_cost_proxy = model.demand
+        self._verify_cost_schema_version = 3
+        extractor = getattr(self, "_acceptance_extractor", None)
+        if extractor is None:
+            raise ValueError(
+                "v3 verify model requires the acceptance predictor route recorder"
+            )
+        extractor.original_route_readback_enabled = True
+        acceptance_strategy = str(
+            getattr(self.config, "acceptance_strategy", "")
+        ).strip().lower()
+        setattr(
+            self.config,
+            "draft_tpot_verify_model_sampling_validated",
+            acceptance_strategy
+            in {"standard_sampling", "sampling", "spec_sampling"},
+        )
+        setattr(
+            self.config,
+            "draft_tpot_verify_model_temperature",
+            temperature,
+        )
+
     def _predict_verify_cost_from_draft_routes(
         self,
         *,
@@ -2718,7 +2969,16 @@ class ModelRunner:
         reset_round: bool = False,
         predict: bool = True,
         lookahead_logical_tokens: int | None = None,
+        next_draft_ms: float | None = None,
     ) -> dict[str, object] | None:
+        if int(getattr(self, "_verify_cost_schema_version", 0)) == 3:
+            return self._predict_transfer_aware_verify_cost(
+                seq_count=seq_count,
+                original_routes=original_routes,
+                reset_round=reset_round,
+                predict=predict,
+                next_draft_ms=next_draft_ms,
+            )
         proxy = getattr(self, "_verify_cost_proxy", None)
         model = getattr(self, "_verify_cost_model", None)
         if proxy is None or model is None:
@@ -2897,12 +3157,205 @@ class ModelRunner:
                 self._profile["verify_cost_proxy_total_ms"] += total_ms
         return result
 
+    def _predict_transfer_aware_verify_cost(
+        self,
+        *,
+        seq_count: int,
+        original_routes=None,
+        reset_round: bool = False,
+        predict: bool = True,
+        next_draft_ms: float | None = None,
+    ) -> dict[str, object] | None:
+        from nanovllm.engine.speculative.transfer_aware_cost_model import (
+            prediction_to_runtime_dict,
+            snapshot_runtime_state,
+        )
+
+        model = getattr(self, "_verify_cost_model", None)
+        if model is None:
+            return None
+        profile_proxy = bool(self.profile_enabled and self.rank == 0)
+        total_t0 = perf_counter() if profile_proxy else 0.0
+        if reset_round or not bool(getattr(self, "_verify_cost_round_active", False)):
+            model.reset()
+            self._verify_cost_round_active = True
+            self._verify_cost_latest_prediction = None
+            self._transfer_aware_profile_routes.clear()
+        if original_routes is not None:
+            model.observe(original_routes)
+            if bool(getattr(self.config, "transfer_aware_profile", False)):
+                self._transfer_aware_profile_routes.append(
+                    original_routes.astype("int16", copy=True).tolist()
+                )
+        if not predict:
+            if profile_proxy:
+                with self._prefetch_profile_lock:
+                    self._profile[
+                        "verify_cost_route_observe_only_count"
+                    ] += 1.0
+            return None
+
+        snapshot_t0 = perf_counter() if profile_proxy else 0.0
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        snapshot_scratch = getattr(
+            self, "_verify_cost_snapshot_scratch", None
+        )
+        cache_host = getattr(
+            self, "_verify_cost_cache_host_matrices", None
+        )
+        cache_strategy = str(
+            getattr(self.config, "cache_strategy", "lru")
+        ).strip().lower()
+        access_host = (
+            cache_host.access_count
+            if cache_host is not None
+            and cache_strategy
+            in {"lfu", "lfu_rankguard", "lfu_rankguard_online"}
+            else (
+                None
+                if cache_host is None
+                else cache_host.last_access
+            )
+        )
+        resident_host = (
+            None if cache_host is None else cache_host.resident
+        )
+        slot_counts_host = (
+            None if cache_host is None else cache_host.slot_counts
+        )
+        if prefetch_runtime is not None:
+            with self._prefetch_runtime_lock:
+                state = snapshot_runtime_state(
+                    layer_caches=self.layer_caches,
+                    prefetch_runtime=prefetch_runtime,
+                    num_layers=model.num_layers,
+                    num_experts=model.num_experts,
+                    transfer_ms=model.simulator.transfer_ms,
+                    materialize_layers=False,
+                    array_scratch=snapshot_scratch,
+                    resident_host_matrix=resident_host,
+                    access_host_matrix=access_host,
+                    slot_counts_host=slot_counts_host,
+                )
+        else:
+            state = snapshot_runtime_state(
+                layer_caches=self.layer_caches,
+                prefetch_runtime=None,
+                num_layers=model.num_layers,
+                num_experts=model.num_experts,
+                transfer_ms=model.simulator.transfer_ms,
+                materialize_layers=False,
+                array_scratch=snapshot_scratch,
+                resident_host_matrix=resident_host,
+                access_host_matrix=access_host,
+                slot_counts_host=slot_counts_host,
+            )
+        self._verify_cost_snapshot_scratch = state.array_state
+        snapshot_ms = (
+            (perf_counter() - snapshot_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        logical_tokens = int(model.demand.known_rows) + int(seq_count)
+        try:
+            current, next_prediction = model.predict_pair(
+                state=state,
+                logical_tokens=logical_tokens,
+                vpb=int(
+                    getattr(
+                        self.config,
+                        "verify_prefetch_max_per_boundary",
+                        0,
+                    )
+                ),
+                next_draft_ms=float(
+                    next_draft_ms
+                    if next_draft_ms is not None
+                    else getattr(self.config, "draft_tpot_td_ms", 19.0)
+                ),
+            )
+        except (KeyError, ValueError, IndexError) as error:
+            # A transient/incomplete state must never trigger an early stop.
+            result = {
+                "verify_cost_schema_version": 3,
+                "verify_cost_model_id": str(model.model_id),
+                "verify_cost_state_complete": False,
+            }
+            if profile_proxy:
+                result["verify_cost_fail_open_reason"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+                with self._prefetch_profile_lock:
+                    self._profile[
+                        "verify_cost_transfer_aware_fail_open_count"
+                    ] += 1.0
+            self._verify_cost_latest_prediction = dict(result)
+            return result
+        result = prediction_to_runtime_dict(model, current, next_prediction)
+        result["verify_cost_known_rows"] = int(model.demand.known_rows)
+        if profile_proxy:
+            result.update(
+                {
+                    "verify_cost_runtime_cache_snapshot_ms": snapshot_ms,
+                    "verify_cost_runtime_total_ms": (
+                        perf_counter() - total_t0
+                    )
+                    * 1000.0,
+                }
+            )
+            if bool(
+                getattr(self.config, "transfer_aware_profile", False)
+            ) or str(
+                getattr(self.config, "perf_profile_level", "basic")
+            ).strip().lower() == "detailed":
+                result.update(
+                    {
+                        "verify_cost_segment_workloads": [
+                        {
+                            "segment_id": segment.segment_id,
+                            "first_layer": segment.first_layer,
+                            "last_layer": segment.last_layer,
+                            "cpu_experts": segment.cpu_experts,
+                            "cpu_routes": segment.cpu_routes,
+                            "max_layer_experts": segment.max_layer_experts,
+                            "transfer_submits": segment.transfer_submits,
+                        }
+                        for segment in current.segments
+                        ],
+                        "verify_cost_lookahead_segment_workloads": [
+                        {
+                            "segment_id": segment.segment_id,
+                            "first_layer": segment.first_layer,
+                            "last_layer": segment.last_layer,
+                            "cpu_experts": segment.cpu_experts,
+                            "cpu_routes": segment.cpu_routes,
+                            "max_layer_experts": segment.max_layer_experts,
+                            "transfer_submits": segment.transfer_submits,
+                        }
+                        for segment in next_prediction.segments
+                        ],
+                    }
+                )
+            with self._prefetch_profile_lock:
+                self._profile["verify_cost_proxy_prediction_count"] += 1.0
+                self._profile["verify_cost_cache_snapshot_ms"] += snapshot_ms
+                self._profile["verify_cost_proxy_total_ms"] += float(
+                    result["verify_cost_runtime_total_ms"]
+                )
+        self._verify_cost_latest_prediction = dict(result)
+        return result
+
     def start_verify_cost_round(
         self,
         seq_count: int,
         predict: bool = True,
     ) -> dict[str, object] | None:
         """Predict the no-draft verify baseline before the first draft call."""
+        if (
+            getattr(self, "_verify_cost_model", None) is None
+            and bool(getattr(self.config, "transfer_aware_profile", False))
+        ):
+            self._transfer_aware_profile_routes.clear()
+            self._verify_cost_round_active = True
+            return None
         return self._predict_verify_cost_from_draft_routes(
             seq_count=int(seq_count),
             reset_round=True,
@@ -2922,6 +3375,7 @@ class ModelRunner:
         observe_verify_cost: bool = True,
         predict_verify_cost: bool = True,
         verify_cost_lookahead_tokens: int | None = None,
+        verify_cost_next_draft_ms: float | None = None,
     ) -> tuple:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
         self._ensure_prefetch_internal_state()
@@ -3039,7 +3493,16 @@ class ModelRunner:
                 # Reads alpha + updated history state (one D2H, after the sampler
                 # sync already forced by self.run) and advances host history state.
                 include_routes = (
-                    getattr(self, "_verify_cost_proxy", None) is not None
+                    (
+                        getattr(self, "_verify_cost_proxy", None) is not None
+                        or bool(
+                            getattr(
+                                self.config,
+                                "transfer_aware_profile",
+                                False,
+                            )
+                        )
+                    )
                     and bool(observe_verify_cost)
                 )
                 readback_t0 = (
@@ -3058,11 +3521,27 @@ class ModelRunner:
                         self._profile["acceptance_readback_count"] += 1.0
                 if include_routes:
                     acceptance_alpha, original_routes = acceptance_outputs
+                    if (
+                        getattr(self, "_verify_cost_model", None) is None
+                        and bool(
+                            getattr(
+                                self.config,
+                                "transfer_aware_profile",
+                                False,
+                            )
+                        )
+                    ):
+                        self._transfer_aware_profile_routes.append(
+                            original_routes.astype(
+                                "int16", copy=True
+                            ).tolist()
+                        )
                     verify_cost_prediction = self._predict_verify_cost_from_draft_routes(
                         seq_count=len(seqs),
                         original_routes=original_routes,
                         predict=bool(predict_verify_cost),
                         lookahead_logical_tokens=verify_cost_lookahead_tokens,
+                        next_draft_ms=verify_cost_next_draft_ms,
                     )
                     if (
                         verify_cost_prediction is not None
@@ -3546,6 +4025,84 @@ class ModelRunner:
             and getattr(self, "verify_graph_bs", None)
             else int(token_count)
         )
+        transfer_profile_snapshot = None
+        if (
+            bool(getattr(self.config, "transfer_aware_profile", False))
+            and self.rank == 0
+        ):
+            snapshot_now_ms = perf_counter() * 1000.0
+            with self._prefetch_runtime_lock:
+                cache_rows = {}
+                for layer_idx, cache in self.layer_caches.items():
+                    cache_rows[str(int(layer_idx))] = {
+                        "resident_experts": [
+                            int(expert_idx)
+                            for expert_idx, cached in enumerate(
+                                getattr(cache, "cached_expert_mask_host", ())
+                            )
+                            if bool(cached)
+                        ],
+                        "slots": [
+                            int(value)
+                            for value in getattr(cache, "slot_to_expert", ())
+                        ],
+                        "pending": [
+                            int(value)
+                            for value in getattr(
+                                cache, "active_slot_pending_expert", ()
+                            )
+                        ],
+                        "last_access_step": [
+                            int(value)
+                            for value in getattr(cache, "last_access_step", ())
+                        ],
+                        "access_count": [
+                            int(value)
+                            for value in getattr(cache, "access_count", ())
+                        ],
+                    }
+                inflight_rows = []
+                for ticket in getattr(prefetch_runtime, "inflight", {}).values():
+                    ready = bool(getattr(ticket, "ready", False))
+                    ready_event = getattr(ticket, "ready_event", None)
+                    if not ready and ready_event is not None:
+                        ready = bool(ready_event.query())
+                    inflight_rows.append(
+                        {
+                            "step_id": int(ticket.step_id),
+                            "layer_idx": int(ticket.layer_idx),
+                            "expert_idx": int(ticket.expert_idx),
+                            "source": str(ticket.source),
+                            "ready": bool(ready),
+                            "direct_active": bool(ticket.direct_active),
+                            "active_slot_idx": int(ticket.active_slot_idx),
+                            "active_slot_prev_expert": int(
+                                ticket.active_slot_prev_expert
+                            ),
+                            "segment_id": int(ticket.segment_id),
+                            "submit_ts_ms": float(ticket.submit_ts_ms),
+                            "age_ms": max(
+                                0.0,
+                                snapshot_now_ms - float(ticket.submit_ts_ms),
+                            ),
+                            "num_bytes": int(ticket.num_bytes),
+                            "transfer_stream_idx": int(
+                                ticket.transfer_stream_idx
+                            ),
+                        }
+                    )
+                transfer_profile_snapshot = {
+                    "cache_layers": cache_rows,
+                    "inflight": inflight_rows,
+                    "round_loaded": {
+                        str(int(layer_idx)): sorted(
+                            int(value) for value in experts
+                        )
+                        for layer_idx, experts in getattr(
+                            prefetch_runtime, "_round_loaded", {}
+                        ).items()
+                    },
+                }
         verify_forward_ms = 0.0
         _original_verify_prefetch_max = None
         _dynamic_verify_prefetch_budget_applied = False
@@ -3738,6 +4295,8 @@ class ModelRunner:
                     "verify_lengths": [int(x) for x in verify_lengths],
                     "seq_count": int(len(seqs)),
                     "bucket": int(verify_bucket),
+                    "padding_tokens": int(max(0, verify_bucket - token_count)),
+                    "exact_graph_bucket": bool(verify_bucket == token_count),
                     "used_cuda_graph": bool(self._can_use_verify_cudagraph(int(token_count))),
                     "used_kt_hybrid": bool(getattr(self.config, "verify_cuda_graph_kt_hybrid", False)),
                     "used_segment_graph": bool(used_verify_segment_graph),
@@ -3748,6 +4307,13 @@ class ModelRunner:
                     "outputs_ready": bool(outputs_ready),
                     "return_logits": bool(return_logits),
                 }
+                if transfer_profile_snapshot is not None:
+                    record["transfer_aware_pre_verify_state"] = (
+                        transfer_profile_snapshot
+                    )
+                    record["draft_original_route_rows"] = list(
+                        self._transfer_aware_profile_routes
+                    )
                 latest_prediction = getattr(
                     self, "_verify_cost_latest_prediction", None
                 )
@@ -4768,6 +5334,7 @@ class ModelRunner:
                 step_id=int(step_id),
                 token_capacity=max_bucket,
                 logical_token_count=num_tokens,
+                execution_token_count=bucket,
             )
 
         graph = self.verify_kt_hybrid_graphs[bucket]
@@ -4983,6 +5550,7 @@ class ModelRunner:
                 step_id=step_id,
                 token_capacity=max_bucket,
                 logical_token_count=num_tokens,
+                execution_token_count=bucket,
             )
 
         num_segments = len(graphs)

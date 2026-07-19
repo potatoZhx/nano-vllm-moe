@@ -291,6 +291,7 @@ def _policy_specs(args: argparse.Namespace) -> list[dict[str, object]]:
             "lookahead",
             "lookahead_hysteresis",
             "bucket_lookahead",
+            "transfer_aware_step",
         }:
             raise SystemExit(f"invalid stop_rule for {name}")
         if spec["cost_model"] not in {"static", "history"}:
@@ -586,6 +587,7 @@ def parse_args() -> argparse.Namespace:
             "lookahead",
             "lookahead_hysteresis",
             "bucket_lookahead",
+            "transfer_aware_step",
         ],
         default="lookahead",
     )

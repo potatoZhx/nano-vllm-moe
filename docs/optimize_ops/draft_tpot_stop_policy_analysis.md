@@ -2,6 +2,99 @@
 
 Date: 2026-07-08
 
+## 2026-07-19 One-Step Transfer-Aware Rule
+
+`transfer_aware_step` supersedes the old experimental `bucket_lookahead` as the
+target design. Its validated first scope is fixed:
+
+```text
+batch size / protocol       = 1 / standard_sampling, temperature 0.8
+cache ratio                 = 0.3125
+min K / max K               = 6 / 12
+verify graph buckets        = 5,7,8,9,10,11,12,13
+legacy cache credit         = 0
+```
+
+Every K6-K11 endpoint has an exact graph, so the policy no longer projects
+K6->K9 or K9->K12. After each new draft route, it rebuilds only the current and
+next endpoint from the latest live resident/pending/inflight state. Thus the
+old `+24.411 ms` and `+27.351 ms` frozen-cache three-step errors are historical
+motivation, not promotion criteria for this rule.
+
+For a current endpoint K:
+
+```text
+T(K)   = (sum(actual draft_call_ms[1:K]) + V_hat(K)) /
+         expected_output(current alpha history)
+T(K+1) = (same actual draft time + draft-time EMA + V_hat(K+1)) /
+         expected_output(history + one-step alpha forecast)
+```
+
+The stop condition is deliberately conservative:
+
+```text
+optimistic_lower(T(K+1)) >
+    conservative_upper(T(K)) * (1 + stop_margin)
+```
+
+Uncertain demand, incomplete transfer state, missing predictions, and
+overlapping intervals all fail open by continuing. K12 ends drafting
+unconditionally. Trace rows include both bounds, prediction completeness,
+one-step horizon, actual cumulative draft time, and the decision.
+
+The first active screen uses a provisional steady draft-call mean gate `<21
+ms` after warmup reset and removal of the first measured round; P50/P90
+accompany it. The original `<19 ms` target remains a marked follow-up
+optimization. All model-error and TPOT numbers are soft targets. The next
+tuning order after an unfavorable single-seed paired screen is uncertainty
+scale, stop margin, then the offline-selected vpb—not reverting the target
+design to fixed K.
+
+### 2026-07-19 paired active screen
+
+The first conservative screen at uncertainty scale `0.10` drafted too far.
+The planned next tuning step reduced uncertainty scale to zero while retaining
+the same one-step rule, stop margin, vpb4, seed, 512-token output length, and
+sampling protocol:
+
+| policy | tok/s | TPOT | steady mean K | K histogram | accepted/draft |
+|:---|---:|---:|---:|:---|---:|
+| fixed K6 control | 28.398 | 35.214 ms | 5.95 | `{1:1, 6:96}` | 0.716 |
+| active, uncertainty 0.10 | 24.976 | 40.039 ms | 10.75 | `{1:1, 6:2, 7:9, 8:2, 9:1, 10:1, 11:3, 12:48}` | 0.613 |
+| active, uncertainty 0.00 | 29.075 | 34.393 ms | 6.96 | `{2:1, 5:1, 6:8, 7:66, 10:1, 11:1, 12:1}` | 0.780 |
+
+The histograms include the final tail round; mean K and time gates exclude the
+first measured round. Time decomposition explains the tuned result:
+
+| policy | draft calls / sum | verify rounds / sum | steady draft mean/P50/P90 |
+|:---|---:|---:|---:|
+| fixed K6 | 577 / 10.517 s | 97 / 6.981 s | 18.227/18.277/19.370 ms |
+| active, uncertainty 0.10 | 720 / 14.284 s | 67 / 5.750 s | 19.839/20.037/21.360 ms |
+| active, uncertainty 0.00 | 550 / 10.958 s | 79 / 6.195 s | 19.924/19.678/21.934 ms |
+
+The tuned candidate traded `0.441 s` more draft work for `0.786 s` less verify
+work and improved same-seed TPOT by `2.33%`. Its steady draft mean passes the
+temporary `<21 ms` gate, although P90 and the original `<19 ms` target do not.
+The `0.10` result shows that the current intervals are overly conservative;
+the zero-scale run is a policy diagnostic, not evidence that uncertainty is
+truly absent.
+
+Online verify prediction for the tuned run had bias `+6.645 ms`, MAE
+`11.472 ms`, and P90 absolute error `19.023 ms`. Because that residual is
+large, the gain is one seed, and the absolute result remains below the formal
+five-seed K6/vpb4 baseline, this candidate was not promoted to multi-seed
+validation. Further work stays on the early-stop path: recalibrate
+uncertainty/stop margin, reduce demand+simulator error, and restore the
+`<19 ms` hot-path gate.
+
+Evidence:
+
+```text
+results/transfer_v3_active_screen_u010_20260719/
+results/transfer_v3_active_screen_u000_20260719/
+results/transfer_v3_control_k6_vpb4_20260719/
+```
+
 ## 2026-07-13 High-K Early-Stop Follow-Up
 
 This is the latest decision section. The five-seed K6/vpb4 result remains the

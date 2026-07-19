@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nanovllm.engine.speculative.spec_engine import SpeculativeEngine
@@ -207,6 +208,42 @@ class _SamplingTpotModelRunner(_SamplingModelRunner):
                 "verify_cost_prediction_ms": 80.0,
                 "verify_cost_lookahead_prediction_ms": 200.0,
             }, logits
+        return super().call(name, *args)
+
+
+class _TransferAwareTpotModelRunner(_DummyModelRunner):
+    def __init__(self, *, state_complete=True, next_ms=500.0, error_ms=0.0):
+        super().__init__()
+        self.state_complete = bool(state_complete)
+        self.next_ms = float(next_ms)
+        self.error_ms = float(error_ms)
+        self.controls = []
+        self.next_draft_ms = []
+
+    def call(self, name, *args):
+        if name == "start_verify_cost_round":
+            return None
+        if name == "run_draft":
+            seqs = args[0]
+            self.draft_calls += 1
+            predict = bool(args[3]) if len(args) > 3 else True
+            self.controls.append(predict)
+            self.next_draft_ms.append(args[5] if len(args) > 5 else None)
+            state = {
+                "prefetch_step_id": self.draft_calls,
+                "acceptance_alpha": [0.9 for _ in seqs],
+            }
+            if predict:
+                state.update(
+                    {
+                        "verify_cost_prediction_ms": 10.0,
+                        "verify_cost_error_p90_ms": self.error_ms,
+                        "verify_cost_lookahead_prediction_ms": self.next_ms,
+                        "verify_cost_lookahead_error_p90_ms": self.error_ms,
+                        "verify_cost_state_complete": self.state_complete,
+                    }
+                )
+            return [10 + self.draft_calls for _ in seqs], state
         return super().call(name, *args)
 
 
@@ -564,6 +601,126 @@ class TestSpecEngineFlow(unittest.TestCase):
         engine = SpeculativeEngine(model_runner, scheduler, config)
         with self.assertRaisesRegex(ValueError, "sampling temperature"):
             engine.speculative_step([seq])
+
+    def test_transfer_aware_step_compares_only_k_and_k_plus_one_at_k6(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TransferAwareTpotModelRunner(next_ms=500.0)
+        config = SimpleNamespace(
+            max_draft_tokens=12,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="transfer_aware_step",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=6,
+            draft_tpot_cost_model="history",
+            draft_tpot_history_alpha=0.2,
+            draft_tpot_alpha_error_p90=0.0,
+            draft_tpot_draft_error_p90_ms=0.0,
+            draft_tpot_uncertainty_scale=1.0,
+            verify_cuda_graph_bucket_steps=[5, 7, 8, 9, 10, 11, 12, 13],
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        assert model_runner.draft_calls == 6
+        assert model_runner.controls == [False] * 5 + [True]
+        assert all(value is not None for value in model_runner.next_draft_ms)
+        trace = engine.get_profile()["step_traces"][0]
+        cost = trace["draft_tpot_costs"][-1]
+        assert cost["lookahead_horizon"] == 1.0
+        assert cost["lookahead_draft_len"] == 7.0
+        assert cost["stop_decision"] == 1.0
+        assert cost["draft_ms"] == pytest.approx(sum(trace["draft_call_ms"]))
+
+    def test_transfer_aware_uncertain_state_fails_open_until_k12(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TransferAwareTpotModelRunner(
+            state_complete=False,
+            next_ms=500.0,
+        )
+        config = SimpleNamespace(
+            max_draft_tokens=12,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="transfer_aware_step",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=6,
+            verify_cuda_graph_bucket_steps=[5, 7, 8, 9, 10, 11, 12, 13],
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        assert model_runner.draft_calls == 12
+        assert model_runner.controls == [False] * 5 + [True] * 6 + [False]
+        profile = engine.get_profile()
+        assert profile["draft_transfer_aware_fail_open_count"] == 6
+        assert profile["step_traces"][0]["draft_steps_actual"] == 12
+
+    def test_transfer_aware_shadow_matches_hot_path_without_stopping(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TransferAwareTpotModelRunner(next_ms=500.0)
+        config = SimpleNamespace(
+            max_draft_tokens=12,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="transfer_aware_step",
+            draft_tpot_verify_model_mode="shadow",
+            draft_tpot_min_steps=6,
+            draft_tpot_cost_model="history",
+            draft_tpot_history_alpha=0.2,
+            draft_tpot_alpha_error_p90=0.0,
+            draft_tpot_draft_error_p90_ms=0.0,
+            draft_tpot_uncertainty_scale=1.0,
+            verify_cuda_graph_bucket_steps=[5, 7, 8, 9, 10, 11, 12, 13],
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        assert model_runner.draft_calls == 12
+        assert model_runner.controls == [False] * 5 + [True] * 6 + [False]
+        profile = engine.get_profile()
+        assert profile.get("draft_tpot_early_stop_count", 0) == 0
+        assert profile.get("draft_transfer_aware_fail_open_count", 0) == 0
+        evaluated = [
+            row
+            for row in profile["step_traces"][0]["draft_tpot_costs"]
+            if row["prediction_complete"]
+        ]
+        assert len(evaluated) == 6
+        assert all(row["stop_signal"] == 1.0 for row in evaluated)
+        assert all(row["stop_decision"] == 0.0 for row in evaluated)
+
+    def test_transfer_aware_step_rejects_batch_greater_than_one(self):
+        seqs = [
+            _Seq(seq_id=1, token_ids=[1, 2, 3]),
+            _Seq(seq_id=2, token_ids=[1, 2, 3]),
+        ]
+        engine = SpeculativeEngine(
+            _TransferAwareTpotModelRunner(),
+            _DummyScheduler(),
+            SimpleNamespace(
+                max_draft_tokens=12,
+                acceptance_strategy="greedy",
+                draft_tpot_stop_rule="transfer_aware_step",
+            ),
+        )
+        with pytest.raises(ValueError, match="batch size 1"):
+            engine.speculative_step(seqs)
 
 
 if __name__ == "__main__":

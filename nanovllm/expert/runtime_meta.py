@@ -39,6 +39,9 @@ class LayerRuntimeMetaCPU:
     expert_status: torch.Tensor | None = None
     route_status: torch.Tensor | None = None
     execution_activation_count: torch.Tensor | None = None
+    execution_selected_experts: torch.Tensor | None = None
+    execution_routing_weights: torch.Tensor | None = None
+    execution_route_status: torch.Tensor | None = None
 
 
 @dataclass
@@ -49,6 +52,7 @@ class RuntimeMetaOffloadHandle:
     token_capacity: int
     logical_token_count: int
     buffer_bytes: int
+    execution_token_count: int = 0
     host_buffer_slot: int = 0
     layer_start_idx: int = 0
     layer_end_idx: int | None = None
@@ -105,6 +109,7 @@ class ModelRuntimeMetaRecorder:
         self.active_step_id: int = -1
         self.active_mode: str = "idle"
         self.active_logical_token_count: int = 0
+        self.active_execution_token_count: int = 0
         self.verify_metadata_lightweight = _env_truthy("NANOVLLM_VERIFY_METADATA_LIGHTWEIGHT")
         self.verify_metadata_omit_score_sum = (
             self.verify_metadata_lightweight
@@ -121,6 +126,11 @@ class ModelRuntimeMetaRecorder:
         self.verify_cost_profile_enabled = _env_truthy(
             "NANOVLLM_VERIFY_COST_MODEL_PROFILE"
         )
+        self.transfer_aware_profile_enabled = bool(
+            getattr(config, "transfer_aware_profile", False)
+        ) or _env_truthy("NANOVLLM_TRANSFER_AWARE_PROFILE")
+        if self.transfer_aware_profile_enabled:
+            self.wants_route_status = True
 
     def target_host_buffer_pool_size(self, mode: str, token_capacity: int) -> int:
         _ = token_capacity
@@ -146,6 +156,11 @@ class ModelRuntimeMetaRecorder:
         return max(1, target)
 
     def _use_histogram_metadata(self, mode: str) -> bool:
+        if self.transfer_aware_profile_enabled and str(mode) in {
+            "verify",
+            "verify_kt_hybrid",
+        }:
+            return False
         if self.perfect_match_trace_enabled and str(mode) in {
             "draft",
             "verify_kt_hybrid",
@@ -343,6 +358,7 @@ class ModelRuntimeMetaRecorder:
         step_id: int,
         token_capacity: int,
         logical_token_count: int | None = None,
+        execution_token_count: int | None = None,
     ) -> None:
         if token_capacity <= 0:
             self.reset()
@@ -353,6 +369,11 @@ class ModelRuntimeMetaRecorder:
         self.active_step_id = int(step_id)
         self.active_mode = mode
         self.active_logical_token_count = int(logical_token_count if logical_token_count is not None else token_capacity)
+        self.active_execution_token_count = int(
+            execution_token_count
+            if execution_token_count is not None
+            else token_capacity
+        )
         dev = self.device_buffers[key]
         dev["token_count"].zero_()
         if "activation_count" in dev:
@@ -617,6 +638,7 @@ class ModelRuntimeMetaRecorder:
             event=event,
             token_capacity=key[1],
             logical_token_count=self.active_logical_token_count,
+            execution_token_count=self.active_execution_token_count,
             buffer_bytes=buffer_bytes,
             host_buffer_slot=host_slot,
             layer_start_idx=layer_start,
@@ -708,13 +730,30 @@ class ModelRuntimeMetaRecorder:
                 continue
             selected_experts = host["selected_experts"][layer_idx, :token_count]
             routing_weights = host["routing_weights"][layer_idx, :token_count]
+            execution_token_count = int(
+                getattr(handle, "execution_token_count", 0)
+            )
+            if execution_token_count <= 0:
+                execution_token_count = token_count
+            execution_token_count = min(
+                execution_token_count, int(handle.token_capacity)
+            )
+            execution_selected_experts = host["selected_experts"][
+                layer_idx, :execution_token_count
+            ]
+            execution_routing_weights = host["routing_weights"][
+                layer_idx, :execution_token_count
+            ]
             aggregated = _aggregate_layer_runtime_meta_cpu(selected_experts, routing_weights)
             route_status = (
                 host["route_status"][layer_idx, :token_count].clone()
                 if "route_status" in host
                 else None
             )
-            keep_route_rows = bool(self.perfect_match_trace_enabled)
+            keep_route_rows = bool(
+                self.perfect_match_trace_enabled
+                or self.transfer_aware_profile_enabled
+            )
             meta = LayerRuntimeMetaCPU(
                 step_id=handle.step_id,
                 mode=handle.mode,
@@ -734,6 +773,24 @@ class ModelRuntimeMetaRecorder:
                     else None
                 ),
                 route_status=route_status,
+                execution_selected_experts=(
+                    execution_selected_experts.clone()
+                    if self.transfer_aware_profile_enabled
+                    else None
+                ),
+                execution_routing_weights=(
+                    execution_routing_weights.clone()
+                    if self.transfer_aware_profile_enabled
+                    else None
+                ),
+                execution_route_status=(
+                    host["route_status"][
+                        layer_idx, :execution_token_count
+                    ].clone()
+                    if self.transfer_aware_profile_enabled
+                    and "route_status" in host
+                    else None
+                ),
             )
             if route_status is not None:
                 active_routes = route_status > 0
@@ -747,6 +804,7 @@ class ModelRuntimeMetaRecorder:
         self.active_step_id = -1
         self.active_mode = "idle"
         self.active_logical_token_count = 0
+        self.active_execution_token_count = 0
 
     def _buffer_bytes(self, key: tuple[str, int], layer_start: int = 0, layer_end: int | None = None) -> int:
         host = self.host_buffers[key]

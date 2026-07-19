@@ -67,6 +67,43 @@ def compute_priority(
     )
 
 
+def select_predictive_victim_slot(
+    *,
+    slots: list[int] | tuple[int, ...],
+    pending: list[int] | tuple[int, ...],
+    access_values,
+    protected_experts: set[int] | frozenset[int] = frozenset(),
+) -> int | None:
+    """Pure predictive victim rule shared by live and shadow runtimes.
+
+    Empty slots win, pending slots are unavailable, then the least-accessed
+    unprotected expert is selected.  If every usable expert is protected, the
+    same least-accessed fallback keeps prefetch progressing.
+    """
+    selected: tuple[float, int] | None = None
+    fallback: tuple[float, int] | None = None
+    for slot_idx, raw_expert in enumerate(slots):
+        if slot_idx < len(pending) and int(pending[slot_idx]) >= 0:
+            continue
+        expert_idx = int(raw_expert)
+        if expert_idx < 0:
+            return slot_idx
+        value = (
+            float(access_values[expert_idx])
+            if 0 <= expert_idx < len(access_values)
+            else 0.0
+        )
+        candidate = (value, slot_idx)
+        if fallback is None or candidate < fallback:
+            fallback = candidate
+        if expert_idx in protected_experts:
+            continue
+        if selected is None or candidate < selected:
+            selected = candidate
+    chosen = selected if selected is not None else fallback
+    return chosen[1] if chosen is not None else None
+
+
 class GlobalWarmStartQueue:
     def __init__(self, config: Config):
         self.config = config
@@ -790,6 +827,7 @@ class PrefetchRuntime:
         self._prefetch_submitted_bytes_by_stream = defaultdict(int)
         self._prefetch_transfer_enqueue_ms_by_stream = defaultdict(float)
         self._prefetch_completion_latency_ms_by_stream = defaultdict(float)
+        self._transfer_lifecycle_events: list[dict[str, object]] = []
         self._draft_m3_layers_by_step: dict[int, dict[int, bool]] = {}
         self._draft_m3_step0_steps: set[int] = set()
         self._draft_m3_next_is_step0 = True
@@ -865,6 +903,7 @@ class PrefetchRuntime:
             float(self._profile.get("prefetch_max_inflight_observed", 0.0)),
             float(len(self.inflight)),
         )
+        self._record_transfer_lifecycle("submit", ticket)
 
     def _record_prefetch_completed(self, ticket: PrefetchTicket) -> None:
         source = str(ticket.source)
@@ -878,6 +917,7 @@ class PrefetchRuntime:
         self._prefetch_completed_bytes_by_source[source] += num_bytes
         self._prefetch_completion_latency_ms_by_source[source] += latency_ms
         self._prefetch_completion_latency_ms_by_stream[int(ticket.transfer_stream_idx)] += latency_ms
+        self._record_transfer_lifecycle("ready", ticket)
 
     def _record_prefetch_published(self, ticket: PrefetchTicket) -> None:
         source = str(ticket.source)
@@ -886,6 +926,7 @@ class PrefetchRuntime:
         self._profile[f"{source}_prefetch_published_bytes"] += num_bytes
         self._prefetch_published_count_by_source[source] += 1
         self._prefetch_published_bytes_by_source[source] += num_bytes
+        self._record_transfer_lifecycle("publish", ticket)
 
     def _record_prefetch_late(self, ticket: PrefetchTicket) -> None:
         source = str(ticket.source)
@@ -894,6 +935,37 @@ class PrefetchRuntime:
         self._profile[f"{source}_prefetch_late_bytes"] += num_bytes
         self._prefetch_late_count_by_source[source] += 1
         self._prefetch_late_bytes_by_source[source] += num_bytes
+        self._record_transfer_lifecycle("late", ticket)
+
+    def _record_transfer_lifecycle(
+        self,
+        event: str,
+        ticket: PrefetchTicket,
+    ) -> None:
+        if not bool(getattr(self.config, "transfer_aware_profile", False)):
+            return
+        now_ms = time.perf_counter() * 1000.0
+        self._transfer_lifecycle_events.append(
+            {
+                "event": str(event),
+                "timestamp_ms": float(now_ms),
+                "latency_from_submit_ms": max(
+                    0.0, now_ms - float(ticket.submit_ts_ms)
+                ),
+                "step_id": int(ticket.step_id),
+                "layer_idx": int(ticket.layer_idx),
+                "expert_idx": int(ticket.expert_idx),
+                "source": str(ticket.source),
+                "direct_active": bool(ticket.direct_active),
+                "active_slot_idx": int(ticket.active_slot_idx),
+                "active_slot_prev_expert": int(
+                    ticket.active_slot_prev_expert
+                ),
+                "segment_id": int(ticket.segment_id),
+                "num_bytes": int(ticket.num_bytes),
+                "transfer_stream_idx": int(ticket.transfer_stream_idx),
+            }
+        )
 
     def _initial_draft_direct_active_budget(self) -> int:
         return max(
@@ -2363,6 +2435,9 @@ class PrefetchRuntime:
             "prefetch_completion_latency_ms_by_source": dict(
                 self._prefetch_completion_latency_ms_by_source
             ),
+            "transfer_lifecycle_events": list(
+                self._transfer_lifecycle_events
+            ),
             "prefetch_wait_ms": float(self._profile.get("prefetch_wait_ms", 0.0)),
             "prefetch_consumed_count": int(self._profile.get("prefetch_consumed_count", 0.0)),
             "prefetch_timeout_count": int(self._profile.get("prefetch_timeout_count", 0.0)),
@@ -2632,6 +2707,7 @@ class PrefetchRuntime:
             self._prefetch_submitted_bytes_by_stream.clear()
             self._prefetch_transfer_enqueue_ms_by_stream.clear()
             self._prefetch_completion_latency_ms_by_stream.clear()
+            self._transfer_lifecycle_events.clear()
             self._draft_m3_layers_by_step.clear()
             self._draft_m3_step0_steps.clear()
             self._draft_m3_next_is_step0 = True
@@ -2780,30 +2856,23 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         rankguard = self.cache_strategy if isinstance(self.cache_strategy, LFURankGuardStrategy) else None
         li = None if layer_idx is None else int(layer_idx)
 
-        best_slot: int | None = None
-        best_value: int | None = None
-        fb_slot: int | None = None      # fallback ignoring protection (safety valve)
-        fb_value: int | None = None
-        for slot_idx, slot_expert in enumerate(cache.slot_to_expert):
-            if cache.is_active_slot_pending(slot_idx):
-                continue
-            e = int(slot_expert)
-            if e < 0:
-                return slot_idx  # empty slot: no eviction needed
-            value = int(cache.access_count[e]) if use_lfu else int(cache.last_access_step[e])
-            if fb_value is None or value < fb_value:
-                fb_value = value
-                fb_slot = slot_idx
-            if li is not None and self._round_protected(li, e):
-                continue
-            if rankguard is not None and li is not None and rankguard.is_protected(li, e):
-                continue
-            if best_value is None or value < best_value:
-                best_value = value
-                best_slot = slot_idx
-        if best_slot is not None:
-            return best_slot
-        return fb_slot  # all protected -> safety valve keeps prefetch progressing
+        protected = set(self._round_loaded.get(li, ())) if li is not None else set()
+        if rankguard is not None and li is not None:
+            protected.update(
+                int(expert_idx)
+                for expert_idx in cache.slot_to_expert
+                if int(expert_idx) >= 0
+                and rankguard.is_protected(li, int(expert_idx))
+            )
+        access_values = (
+            cache.access_count if use_lfu else cache.last_access_step
+        )
+        return select_predictive_victim_slot(
+            slots=cache.slot_to_expert,
+            pending=cache.active_slot_pending_expert,
+            access_values=access_values,
+            protected_experts=protected,
+        )
 
     def _select_publish_slot_cpu(self, cache, *, expert_idx, step_id, layer_idx=None) -> int | None:
         return self._select_protected_victim(cache, layer_idx, expert_idx)

@@ -12,6 +12,7 @@ from scripts.bench_eval_workload_tpot import (
     load_dataset_samples,
     resolve_acceptance_predictor,
     select_samples,
+    steady_draft_call_stats,
     TPOT_DEFINITION,
 )
 
@@ -146,3 +147,44 @@ def test_explicitly_disabling_required_predictor_fails(tmp_path):
         assert "draft_stop_policy=tpot" in str(error)
     else:
         raise AssertionError("required predictor disable should fail")
+
+
+def test_k12_transfer_step_preset_uses_dense_one_step_policy(tmp_path):
+    argv = [
+        "--output-dir",
+        str(tmp_path),
+        "--optimized-config",
+        "k12_transfer_step",
+    ]
+    args = build_parser().parse_args(argv)
+
+    apply_optimized_config(args, argv)
+    predictor = resolve_acceptance_predictor(args)
+
+    assert args.max_draft_tokens_values == "12"
+    assert args.draft_tpot_stop_rule == "transfer_aware_step"
+    assert args.draft_tpot_min_steps == 6
+    assert args.draft_tpot_cost_model == "history"
+    assert args.draft_tpot_lookahead_cache_credit_ms_per_step == 0.0
+    assert args.verify_cuda_graph_bucket_steps == "5,7,8,9,10,11,12,13"
+    assert args.verify_prefetch_max_per_boundary == 4
+    assert predictor["effective"] is True
+
+
+def test_steady_draft_gate_drops_first_round_and_reports_distribution():
+    stats = steady_draft_call_stats(
+        {
+            "spec_step_traces": [
+                {"draft_call_ms": [50.0, 40.0]},
+                {"draft_call_ms": [10.0, 12.0]},
+                {"draft_call_ms": [14.0, 16.0]},
+            ]
+        }
+    )
+
+    assert stats["steady_draft_call_count"] == 4
+    assert stats["steady_draft_call_mean_ms"] == 13.0
+    assert stats["steady_draft_call_p50_ms"] == 13.0
+    assert stats["steady_draft_call_p90_ms"] == pytest.approx(15.4)
+    assert stats["steady_draft_gate_ms"] == 21.0
+    assert stats["steady_draft_gate_passed"] is True

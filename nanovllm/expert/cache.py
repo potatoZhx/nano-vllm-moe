@@ -101,6 +101,13 @@ class LayerExpertCache:
 
         self.last_access_step = [-1] * self.num_experts
         self.access_count = [0] * self.num_experts
+        # Read-only hot-path mirrors for transfer-aware shadow snapshots.
+        self.last_access_step_array = np.full(
+            self.num_experts, -1, dtype=np.int32
+        )
+        self.access_count_array = np.zeros(
+            self.num_experts, dtype=np.int32
+        )
         self.access_score_sum = [0.0] * self.num_experts
         self.slot_generation = [0] * self.num_slots
         self._cache_fill_no_cpu_flag_device: torch.Tensor | None = None
@@ -173,6 +180,8 @@ class LayerExpertCache:
                 continue
             self.last_access_step[expert_idx] = int(step_id)
             self.access_count[expert_idx] += 1
+            self.last_access_step_array[expert_idx] = int(step_id)
+            self.access_count_array[expert_idx] += 1
             if score_sum is not None:
                 self.access_score_sum[expert_idx] += float(score_sum[i].item())
 
@@ -203,6 +212,10 @@ class LayerExpertCache:
                 continue
             self.last_access_step[expert_idx] = int(step_id)
             self.access_count[expert_idx] += int(activation_list[i]) if activation_list is not None else 1
+            self.last_access_step_array[expert_idx] = int(step_id)
+            self.access_count_array[expert_idx] = self.access_count[
+                expert_idx
+            ]
             if score_list is not None:
                 self.access_score_sum[expert_idx] += float(score_list[i])
 

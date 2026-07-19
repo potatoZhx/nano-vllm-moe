@@ -110,6 +110,51 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
         self.assertEqual(meta.execution_activation_count.tolist(), [2, 2, 1, 3])
         self.assertEqual(meta.expert_status.tolist(), [2, 1, 1, 2])
 
+    def test_transfer_profile_keeps_logical_and_execution_route_rows(self):
+        recorder = ModelRuntimeMetaRecorder(
+            config=SimpleNamespace(transfer_aware_profile=True),
+            hf_config=SimpleNamespace(
+                num_hidden_layers=1,
+                num_experts_per_tok=2,
+                num_experts=4,
+            ),
+        )
+        recorder.arm(
+            mode="verify_kt_hybrid",
+            step_id=9,
+            token_capacity=4,
+            logical_token_count=2,
+            execution_token_count=4,
+        )
+        selected = torch.tensor(
+            [[0, 1], [1, 2], [3, 3], [0, 3]], dtype=torch.int64
+        )
+        weights = torch.ones(4, 2, dtype=torch.float32)
+        uncached = torch.tensor(
+            [True, False, False, False, True, True, True, True],
+            dtype=torch.bool,
+        )
+        recorder.record_layer(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=weights,
+            uncached_route_mask=uncached,
+        )
+
+        handle = recorder.offload_async(stream=None)
+        out = recorder.collect(handle, wait=True)
+        meta = out[0]
+
+        self.assertEqual(handle.metadata_format, "raw")
+        self.assertEqual(meta.selected_experts.tolist(), selected[:2].tolist())
+        self.assertEqual(meta.execution_selected_experts.tolist(), selected.tolist())
+        self.assertEqual(meta.execution_route_status.tolist(), [
+            [2, 1],
+            [1, 1],
+            [2, 2],
+            [2, 2],
+        ])
+
     def test_collect_supports_host_buffer_pool_slot(self):
         recorder = ModelRuntimeMetaRecorder(
             config=SimpleNamespace(prefetch_metadata_host_buffer_pool_size=2),

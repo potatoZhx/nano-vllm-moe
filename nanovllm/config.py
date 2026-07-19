@@ -143,10 +143,18 @@ class Config:
     draft_tpot_lookahead_cache_credit_ms_per_step: float = 0.0
     draft_tpot_short_verify_penalty_ms: float = 0.0
     draft_tpot_verify_cost_floor_ms: float = 0.0
+    # Uncertainty used by the one-step transfer-aware rule.  The policy stops
+    # only when optimistic T(K+1) is still worse than conservative T(K).
+    draft_tpot_alpha_error_p90: float = 0.05
+    draft_tpot_draft_error_p90_ms: float = 1.0
+    draft_tpot_uncertainty_scale: float = 1.0
     draft_tpot_stop_rule: str = "first_increase"  # includes "bucket_lookahead"
     draft_tpot_verify_model_mode: str = "off"  # "off" | "shadow" | "active"
     draft_tpot_verify_model_path: str = ""
     draft_tpot_alpha_calibration_path: str = ""
+    # Profile-only truth collection for the v3 route/cache/transfer pipeline.
+    # This does not enable an active policy or require a fitted v3 artifact.
+    transfer_aware_profile: bool = False
     verify_prefetch_tpot_dynamic_budget_enabled: bool = False
     verify_prefetch_tpot_dynamic_budget_token_threshold: int = 10
     verify_prefetch_tpot_dynamic_budget_small: int = 4
@@ -297,6 +305,10 @@ class Config:
         if self.acceptance_predictor_enabled:
             assert self.inference_mode == "spec", "acceptance predictor requires spec mode"
             assert self.acceptance_predictor_path, "acceptance_predictor_enabled requires acceptance_predictor_path"
+        if self.transfer_aware_profile:
+            assert self.acceptance_predictor_enabled, (
+                "transfer-aware profile requires acceptance_predictor_enabled=True"
+            )
         assert self.draft_tpot_cost_model in {"static", "history"}
         assert 0.0 < self.draft_tpot_history_alpha <= 1.0
         assert self.draft_tpot_min_steps >= 0
@@ -305,12 +317,16 @@ class Config:
         assert self.draft_tpot_lookahead_cache_credit_ms_per_step >= 0.0
         assert self.draft_tpot_short_verify_penalty_ms >= 0.0
         assert self.draft_tpot_verify_cost_floor_ms >= 0.0
+        assert 0.0 <= self.draft_tpot_alpha_error_p90 <= 1.0
+        assert self.draft_tpot_draft_error_p90_ms >= 0.0
+        assert self.draft_tpot_uncertainty_scale >= 0.0
         assert self.draft_tpot_stop_rule in {
             "first_increase",
             "best_margin",
             "lookahead",
             "lookahead_hysteresis",
             "bucket_lookahead",
+            "transfer_aware_step",
         }
         assert self.draft_tpot_verify_model_mode in {"off", "shadow", "active"}
         if self.draft_tpot_alpha_calibration_path:
@@ -334,6 +350,33 @@ class Config:
         if self.draft_tpot_stop_rule == "bucket_lookahead":
             assert self.draft_tpot_verify_model_mode == "active", (
                 "bucket_lookahead requires draft_tpot_verify_model_mode='active'"
+            )
+        if self.draft_tpot_stop_rule == "transfer_aware_step":
+            dense_buckets = {5, 7, 8, 9, 10, 11, 12, 13}
+            assert self.draft_tpot_verify_model_mode in {"shadow", "active"}, (
+                "transfer_aware_step requires draft_tpot_verify_model_mode="
+                "'shadow' or 'active'"
+            )
+            assert self.draft_stop_policy == "tpot", (
+                "transfer_aware_step requires draft_stop_policy='tpot'"
+            )
+            assert self.max_draft_tokens == 12, (
+                "transfer_aware_step is validated only with max_draft_tokens=12"
+            )
+            assert self.draft_tpot_min_steps == 6, (
+                "transfer_aware_step is validated only with draft_tpot_min_steps=6"
+            )
+            assert self.verify_cuda_graph, (
+                "transfer_aware_step requires verify CUDA graphs"
+            )
+            assert dense_buckets.issubset(
+                {int(value) for value in self.verify_cuda_graph_bucket_steps}
+            ), (
+                "transfer_aware_step requires dense verify buckets "
+                "5,7,8,9,10,11,12,13"
+            )
+            assert self.draft_tpot_lookahead_cache_credit_ms_per_step == 0.0, (
+                "transfer_aware_step does not use legacy lookahead cache credit"
             )
         assert self.verify_prefetch_tpot_dynamic_budget_token_threshold >= 1
         assert self.verify_prefetch_tpot_dynamic_budget_small >= 0

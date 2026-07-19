@@ -2,6 +2,112 @@
 
 Date: 2026-07-11
 
+## 2026-07-19 Schema-v3 Transfer-Aware Pipeline
+
+The current target is `Kmax=12` with dense batch-1 verify buckets
+`5,7,8,9,10,11,12,13` and a one-step early-stop controller. The older v2
+artifact and its frozen-cache multi-horizon path remain available only for
+reproduction. They cannot drive the v3 active policy.
+
+Schema v3 separates the causal stages:
+
+1. calibrated draft-original routes predict each aligned verify row and the
+   remaining verify-next row;
+2. an immutable shadow simulator copies resident, pending, inflight, victim,
+   reservation, completion, and publish state;
+3. the simulator predicts compute-time CPU routes/experts by segment at the
+   runtime `vpb`;
+4. a bucket-conditioned nonnegative model predicts
+   `verify_accept_ready_ms` from segment CPU experts, CPU routes, and maximum
+   per-layer experts. Transfer submits are retained only if they improve
+   untouched holdout residuals.
+
+The artifact identity binds demand, transfer timing, latency, protocol, and
+hardware/kernel fingerprint. `vpb` is deliberately not a fixed artifact
+constant. The fit tool evaluates `0..16` offline and selects the lowest
+predicted TPOT, breaking ties toward the smaller budget:
+
+```bash
+python scripts/fit_transfer_aware_verify_cost_v3.py \
+  'results/dense_workload_profiles/**/*sample*.json' \
+  --latency-profiles 'results/dense_clean_latency/**/*sample*.json' \
+  --gpu-model 'NVIDIA GeForce RTX 4090' \
+  --kt-kernel-version <installed-version> \
+  --output results/transfer_aware/verify_cost.active.v3.json
+```
+
+Workload truth and latency must come from separate runs. The workload run uses
+`--transfer-aware-profile true` and records draft rows, logical/execution
+verify rows, compute-time CPU status, cache snapshots, and transfer ticket
+lifecycle. The paired latency run leaves that instrumentation off. Pairing is
+by full request/sample/seed/round and also checks the output digest.
+
+Accuracy and TPOT values are diagnostic soft targets. Hard validity checks are
+route-row alignment, correct graph selection/padding, complete output,
+protocol/fingerprint match, finite acceptance-ready timing, and no accidental
+eager fallback. For the first active screen, the post-warmup,
+post-first-round steady `draft_call_ms` mean gate is provisionally `<21 ms`;
+P50 and P90 are always reported. Restoring the original `<19 ms` gate remains
+explicit follow-up work on the boundary simulator and phase-1 hot path.
+
+### Observed v3 fit and deployment screen
+
+The 2026-07-19 fit used 84 instrumented workload profiles and 84 clean
+latency profiles. Complete request/process/seed groups were assigned to only
+one split. Of the 84 nominal workload/latency pairs, 73 had different output
+digests; the fitter therefore did not attach clean latency to workload truth
+by round identity. Clean latency and workload features remain separate
+grouped samples rather than a synthetic paired trace.
+
+| diagnostic | grouped holdout | untouched vpb7 checkpoint |
+|:---|---:|---:|
+| verify-next demand route-count L1 | 9.900 | 9.734 |
+| clean verify latency MAE | 7.479 ms | 5.478 ms |
+| clean verify latency P90 absolute error | 15.193 ms | 10.774 ms |
+| predicted-demand + simulated-cache ablation MAE | 15.737 ms | 12.820 ms |
+| actual-demand + actual-cache ablation MAE | 9.518 ms | 6.127 ms |
+
+Within fixed buckets, partial correlation with clean verify latency was
+`0.884` for CPU experts and `0.869` for CPU routes. Instrumented transfer
+submits had partial correlation `0.193` and did not reduce untouched-holdout
+residuals, so the optional submit feature was excluded. The four transfer
+ablations localize the largest remaining loss to predicted demand plus
+simulated cache, rather than to the bucket base alone.
+
+Offline replay over vpb `0..16` selected vpb4 after checkpoint-derived
+extrapolation uncertainty was applied; the raw point estimate favored vpb0.
+Only vpb4 was validated online. The selected artifact is:
+
+```text
+results/transfer_v3_artifact_20260719/verify_cost_v3.json
+model_id = 35cdb4d18fa98c67c0b26e0cf0c38e5ade490a5247237c4785f94f4175a2dc0c
+```
+
+A fixed-K6..K12 dense-graph smoke used the exact bucket at every full-K
+endpoint; shorter output-tail rounds used the expected padded bucket. Every
+verify record used a CUDA graph, outputs were complete, and steady draft means
+ranged from `18.23` to `18.41 ms`. The final instrumentation-off boundary
+shadow reached steady draft mean/P50/P90 `20.287/20.459/21.647 ms`; this
+passes the provisional mean `<21 ms` gate, not the retained `<19 ms` target.
+
+The tuned active screen (`uncertainty_scale=0`, vpb4) realized online verify
+prediction bias `+6.645 ms`, MAE `11.472 ms`, and P90 absolute error
+`19.023 ms`. Its prediction intervals therefore remain the primary policy
+calibration issue. It reached `29.075 tok/s` and `34.393 ms` TPOT versus the
+same-seed fixed-K6/vpb4 control at `28.398 tok/s` and `35.214 ms`, but remains
+below the formal five-seed K6/vpb4 baseline (`33.501 tok/s`, `29.877 ms`).
+This is a mechanism screen, not a stable promotion result.
+
+Evidence:
+
+```text
+results/transfer_v3_artifact_20260719/verify_cost_v3.json.report.json
+results/dense_graph_smoke_20260719/
+results/transfer_v3_shadow_vpb4_fast3_20260719/
+results/transfer_v3_active_screen_u000_20260719/
+results/transfer_v3_control_k6_vpb4_20260719/
+```
+
 ## 2026-07-13 Multi-Horizon Update
 
 The promoted sampling model remains valid for the current cache snapshot and

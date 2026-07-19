@@ -149,6 +149,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k6_decode",
     "k12_decode",
     "k12_bucket_stop",
+    "k12_transfer_step",
 )
 TPOT_DEFINITION = "decode_sec / (generated_output_tokens - 1)"
 
@@ -203,6 +204,27 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
         "kt_num_threads": 16,
         "kt_direct_backend": "avx2_bf16",
         "verify_cuda_graph_bucket_steps": "3,5,7,10,13",
+        "verify_prefetch_rank_multiplier": 1,
+        "decode_driver": "generate",
+        "reset_seed_after_warmup": True,
+    },
+    "k12_transfer_step": {
+        "allocation_modes": "profile_weighted",
+        "cache_ratios": "0.3125",
+        "max_draft_tokens_values": "12",
+        "segment_sizes": "12",
+        "verify_prefetch_max_per_boundary": 4,
+        "draft_stop_policy": "tpot",
+        "draft_tpot_cost_model": "history",
+        "draft_tpot_stop_rule": "transfer_aware_step",
+        "draft_tpot_min_steps": 6,
+        "draft_tpot_stop_margin": 0.0,
+        "draft_tpot_lookahead_cache_credit_ms_per_step": 0.0,
+        "draft_tpot_verify_model_mode": "active",
+        "acceptance_predictor_enabled": True,
+        "kt_num_threads": 16,
+        "kt_direct_backend": "avx2_bf16",
+        "verify_cuda_graph_bucket_steps": "5,7,8,9,10,11,12,13",
         "verify_prefetch_rank_multiplier": 1,
         "decode_driver": "generate",
         "reset_seed_after_warmup": True,
@@ -303,6 +325,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "draft_tpot_stop_rule": "--draft-tpot-stop-rule",
         "draft_tpot_min_steps": "--draft-tpot-min-steps",
         "draft_tpot_stop_margin": "--draft-tpot-stop-margin",
+        "draft_tpot_cost_model": "--draft-tpot-cost-model",
         "draft_tpot_lookahead_cache_credit_ms_per_step": (
             "--draft-tpot-lookahead-cache-credit-ms-per-step"
         ),
@@ -348,6 +371,8 @@ def resolve_acceptance_predictor(args: argparse.Namespace) -> dict[str, Any]:
         required_by.append(f"verify_model_mode={verify_model_mode}")
     if alpha_calibration_path:
         required_by.append("alpha_calibration")
+    if bool(getattr(args, "transfer_aware_profile", False)):
+        required_by.append("transfer_aware_profile")
 
     effective = bool(required_by) if requested is None else bool(requested)
     if required_by and not effective:
@@ -367,13 +392,18 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
     optimized_config = str(getattr(args, "optimized_config", "none") or "none")
     rank_multiplier = getattr(args, "verify_prefetch_rank_multiplier", None)
     verify_cost_profile = bool(getattr(args, "verify_cost_model_profile", False))
+    transfer_aware_profile = bool(
+        getattr(args, "transfer_aware_profile", False)
+    )
     should_configure = (
         optimized_config != "none"
         or rank_multiplier is not None
         or verify_cost_profile
+        or transfer_aware_profile
     )
     if not should_configure:
         os.environ.pop("NANOVLLM_VERIFY_COST_MODEL_PROFILE", None)
+        os.environ.pop("NANOVLLM_TRANSFER_AWARE_PROFILE", None)
         return {}
 
     env_overrides: dict[str, str] = {}
@@ -396,6 +426,12 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
         env_overrides["NANOVLLM_VERIFY_COST_MODEL_PROFILE"] = "1"
     else:
         os.environ.pop("NANOVLLM_VERIFY_COST_MODEL_PROFILE", None)
+    if transfer_aware_profile:
+        env_overrides["NANOVLLM_TRANSFER_AWARE_PROFILE"] = "1"
+        # The v3 profile includes the legacy aggregate execution truth too.
+        env_overrides["NANOVLLM_VERIFY_COST_MODEL_PROFILE"] = "1"
+    else:
+        os.environ.pop("NANOVLLM_TRANSFER_AWARE_PROFILE", None)
 
     for key, value in env_overrides.items():
         os.environ[key] = value
@@ -1126,6 +1162,44 @@ def reset_llm_profile(llm: Any) -> None:
     llm.get_profile(reset=True)
 
 
+# TODO(transfer-aware-hotpath): restore the promotion gate to 19 ms after the
+# boundary simulator and first-draft phase-1 path are optimized. The user
+# explicitly approved 21 ms as a provisional gate for the active screen.
+PROVISIONAL_STEADY_DRAFT_GATE_MS = 21.0
+
+
+def steady_draft_call_stats(
+    profile: dict[str, Any],
+    *,
+    gate_ms: float = PROVISIONAL_STEADY_DRAFT_GATE_MS,
+    drop_initial_rounds: int = 1,
+) -> dict[str, Any]:
+    """Flatten steady draft calls after warmup reset and first-round removal."""
+    traces = profile.get("spec_step_traces", [])
+    if not isinstance(traces, list):
+        traces = []
+    steady_traces = traces[max(0, int(drop_initial_rounds)) :]
+    calls = [
+        float(value)
+        for trace in steady_traces
+        if isinstance(trace, dict)
+        for value in trace.get("draft_call_ms", [])
+        if isinstance(value, (int, float))
+    ]
+    mean_ms = sum(calls) / len(calls) if calls else 0.0
+    return {
+        "steady_draft_call_count": len(calls),
+        "steady_draft_call_mean_ms": mean_ms,
+        "steady_draft_call_p50_ms": percentile(calls, 50),
+        "steady_draft_call_p90_ms": percentile(calls, 90),
+        "steady_draft_gate_ms": float(gate_ms),
+        "steady_draft_gate_passed": bool(calls and mean_ms < float(gate_ms)),
+        "steady_draft_dropped_initial_rounds": max(
+            0, int(drop_initial_rounds)
+        ),
+    }
+
+
 def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     scalar_keys = [
         "step_count",
@@ -1247,6 +1321,8 @@ def collect_profile_metrics(profile: dict[str, Any], result: dict[str, Any]) -> 
     accepted = float(profile.get("spec_accepted_tokens_total", 0.0) or 0.0)
     if draft_tokens > 0.0:
         metrics["profile_acceptance_rate"] = accepted / draft_tokens
+    for key, value in steady_draft_call_stats(profile).items():
+        metrics[f"profile_{key}"] = value
     return metrics
 
 
@@ -1302,12 +1378,20 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         ),
         draft_tpot_short_verify_penalty_ms=float(args.draft_tpot_short_verify_penalty_ms),
         draft_tpot_verify_cost_floor_ms=float(args.draft_tpot_verify_cost_floor_ms),
+        draft_tpot_alpha_error_p90=float(args.draft_tpot_alpha_error_p90),
+        draft_tpot_draft_error_p90_ms=float(
+            args.draft_tpot_draft_error_p90_ms
+        ),
+        draft_tpot_uncertainty_scale=float(
+            args.draft_tpot_uncertainty_scale
+        ),
         draft_tpot_stop_rule=str(args.draft_tpot_stop_rule),
         draft_tpot_verify_model_mode=str(args.draft_tpot_verify_model_mode),
         draft_tpot_verify_model_path=str(args.draft_tpot_verify_model_path),
         draft_tpot_alpha_calibration_path=str(
             args.draft_tpot_alpha_calibration_path
         ),
+        transfer_aware_profile=bool(args.transfer_aware_profile),
         cpu_expert_execution_enabled=True,
         cpu_expert_pin_memory=True,
         cpu_expert_backend="kt_direct",
@@ -1541,6 +1625,9 @@ def run_case(
                     if bool(args.save_profile_json):
                         profile["verify_cost_measurement"] = {
                             "enabled": bool(args.verify_cost_model_profile),
+                            "transfer_aware_enabled": bool(
+                                args.transfer_aware_profile
+                            ),
                             "target": "spec.verify_accept_ready_ms",
                             "target_boundary": (
                                 "before ModelRunner.run_verify through acceptance-result "
@@ -1548,6 +1635,11 @@ def run_case(
                             ),
                             "execution_workload": (
                                 "all CUDA-graph bucket rows, including padding"
+                            ),
+                            "route_alignment": (
+                                "draft forward i original routes -> verify "
+                                "logical row i-1; one verify-next row remains "
+                                "after the final draft"
                             ),
                             "profile_cuda_sync": bool(args.engine_profile_cuda_sync),
                             "case": dict(case),
@@ -1558,6 +1650,42 @@ def run_case(
                                 "source_index": int(base_row["source_index"]),
                             },
                             "runtime_seed": int(base_row["runtime_seed"]),
+                            "protocol": {
+                                "batch_size": 1,
+                                "acceptance_strategy": str(
+                                    args.acceptance_strategy
+                                ),
+                                "temperature": float(args.temperature),
+                                "cache_ratio": float(case["cache_ratio"]),
+                                "max_draft_tokens": int(
+                                    case["max_draft_tokens"]
+                                ),
+                                "prefetch_runtime_kind": str(
+                                    args.prefetch_runtime_kind
+                                ),
+                                "verify_buckets": _parse_csv(
+                                    args.verify_cuda_graph_bucket_steps, int
+                                ),
+                            },
+                            "output_validation": {
+                                "output_sequence_count": int(
+                                    result.get("output_sequence_count", 0)
+                                ),
+                                "fixed_length_ok": bool(
+                                    result.get("output_fixed_length_ok", False)
+                                ),
+                                "error": str(
+                                    result.get(
+                                        "output_validation_error", ""
+                                    )
+                                ),
+                                "outputs_digest": str(
+                                    result.get("outputs_digest", "")
+                                ),
+                            },
+                            "steady_draft_gate": steady_draft_call_stats(
+                                profile
+                            ),
                             "optimized_env_overrides": dict(
                                 getattr(args, "_optimized_env_overrides", {})
                             ),
@@ -2088,6 +2216,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "draft_tpot_short_verify_penalty_ms": float(args.draft_tpot_short_verify_penalty_ms),
             "draft_tpot_verify_cost_floor_ms": float(args.draft_tpot_verify_cost_floor_ms),
+            "draft_tpot_alpha_error_p90": float(
+                args.draft_tpot_alpha_error_p90
+            ),
+            "draft_tpot_draft_error_p90_ms": float(
+                args.draft_tpot_draft_error_p90_ms
+            ),
+            "draft_tpot_uncertainty_scale": float(
+                args.draft_tpot_uncertainty_scale
+            ),
             "draft_tpot_stop_rule": str(args.draft_tpot_stop_rule),
             "draft_tpot_verify_model_mode": str(
                 args.draft_tpot_verify_model_mode
@@ -2099,6 +2236,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args.draft_tpot_alpha_calibration_path
             ),
             "verify_cost_model_profile": bool(args.verify_cost_model_profile),
+            "transfer_aware_profile": bool(args.transfer_aware_profile),
             "verify_prefetch_max_per_boundary": int(
                 args.verify_prefetch_max_per_boundary
             ),
@@ -2334,6 +2472,7 @@ def build_parser() -> argparse.ArgumentParser:
             "lookahead",
             "lookahead_hysteresis",
             "bucket_lookahead",
+            "transfer_aware_step",
         ],
         default="first_increase",
     )
@@ -2344,6 +2483,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--draft-tpot-verify-model-path", default="")
     parser.add_argument("--draft-tpot-alpha-calibration-path", default="")
+    parser.add_argument("--draft-tpot-alpha-error-p90", type=float, default=0.05)
+    parser.add_argument(
+        "--draft-tpot-draft-error-p90-ms", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--draft-tpot-uncertainty-scale", type=float, default=1.0
+    )
 
     parser.add_argument("--rank-guard-threshold", type=float, default=0.15)
     parser.add_argument("--rank-guard-ema-alpha", type=float, default=0.95)
@@ -2484,6 +2630,15 @@ def build_parser() -> argparse.ArgumentParser:
             "collection and keeps synchronous profilers disabled."
         ),
     )
+    parser.add_argument(
+        "--transfer-aware-profile",
+        type=str2bool,
+        default=False,
+        help=(
+            "Collect v3 draft-route alignment, logical/execution verify rows, "
+            "resident/pending/inflight snapshots, and transfer ticket lifecycle."
+        ),
+    )
     parser.add_argument("--skip-existing", type=str2bool, default=True)
     parser.add_argument("--fail-fast", type=str2bool, default=True)
     parser.add_argument("--fail-on-output-validation-error", type=str2bool, default=True)
@@ -2499,7 +2654,9 @@ def main() -> None:
     args = build_parser().parse_args(argv)
     args._optimized_config_applied = apply_optimized_config(args, argv)
     args._acceptance_predictor_resolution = resolve_acceptance_predictor(args)
-    if bool(args.verify_cost_model_profile):
+    if bool(args.verify_cost_model_profile) or bool(
+        args.transfer_aware_profile
+    ):
         args.collect_profile = True
         args.engine_profile = True
         args.engine_profile_cuda_sync = False
