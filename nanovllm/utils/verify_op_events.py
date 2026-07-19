@@ -82,7 +82,6 @@ def verify_op_event(label: str, layer_idx: int = -1):
         not verify_op_event_enabled()
         or not _capture_stack
         or not torch.cuda.is_available()
-        or not torch.cuda.is_current_stream_capturing()
     ):
         with nullcontext():
             yield

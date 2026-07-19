@@ -152,6 +152,73 @@ class TestPredictorModule(unittest.TestCase):
 
 
 class TestFeatureParity(unittest.TestCase):
+    def test_token_features_do_not_require_full_vocab_fp32_materialization(self):
+        device = _device()
+        ext = _build_extractor(device, max_bs=2)
+        logits = torch.randn(2, VOCAB, device=device, dtype=torch.bfloat16)
+        reference_topk = torch.topk(logits.float(), k=32, dim=-1).values
+
+        ext.set_token_features_from_logits(logits)
+
+        top1 = reference_topk[:, 0]
+        top2 = reference_topk[:, 1]
+        shifted = reference_topk - reference_topk.max(
+            dim=1, keepdim=True
+        ).values
+        probs = torch.exp(shifted)
+        probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1)
+        expected = torch.stack(
+            [
+                top1,
+                top2,
+                top1 - top2,
+                reference_topk[:, :5].mean(dim=1),
+                top1 - reference_topk[:, :5].mean(dim=1),
+                reference_topk.std(dim=1, unbiased=False),
+                probs[:, 0],
+                entropy,
+                torch.exp(entropy),
+                torch.full_like(top1, 32.0),
+            ],
+            dim=1,
+        )
+        self.assertTrue(
+            torch.allclose(
+                ext.token_features_buf[:2],
+                expected,
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        )
+
+    def test_read_outputs_can_return_original_routes_in_same_transfer(self):
+        device = _device()
+        rng = np.random.default_rng(11)
+        ext = _build_extractor(device, max_bs=2)
+        seqs = [_FakeSeq(seq_id=1, num_prompt_tokens=3), _FakeSeq(seq_id=2, num_prompt_tokens=4)]
+        expected = []
+        for row in range(2):
+            step, _ = _make_step(rng)
+            _fill_row(ext, row, step)
+            expected.append(
+                np.asarray(
+                    [layer["original_ids"][0] for layer in step["router"]],
+                    dtype=np.int64,
+                )
+            )
+        ext.original_route_readback_enabled = True
+        ext.alpha_buf[:2].copy_(torch.tensor([0.25, 0.75], device=device))
+        ext._pack_outputs(2)
+
+        alphas, routes = ext.read_outputs(seqs, include_original_routes=True)
+
+        self.assertEqual(alphas, [0.25, 0.75])
+        self.assertIsInstance(routes, np.ndarray)
+        routes_array = np.asarray(routes, dtype=np.int64).transpose(1, 0, 2)
+        self.assertTrue(np.array_equal(routes_array[0], expected[0]))
+        self.assertTrue(np.array_equal(routes_array[1], expected[1]))
+
     def test_route_and_token_features_batched(self):
         device = _device()
         rng = np.random.default_rng(1)

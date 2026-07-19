@@ -37,6 +37,8 @@ class LayerRuntimeMetaCPU:
     miss_count: float = 0.0
     active_count: float = 0.0
     expert_status: torch.Tensor | None = None
+    route_status: torch.Tensor | None = None
+    execution_activation_count: torch.Tensor | None = None
 
 
 @dataclass
@@ -112,6 +114,13 @@ class ModelRuntimeMetaRecorder:
             self.verify_metadata_lightweight
             or _env_truthy("NANOVLLM_VERIFY_METADATA_OMIT_STATUS")
         )
+        self.perfect_match_trace_enabled = _env_truthy(
+            "NANOVLLM_DRAFT_PERFECT_MATCH_TRACE"
+        )
+        self.wants_route_status = self.perfect_match_trace_enabled
+        self.verify_cost_profile_enabled = _env_truthy(
+            "NANOVLLM_VERIFY_COST_MODEL_PROFILE"
+        )
 
     def target_host_buffer_pool_size(self, mode: str, token_capacity: int) -> int:
         _ = token_capacity
@@ -137,6 +146,11 @@ class ModelRuntimeMetaRecorder:
         return max(1, target)
 
     def _use_histogram_metadata(self, mode: str) -> bool:
+        if self.perfect_match_trace_enabled and str(mode) in {
+            "draft",
+            "verify_kt_hybrid",
+        }:
+            return False
         if str(mode) == "verify_kt_hybrid" and self.num_experts > 0:
             return True
         return (
@@ -147,6 +161,11 @@ class ModelRuntimeMetaRecorder:
         )
 
     def _use_score_sum_metadata(self, mode: str) -> bool:
+        if self.perfect_match_trace_enabled and str(mode) in {
+            "draft",
+            "verify_kt_hybrid",
+        }:
+            return False
         return (
             str(mode) == "draft"
             and str(getattr(self.config, "prefetch_runtime_kind", "legacy")) == "dual_queue"
@@ -185,10 +204,14 @@ class ModelRuntimeMetaRecorder:
                 buf["expert_status"] = torch.empty(
                     (self.num_layers, self.num_experts), dtype=torch.int8, device="cpu", pin_memory=pin,
                 )
+            if is_kt_hybrid and self.verify_cost_profile_enabled:
+                buf["execution_activation_count"] = torch.empty(
+                    (self.num_layers, self.num_experts), dtype=torch.int32, device="cpu", pin_memory=pin,
+                )
             return buf
 
         if device.type == "cuda":
-            return {
+            buf = {
                 "selected_experts": torch.empty(
                     (self.num_layers, token_capacity, self.top_k),
                     dtype=torch.int64,
@@ -203,11 +226,25 @@ class ModelRuntimeMetaRecorder:
                 ),
                 "token_count": torch.empty((self.num_layers,), dtype=torch.int32, device="cpu", pin_memory=True),
             }
-        return {
+            if self.wants_route_status:
+                buf["route_status"] = torch.empty(
+                    (self.num_layers, token_capacity, self.top_k),
+                    dtype=torch.int8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            return buf
+        buf = {
             "selected_experts": torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.int64),
             "routing_weights": torch.empty((self.num_layers, token_capacity, self.top_k), dtype=torch.float32),
             "token_count": torch.empty((self.num_layers,), dtype=torch.int32),
         }
+        if self.wants_route_status:
+            buf["route_status"] = torch.empty(
+                (self.num_layers, token_capacity, self.top_k),
+                dtype=torch.int8,
+            )
+        return buf
 
     def _ensure_buffer(self, mode: str, token_capacity: int, device: torch.device) -> tuple[str, int]:
         key = (mode, int(token_capacity))
@@ -244,6 +281,10 @@ class ModelRuntimeMetaRecorder:
                 dev_buf["expert_status_vals"] = torch.empty(
                     int(token_capacity) * self.top_k, dtype=torch.int8, device=device,
                 )
+            if str(mode) == "verify_kt_hybrid" and self.verify_cost_profile_enabled:
+                dev_buf["execution_activation_count"] = torch.zeros(
+                    (self.num_layers, self.num_experts), dtype=torch.int32, device=device,
+                )
             self.device_buffers[key] = dev_buf
         else:
             selected_device = torch.empty(
@@ -262,6 +303,18 @@ class ModelRuntimeMetaRecorder:
                 "token_count": token_count_device,
                 "token_count_capture_value": token_count_capture_value,
             }
+            if self.wants_route_status:
+                self.device_buffers[key]["route_status"] = torch.zeros(
+                    (self.num_layers, token_capacity, self.top_k),
+                    dtype=torch.int8,
+                    device=device,
+                )
+                self.device_buffers[key]["route_status_hit_val"] = torch.ones(
+                    1, dtype=torch.int8, device=device
+                )
+                self.device_buffers[key]["route_status_miss_val"] = torch.full(
+                    (1,), 2, dtype=torch.int8, device=device
+                )
         host_buffer = self._make_host_buffer(mode, token_capacity, device)
         self.host_buffers[key] = host_buffer
         self.host_buffer_pools[key] = [host_buffer]
@@ -310,6 +363,10 @@ class ModelRuntimeMetaRecorder:
             dev["score_sum"].zero_()
         if "expert_status" in dev:
             dev["expert_status"].zero_()
+        if "execution_activation_count" in dev:
+            dev["execution_activation_count"].zero_()
+        if "route_status" in dev:
+            dev["route_status"].zero_()
         capture_count = min(int(token_capacity), self.active_logical_token_count)
         dev["token_count_capture_value"].fill_(capture_count)
 
@@ -335,13 +392,24 @@ class ModelRuntimeMetaRecorder:
             token_count_tensor[layer_idx] = token_count
         if "activation_count" in dev:
             count_row = dev["activation_count"][layer_idx]
+            execution_count_row = (
+                dev["execution_activation_count"][layer_idx]
+                if "execution_activation_count" in dev
+                else None
+            )
             score_row = dev["score_sum"][layer_idx] if "score_sum" in dev else None
             count_row.zero_()
+            if execution_count_row is not None:
+                execution_count_row.zero_()
             if score_row is not None:
                 score_row.zero_()
             is_capturing = bool(count_row.is_cuda and torch.cuda.is_current_stream_capturing())
             histogram_token_count = token_count if is_capturing else min(token_count, int(self.active_logical_token_count))
             flat_ids = selected_experts[:histogram_token_count].reshape(-1).to(
+                device=count_row.device,
+                dtype=torch.int64,
+            )
+            execution_flat_ids = selected_experts[:token_count].reshape(-1).to(
                 device=count_row.device,
                 dtype=torch.int64,
             )
@@ -364,21 +432,30 @@ class ModelRuntimeMetaRecorder:
                 if flat_weights is not None:
                     score_values = flat_weights
             count_row.scatter_add_(0, flat_ids, count_values)
+            if execution_count_row is not None and execution_flat_ids.numel() > 0:
+                execution_count_row.scatter_add_(
+                    0,
+                    execution_flat_ids,
+                    dev["one_count"][: execution_flat_ids.numel()].to(
+                        dtype=execution_count_row.dtype
+                    ),
+                )
             if score_row is not None and flat_weights is not None:
                 score_row.scatter_add_(0, flat_ids, score_values)
             if "expert_status" in dev and uncached_route_mask is not None:
                 status_row = dev["expert_status"][layer_idx]
                 status_row.zero_()
-                is_cached = ~uncached_route_mask[:flat_ids.numel()].to(device=status_row.device)
+                status_ids = execution_flat_ids
+                is_cached = ~uncached_route_mask[:status_ids.numel()].to(device=status_row.device)
                 hit_val = dev["expert_status_hit_val"]
                 miss_val = dev["expert_status_miss_val"]
-                status_vals = dev["expert_status_vals"][:flat_ids.numel()]
-                torch.where(is_cached, hit_val.expand(flat_ids.numel()), miss_val.expand(flat_ids.numel()), out=status_vals)
+                status_vals = dev["expert_status_vals"][:status_ids.numel()]
+                torch.where(is_cached, hit_val.expand(status_ids.numel()), miss_val.expand(status_ids.numel()), out=status_vals)
                 # No active_routes mask: cached status is per-expert so all routes
                 # (real + padding) to the same expert write the same value.
                 # Padding-only experts are filtered out via activation_count > 0
                 # at readback time.
-                status_row.scatter_(0, flat_ids, status_vals)
+                status_row.scatter_(0, status_ids, status_vals)
             return
         if "score_sum" in dev:
             score_row = dev["score_sum"][layer_idx]
@@ -411,6 +488,22 @@ class ModelRuntimeMetaRecorder:
             routing_weights[:token_count].float(),
             non_blocking=True,
         )
+        if "route_status" in dev:
+            status_row = dev["route_status"][layer_idx]
+            status_row.zero_()
+            if uncached_route_mask is not None:
+                flat_status_count = token_count * self.top_k
+                is_miss = uncached_route_mask[:flat_status_count].reshape(
+                    token_count, self.top_k
+                ).to(device=status_row.device)
+                hit_val = dev["route_status_hit_val"]
+                miss_val = dev["route_status_miss_val"]
+                torch.where(
+                    is_miss,
+                    miss_val.expand_as(is_miss).to(dtype=torch.int8),
+                    hit_val.expand_as(is_miss).to(dtype=torch.int8),
+                    out=status_row[:token_count],
+                )
 
     def offload_async(
         self,
@@ -472,6 +565,11 @@ class ModelRuntimeMetaRecorder:
                             dev["expert_status"][layer_start:layer_end],
                             non_blocking=True,
                         )
+                    if "execution_activation_count" in dev:
+                        host["execution_activation_count"][layer_start:layer_end].copy_(
+                            dev["execution_activation_count"][layer_start:layer_end],
+                            non_blocking=True,
+                        )
                 elif "score_sum" in dev:
                     host["score_sum"][layer_start:layer_end].copy_(
                         dev["score_sum"][layer_start:layer_end],
@@ -486,6 +584,11 @@ class ModelRuntimeMetaRecorder:
                         dev["routing_weights"][layer_start:layer_end],
                         non_blocking=True,
                     )
+                    if "route_status" in dev:
+                        host["route_status"][layer_start:layer_end].copy_(
+                            dev["route_status"][layer_start:layer_end],
+                            non_blocking=True,
+                        )
                 event.record(active_stream)
         else:
             host["token_count"][layer_start:layer_end].copy_(dev["token_count"][layer_start:layer_end])
@@ -495,11 +598,17 @@ class ModelRuntimeMetaRecorder:
                     host["score_sum"][layer_start:layer_end].copy_(dev["score_sum"][layer_start:layer_end])
                 if has_status:
                     host["expert_status"][layer_start:layer_end].copy_(dev["expert_status"][layer_start:layer_end])
+                if "execution_activation_count" in dev:
+                    host["execution_activation_count"][layer_start:layer_end].copy_(
+                        dev["execution_activation_count"][layer_start:layer_end]
+                    )
             elif "score_sum" in dev:
                 host["score_sum"][layer_start:layer_end].copy_(dev["score_sum"][layer_start:layer_end])
             else:
                 host["selected_experts"][layer_start:layer_end].copy_(dev["selected_experts"][layer_start:layer_end])
                 host["routing_weights"][layer_start:layer_end].copy_(dev["routing_weights"][layer_start:layer_end])
+                if "route_status" in dev:
+                    host["route_status"][layer_start:layer_end].copy_(dev["route_status"][layer_start:layer_end])
             event = _ImmediateEvent()
 
         return RuntimeMetaOffloadHandle(
@@ -573,6 +682,10 @@ class ModelRuntimeMetaRecorder:
                     meta.expert_status = status_row.clone()
                     meta.active_count = float(is_real_active.sum().item())
                     meta.miss_count = float(((status_row == 2) & is_real_active).sum().item())
+                    if "execution_activation_count" in host:
+                        meta.execution_activation_count = host[
+                            "execution_activation_count"
+                        ][layer_idx].clone()
                 out[layer_idx] = meta
                 continue
             if fmt == "score_sum":
@@ -596,7 +709,13 @@ class ModelRuntimeMetaRecorder:
             selected_experts = host["selected_experts"][layer_idx, :token_count]
             routing_weights = host["routing_weights"][layer_idx, :token_count]
             aggregated = _aggregate_layer_runtime_meta_cpu(selected_experts, routing_weights)
-            out[layer_idx] = LayerRuntimeMetaCPU(
+            route_status = (
+                host["route_status"][layer_idx, :token_count].clone()
+                if "route_status" in host
+                else None
+            )
+            keep_route_rows = bool(self.perfect_match_trace_enabled)
+            meta = LayerRuntimeMetaCPU(
                 step_id=handle.step_id,
                 mode=handle.mode,
                 layer_idx=layer_idx,
@@ -604,9 +723,23 @@ class ModelRuntimeMetaRecorder:
                 aggregated_expert_ids=aggregated[0] if aggregated is not None else None,
                 aggregated_score_sum=aggregated[1] if aggregated is not None else None,
                 aggregated_activation_count=aggregated[2] if aggregated is not None else None,
-                selected_experts=None if aggregated is not None else selected_experts.clone(),
-                routing_weights=None if aggregated is not None else routing_weights.clone(),
+                selected_experts=(
+                    selected_experts.clone()
+                    if keep_route_rows or aggregated is None
+                    else None
+                ),
+                routing_weights=(
+                    routing_weights.clone()
+                    if keep_route_rows or aggregated is None
+                    else None
+                ),
+                route_status=route_status,
             )
+            if route_status is not None:
+                active_routes = route_status > 0
+                meta.active_count = float(active_routes.sum().item())
+                meta.miss_count = float((route_status == 2).sum().item())
+            out[layer_idx] = meta
         return out
 
     def reset(self) -> None:
@@ -627,9 +760,17 @@ class ModelRuntimeMetaRecorder:
                 total += int(layer_count * host["score_sum"].size(1) * host["score_sum"].element_size())
             if "expert_status" in host:
                 total += int(layer_count * host["expert_status"].size(1) * host["expert_status"].element_size())
+            if "execution_activation_count" in host:
+                total += int(
+                    layer_count
+                    * host["execution_activation_count"].size(1)
+                    * host["execution_activation_count"].element_size()
+                )
         elif "score_sum" in host:
             total += int(layer_count * host["score_sum"].size(1) * host["score_sum"].element_size())
         else:
             total += int(layer_count * host["selected_experts"].size(1) * host["selected_experts"].size(2) * host["selected_experts"].element_size())
             total += int(layer_count * host["routing_weights"].size(1) * host["routing_weights"].size(2) * host["routing_weights"].element_size())
+            if "route_status" in host:
+                total += int(layer_count * host["route_status"].size(1) * host["route_status"].size(2) * host["route_status"].element_size())
         return total

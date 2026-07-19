@@ -1,7 +1,7 @@
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -22,6 +22,166 @@ class _DummyModel:
 
 
 class TestModelRunnerSpecModes(unittest.TestCase):
+    def _verify_cost_runner(self):
+        mr = object.__new__(ModelRunner)
+        mr.rank = 0
+        mr.config = SimpleNamespace(
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_verify_model_path="model.json",
+            hf_config=SimpleNamespace(
+                num_hidden_layers=48,
+                num_experts=128,
+                num_experts_per_tok=8,
+            ),
+        )
+        return mr
+
+    def test_active_verify_cost_model_requires_training_gate(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            artifact={"accuracy_gate_passed": False},
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "accuracy gate"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_verify_cost_model_requires_deployment_shadow_gate(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            artifact={
+                "accuracy_gate_passed": True,
+                "deployment_validation": {"passed": False, "gate_version": "v2"},
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "shadow deployment validation"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_sampling_requires_sampling_shadow_gate(self):
+        mr = self._verify_cost_runner()
+        mr.config.acceptance_strategy = "standard_sampling"
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            artifact={
+                "accuracy_gate_passed": True,
+                "deployment_validation": {
+                    "passed": True,
+                    "gate_version": "v2",
+                },
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "sampling shadow deployment"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_verify_cost_model_requires_bound_deployment_model_id(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            model_id="active-model",
+            artifact={
+                "accuracy_gate_passed": True,
+                "deployment_validation": {
+                    "passed": True,
+                    "gate_version": "v2",
+                    "model_id": "different-model",
+                },
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "not bound"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_verify_cost_model_rejects_old_shadow_gate(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            model_id="active-model",
+            artifact={
+                "accuracy_gate_passed": True,
+                "deployment_validation": {
+                    "passed": True,
+                    "gate_version": "v1",
+                    "model_id": "active-model",
+                },
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "v2 shadow deployment gate"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_verify_cost_model_requires_proxy_workload_gate(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            model_id="active-model",
+            proxy_workload_model={},
+            artifact={
+                "accuracy_gate_passed": True,
+                "proxy_workload_gate_passed": False,
+                "proxy_workload_gate_version": "v2",
+                "deployment_validation": {
+                    "passed": True,
+                    "gate_version": "v2",
+                    "model_id": "active-model",
+                },
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "causal workload proxy gate"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
+    def test_active_verify_cost_model_rejects_old_proxy_workload_gate(self):
+        mr = self._verify_cost_runner()
+        model = SimpleNamespace(
+            num_layers=48,
+            num_experts=128,
+            top_k=8,
+            model_id="active-model",
+            proxy_workload_model={},
+            artifact={
+                "accuracy_gate_passed": True,
+                "proxy_workload_gate_passed": True,
+                "proxy_workload_gate_version": "v1",
+                "deployment_validation": {
+                    "passed": True,
+                    "gate_version": "v2",
+                    "model_id": "active-model",
+                },
+            },
+        )
+        with patch(
+            "nanovllm.engine.speculative.verify_cost_model.VerifyTimeCostModel.load",
+            return_value=model,
+        ), self.assertRaisesRegex(ValueError, "v2 causal workload proxy gate"):
+            ModelRunner._configure_verify_cost_proxy(mr)
+
     def test_run_draft_switches_mode(self):
         mr = object.__new__(ModelRunner)
         mr.model = _DummyModel()
@@ -176,6 +336,46 @@ class TestModelRunnerSpecModes(unittest.TestCase):
 
         _ = ModelRunner.get_profile(mr, reset=True)
         self.assertEqual(len(mr._profile), 0)
+
+    def test_verify_metadata_separates_logical_and_execution_cpu_routes(self):
+        mr = object.__new__(ModelRunner)
+        mr.rank = 0
+        mr.profile_enabled = True
+        mr._profile = defaultdict(float)
+        mr.config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_experts_per_tok=2, num_experts=4)
+        )
+        meta = SimpleNamespace(
+            token_count=2,
+            aggregated_expert_ids=torch.tensor([0, 1, 2], dtype=torch.int64),
+            aggregated_activation_count=torch.tensor([1, 2, 1], dtype=torch.int64),
+            expert_status=torch.tensor([2, 1, 1, 2], dtype=torch.int8),
+            execution_activation_count=torch.tensor(
+                [2, 2, 1, 3], dtype=torch.int64
+            ),
+        )
+
+        ModelRunner._record_verify_metadata_profile_from_runtime_meta(
+            mr,
+            {0: meta},
+            mode="verify_kt_hybrid",
+            step_id=7,
+        )
+
+        record = mr._verify_metadata_records_by_step[7]
+        self.assertEqual(record["metadata_cpu_routes_sum"], 1.0)
+        self.assertEqual(record["metadata_realized_cpu_expert_count_sum"], 1.0)
+        self.assertEqual(record["metadata_execution_active_routes_sum"], 8.0)
+        self.assertEqual(record["metadata_execution_cpu_routes_sum"], 5.0)
+        self.assertEqual(record["metadata_execution_cpu_experts_sum"], 2.0)
+        self.assertEqual(
+            record["metadata_layer_execution_cpu_route_counts"]["0"],
+            [2, 0, 0, 3],
+        )
+        self.assertEqual(
+            record["metadata_layer_execution_route_counts"]["0"],
+            [2, 2, 1, 3],
+        )
 
 
 if __name__ == "__main__":

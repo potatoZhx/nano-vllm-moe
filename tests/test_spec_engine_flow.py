@@ -95,7 +95,60 @@ class _DummyModelRunner:
             self.verify_calls += 1
             self.last_verify_lengths = list(args[1]) if len(args) > 1 else None
             return [[11, 12, 99] for _ in seqs]
+        if name == "forget_acceptance_state":
+            return None
         raise RuntimeError(name)
+
+
+class _TpotModelRunner(_DummyModelRunner):
+    def __init__(self, *, alpha: float, include_lookahead: bool):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.include_lookahead = bool(include_lookahead)
+        self.verify_cost_controls = []
+        self.verify_cost_lookahead_tokens = []
+        self.start_verify_cost_controls = []
+
+    def call(self, name, *args):
+        if name == "start_verify_cost_round":
+            self.start_verify_cost_controls.append(
+                bool(args[1]) if len(args) > 1 else True
+            )
+            return {"verify_cost_prediction_ms": 80.0}
+        if name == "run_draft":
+            seqs = args[0]
+            self.draft_calls += 1
+            observe_verify_cost = bool(args[2]) if len(args) > 2 else True
+            predict_verify_cost = bool(args[3]) if len(args) > 3 else True
+            self.verify_cost_controls.append(
+                (observe_verify_cost, predict_verify_cost)
+            )
+            self.verify_cost_lookahead_tokens.append(
+                args[4] if len(args) > 4 else None
+            )
+            state = {
+                "prefetch_step_id": self.draft_calls,
+                "acceptance_alpha": [self.alpha for _ in seqs],
+            }
+            if predict_verify_cost:
+                state["verify_cost_prediction_ms"] = 80.0
+            if self.include_lookahead and predict_verify_cost:
+                state["verify_cost_lookahead_prediction_ms"] = 200.0
+            return [10 + self.draft_calls for _ in seqs], state
+        return super().call(name, *args)
+
+
+class _LowInitialTpotModelRunner(_TpotModelRunner):
+    def call(self, name, *args):
+        if name == "start_verify_cost_round":
+            self.start_verify_cost_controls.append(
+                bool(args[1]) if len(args) > 1 else True
+            )
+            return {"verify_cost_prediction_ms": 10.0}
+        result = super().call(name, *args)
+        if name == "run_draft" and isinstance(result, tuple):
+            result[1]["verify_cost_lookahead_prediction_ms"] = 80.0
+        return result
 
 
 class _SamplingModelRunner:
@@ -133,6 +186,28 @@ class _SamplingLegacyDraftTupleModelRunner(_SamplingModelRunner):
             token_ids, _prefetch_state, logits = result
             return token_ids, logits
         return result
+
+
+class _SamplingTpotModelRunner(_SamplingModelRunner):
+    def __init__(self):
+        super().__init__()
+        self.draft_calls = 0
+
+    def call(self, name, *args):
+        if name == "start_verify_cost_round":
+            return {"verify_cost_prediction_ms": 80.0}
+        if name == "run_draft":
+            seqs = args[0]
+            self.draft_calls += 1
+            logits = torch.full((len(seqs), 16), -1000.0)
+            logits[:, 11] = 0.0
+            return [11 for _ in seqs], {
+                "prefetch_step_id": self.draft_calls,
+                "acceptance_alpha": [0.9 for _ in seqs],
+                "verify_cost_prediction_ms": 80.0,
+                "verify_cost_lookahead_prediction_ms": 200.0,
+            }, logits
+        return super().call(name, *args)
 
 
 class TestSpecEngineFlow(unittest.TestCase):
@@ -190,6 +265,227 @@ class TestSpecEngineFlow(unittest.TestCase):
         self.assertEqual(model_runner.verify_calls, 1)
         self.assertEqual(model_runner.last_verify_lengths, [2])
 
+    def test_tpot_lookahead_stops_before_predicted_expensive_step(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.9, include_lookahead=True)
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(model_runner.draft_calls, 1)
+        trace = engine.get_profile()["step_traces"][0]
+        self.assertEqual(trace["draft_steps_actual"], 1)
+        self.assertGreater(
+            trace["draft_tpot_costs"][0]["lookahead_tpot_ms"],
+            trace["draft_tpot"][0],
+        )
+
+    def test_tpot_lookahead_uses_calibrated_alpha_for_projection(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.9, include_lookahead=True)
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine._alpha_calibration = SimpleNamespace(
+            calibration_id="test-calibration",
+            calibrate=lambda _value: 0.2,
+        )
+        engine.speculative_step([seq])
+
+        cost = engine.get_profile()["step_traces"][0]["draft_tpot_costs"][0]
+        self.assertAlmostEqual(
+            cost["lookahead_tpot_ms"],
+            (2.0 * 19.0 + 200.0) / (1.0 + 0.2 + 0.2 * 0.2),
+            places=6,
+        )
+
+    def test_tpot_lookahead_without_prediction_falls_back_to_first_increase(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.05, include_lookahead=False)
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="off",
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(model_runner.draft_calls, 1)
+        trace = engine.get_profile()["step_traces"][0]
+        self.assertNotIn("lookahead_tpot_ms", trace["draft_tpot_costs"][0])
+
+    def test_active_verify_prediction_is_deferred_until_min_steps(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.9, include_lookahead=True)
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=3,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(
+            model_runner.verify_cost_controls,
+            [(True, False), (True, False), (True, True)],
+        )
+        self.assertEqual(model_runner.draft_calls, 3)
+
+    def test_active_verify_prediction_is_skipped_at_final_draft_step(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.99, include_lookahead=False)
+        config = SimpleNamespace(
+            max_draft_tokens=3,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=2,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(
+            model_runner.verify_cost_controls,
+            [(True, False), (True, True), (True, False)],
+        )
+
+    def test_min_steps_excludes_unreachable_t0_from_lookahead_baseline(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _LowInitialTpotModelRunner(
+            alpha=0.99,
+            include_lookahead=True,
+        )
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=3,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        # The artificial T(0)=10 ms point is below every feasible K>=3 point.
+        # It must not force a stop at the minimum length.
+        self.assertEqual(model_runner.draft_calls, 4)
+        trace = engine.get_profile()["step_traces"][0]
+        self.assertEqual(trace["verify_cost_last_prediction_candidate_len"], 3)
+        self.assertNotIn("verify_cost_prediction_error_ms", trace)
+
+    def test_bucket_lookahead_targets_next_efficient_verify_boundary(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.9, include_lookahead=True)
+        config = SimpleNamespace(
+            max_draft_tokens=12,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="bucket_lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=6,
+            draft_tpot_lookahead_cache_credit_ms_per_step=8.5,
+            verify_cuda_graph_bucket_steps=[3, 5, 7, 10, 13],
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(model_runner.start_verify_cost_controls, [False])
+        self.assertEqual(model_runner.draft_calls, 6)
+        self.assertEqual(
+            model_runner.verify_cost_controls,
+            [(True, False)] * 5 + [(True, True)],
+        )
+        self.assertEqual(
+            model_runner.verify_cost_lookahead_tokens,
+            [None] * 5 + [10],
+        )
+        trace = engine.get_profile()["step_traces"][0]
+        boundary_cost = trace["draft_tpot_costs"][-1]
+        self.assertEqual(boundary_cost["lookahead_draft_len"], 9.0)
+        self.assertEqual(boundary_cost["lookahead_horizon"], 3.0)
+        self.assertEqual(boundary_cost["lookahead_verify_raw_ms"], 200.0)
+        self.assertEqual(boundary_cost["lookahead_cache_credit_ms"], 25.5)
+        self.assertEqual(boundary_cost["lookahead_verify_ms"], 174.5)
+
+    def test_lookahead_hysteresis_requires_consecutive_stop_signals(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.0)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _TpotModelRunner(alpha=0.9, include_lookahead=True)
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            acceptance_predictor_enabled=True,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead_hysteresis",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_min_steps=1,
+            draft_tpot_stop_patience=2,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        self.assertEqual(model_runner.draft_calls, 2)
+        costs = engine.get_profile()["step_traces"][0]["draft_tpot_costs"]
+        self.assertEqual(costs[0]["stop_streak"], 1.0)
+        self.assertEqual(costs[0]["stop_decision"], 0.0)
+        self.assertEqual(costs[1]["stop_streak"], 2.0)
+        self.assertEqual(costs[1]["stop_decision"], 1.0)
+
     def test_standard_sampling_uses_logits_for_sampling_temperature(self):
         seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=1.0, max_tokens=4)
         scheduler = _DummyScheduler()
@@ -226,6 +522,48 @@ class TestSpecEngineFlow(unittest.TestCase):
 
         self.assertEqual(token_ids, [13])
         self.assertEqual(seq.token_ids, [1, 2, 3, 11, 13])
+
+    def test_validated_sampling_uses_verify_cost_lookahead(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=0.8, max_tokens=8)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _SamplingTpotModelRunner()
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="standard_sampling",
+            acceptance_threshold=0.7,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_verify_model_sampling_validated=True,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        engine.speculative_step([seq])
+
+        trace = engine.get_profile()["step_traces"][0]
+        self.assertEqual(model_runner.draft_calls, 1)
+        self.assertIn("lookahead_tpot_ms", trace["draft_tpot_costs"][0])
+
+    def test_validated_sampling_rejects_uncalibrated_temperature(self):
+        seq = _Seq(seq_id=1, token_ids=[1, 2, 3], temperature=1.0, max_tokens=8)
+        scheduler = _DummyScheduler()
+        scheduler.running = [seq]
+        model_runner = _SamplingTpotModelRunner()
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="standard_sampling",
+            acceptance_threshold=0.7,
+            draft_stop_policy="tpot",
+            draft_tpot_stop_rule="lookahead",
+            draft_tpot_verify_model_mode="active",
+            draft_tpot_verify_model_sampling_validated=True,
+            draft_tpot_verify_model_temperature=0.8,
+        )
+
+        engine = SpeculativeEngine(model_runner, scheduler, config)
+        with self.assertRaisesRegex(ValueError, "sampling temperature"):
+            engine.speculative_step([seq])
 
 
 if __name__ == "__main__":

@@ -19,11 +19,17 @@ class TestExpertCacheStaging(unittest.TestCase):
             enable_prefetch=True,
         )
 
+    def _assert_host_mask_matches(self, cache: LayerExpertCache) -> None:
+        expected = [index in cache.expert_to_slot for index in range(cache.num_experts)]
+        self.assertEqual(cache.get_cached_expert_mask_host().tolist(), expected)
+        self.assertEqual(cache.get_cached_expert_mask().tolist(), expected)
+
     def test_staging_publish_lifecycle(self):
         cache = self._build_cache()
         gate_up_0 = torch.ones(4, 4)
         down_0 = torch.ones(4, 2)
         cache.put_to_slot(0, 0, gate_up_0, down_0)
+        self._assert_host_mask_matches(cache)
 
         reservation = cache.reserve_staging_slot(expert_idx=3)
         self.assertIsNotNone(reservation)
@@ -43,6 +49,7 @@ class TestExpertCacheStaging(unittest.TestCase):
         )
         self.assertIsNotNone(published)
         cache.commit_published_expert(published)
+        self._assert_host_mask_matches(cache)
 
         self.assertEqual(cache.get_slot_idx(3), 1)
         self.assertTrue(bool(cache.get_cached_expert_mask()[3].item()))
@@ -60,6 +67,7 @@ class TestExpertCacheStaging(unittest.TestCase):
     def test_deferred_active_prefetch_does_not_publish_mapping_until_commit(self):
         cache = self._build_cache()
         cache.put_to_slot(0, 0, torch.ones(4, 4), torch.ones(4, 2))
+        self._assert_host_mask_matches(cache)
 
         reservation = cache.reserve_active_slot_for_prefetch_deferred(
             layer_idx=0,
@@ -79,6 +87,7 @@ class TestExpertCacheStaging(unittest.TestCase):
         )
         self.assertTrue(evt.query())
         published = cache.commit_deferred_active_prefetch(reservation)
+        self._assert_host_mask_matches(cache)
 
         self.assertIsNotNone(published)
         self.assertFalse(cache.is_active_slot_pending(0))

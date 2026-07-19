@@ -245,10 +245,27 @@ class DraftAcceptanceFeatureExtractor:
         self.state_out_buf = torch.zeros(self.max_bs, _STATE_DIM, dtype=f32, device=device)
         # Outputs.
         self.alpha_buf = torch.zeros(self.max_bs, dtype=f32, device=device)
+        self._output_route_offset = 1 + _STATE_DIM
+        self._output_width = self._output_route_offset + self.L * self.K
+        self.output_buf = torch.zeros(
+            self.max_bs,
+            self._output_width,
+            dtype=f32,
+            device=device,
+        )
         # Pinned host staging for the per-step transfers (explicit CPU device: the
         # model runner sets a CUDA default device, and pin_memory requires CPU).
         pin = device.type == "cuda"
         self.state_in_host = torch.zeros(self.max_bs, _STATE_DIM, dtype=f32, device="cpu", pin_memory=pin)
+        self.output_host = torch.zeros(
+            self.max_bs,
+            self._output_width,
+            dtype=f32,
+            device="cpu",
+            pin_memory=pin,
+        )
+        self._output_host_array = self.output_host.numpy()
+        self.original_route_readback_enabled = False
 
         # np.array_split(arange(L), 3) block boundaries for the early/mid/late aggregates.
         thirds = np.array_split(np.arange(self.L), 3)
@@ -300,7 +317,10 @@ class DraftAcceptanceFeatureExtractor:
         if bs <= 0:
             return
         k = min(32, int(logits.size(-1)))
-        vals = torch.topk(logits[:bs].float(), k=k, dim=-1).values  # [bs, k] descending
+        # The logits are already quantized to their output dtype. Selecting in
+        # that dtype and casting only the top-k values preserves the feature
+        # inputs while avoiding a full-vocabulary FP32 temporary every draft step.
+        vals = torch.topk(logits[:bs], k=k, dim=-1).values.float()
         top1 = vals[:, 0]
         top2 = vals[:, 1] if k > 1 else top1
         margin12 = top1 - top2
@@ -444,6 +464,20 @@ class DraftAcceptanceFeatureExtractor:
         alpha = self.predictor(route_raw, route_summary, token_features, hidden_f, history)
         self.alpha_buf[:bs].copy_(alpha.squeeze(-1))
         self.state_out_buf[:bs].copy_(new_state)
+        self._pack_outputs(bs)
+
+    def _pack_outputs(self, bs: int) -> None:
+        """Write the fixed-layout D2H buffer from capture-safe GPU buffers."""
+        self.output_buf[:bs, 0].copy_(self.alpha_buf[:bs])
+        self.output_buf[:bs, 1:self._output_route_offset].copy_(
+            self.state_out_buf[:bs]
+        )
+        if self.original_route_readback_enabled:
+            self.output_buf[:bs, self._output_route_offset:].copy_(
+                self.orig_ids[:, :bs, :]
+                .permute(1, 0, 2)
+                .reshape(bs, self.L * self.K)
+            )
 
     # ----------------- host-side state carry ----------------------------- #
     def write_state_in(self, seqs) -> None:
@@ -461,18 +495,46 @@ class DraftAcceptanceFeatureExtractor:
             host[i].copy_(torch.from_numpy(prev))
         self.state_in_buf[:bs].copy_(host, non_blocking=(self.device.type == "cuda"))
 
-    def read_outputs(self, seqs) -> list[float]:
-        """Read alpha + updated state (one D2H, after the sampler sync); update host state."""
+    def read_outputs(
+        self,
+        seqs,
+        *,
+        include_original_routes: bool = False,
+    ) -> list[float] | tuple[list[float], np.ndarray]:
+        """Read predictor outputs and optionally a transient ``[L, bs, K]`` view.
+
+        ``run_predictor`` packs the output inside the captured tail graph. The
+        returned route view aliases the pinned staging buffer and is valid until
+        the next call to this method; callers must consume it immediately.
+        """
         bs = min(len(seqs), self.max_bs)
         if bs <= 0:
-            return []
-        packed = torch.cat([self.alpha_buf[:bs, None], self.state_out_buf[:bs]], dim=1)  # [bs, 1+11]
-        packed_cpu = packed.detach().to("cpu", non_blocking=False).numpy()
+            empty_routes = np.empty((self.L, 0, self.K), dtype=np.float32)
+            return ([], empty_routes) if include_original_routes else []
+        if include_original_routes and not self.original_route_readback_enabled:
+            raise RuntimeError("original route readback was not enabled before graph capture")
+        # A blocking copy is deliberate: the caller consumes the numpy view on
+        # the CPU immediately. Both source and destination are persistent, so no
+        # tensor allocation or Python list materialization occurs on this path.
+        width = self._output_width if include_original_routes else self._output_route_offset
+        self.output_host[:bs, :width].copy_(
+            self.output_buf[:bs, :width], non_blocking=False
+        )
+        packed_cpu = self._output_host_array[:bs]
         alphas: list[float] = []
         for i, seq in enumerate(seqs[:bs]):
             alphas.append(float(packed_cpu[i, 0]))
-            self._host_state[int(seq.seq_id)] = packed_cpu[i, 1:].astype(np.float32).copy()
-        return alphas
+            self._host_state[int(seq.seq_id)] = packed_cpu[
+                i, 1:self._output_route_offset
+            ].copy()
+        if not include_original_routes:
+            return alphas
+        routes = (
+            packed_cpu[:, self._output_route_offset:]
+            .reshape(bs, self.L, self.K)
+            .transpose(1, 0, 2)
+        )
+        return alphas, routes
 
     def forget(self, seq_ids) -> None:
         for sid in seq_ids:

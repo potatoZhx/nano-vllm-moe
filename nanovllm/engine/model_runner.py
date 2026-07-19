@@ -1,6 +1,7 @@
 import pickle
 import os
 import json
+import importlib.metadata
 import threading
 from collections import defaultdict
 from queue import Queue
@@ -70,6 +71,17 @@ def _export_torch_profile_summary(prof, profile_dir: str, stem: str, rank: int, 
             ensure_ascii=True,
             indent=2,
         )
+
+
+def _cpu_model_name() -> str:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
 
 
 def _create_cache_strategy_from_config(config: Config):
@@ -163,8 +175,30 @@ class ModelRunner:
         self._dual_queue_segment_timing_events: list[tuple[str, int, object, object]] = []
         self._verify_op_event_records: list[dict[str, object]] = []
         self._draft_op_event_records: list[dict[str, object]] = []
+        self._verify_call_records: list[dict[str, object]] = []
+        self._verify_metadata_records_by_step: dict[int, dict[str, object]] = {}
+        self._verify_stream_timing_events: list[tuple[int, object, object]] = []
+        self._verify_stream_ms_by_step: dict[int, float] = {}
+        self._verify_cost_model = None
+        self._verify_cost_proxy = None
+        self._verify_cost_round_active = False
+        self._verify_cost_latest_prediction: dict[str, object] | None = None
         self._active_draft_prefetch_step_id = -1
         self._draft_segment_metadata_enqueued_step_id = -1
+        self._draft_perfect_trace_enabled = os.getenv(
+            "NANOVLLM_DRAFT_PERFECT_MATCH_TRACE", "0"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._draft_perfect_refill_rejected = os.getenv(
+            "NANOVLLM_DRAFT_PERFECT_MATCH_REFILL_REJECTED", "0"
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._draft_perfect_detail_limit = int(
+            os.getenv("NANOVLLM_DRAFT_PERFECT_MATCH_DETAIL_LIMIT", "256") or "256"
+        )
+        self._draft_perfect_profile = defaultdict(float)
+        self._draft_perfect_records: list[dict[str, object]] = []
+        self._draft_perfect_last_verify_meta: dict[int, dict[str, torch.Tensor]] | None = None
+        self._draft_perfect_pending: dict[str, object] | None = None
+        self._draft_perfect_draft_meta_by_step: dict[int, dict[int, dict[str, torch.Tensor]]] = {}
 
         dist_url = f"tcp://localhost:{config.dist_port}"
         dist.init_process_group("nccl", dist_url, world_size=self.world_size, rank=rank)
@@ -324,6 +358,8 @@ class ModelRunner:
             )
             self._acceptance_extractor.attach(self.model)
 
+        self._configure_verify_cost_proxy()
+
         self._decode_graph_policy = "standard"
         self.sampler = Sampler()
         self.warmup_model()
@@ -452,6 +488,42 @@ class ModelRunner:
             self._verify_layer_active_timing = {}
         if not hasattr(self, "_dual_queue_segment_timing_events"):
             self._dual_queue_segment_timing_events = []
+        if not hasattr(self, "_verify_op_event_records"):
+            self._verify_op_event_records = []
+        if not hasattr(self, "_draft_op_event_records"):
+            self._draft_op_event_records = []
+        if not hasattr(self, "_verify_call_records"):
+            self._verify_call_records = []
+        if not hasattr(self, "_verify_metadata_records_by_step"):
+            self._verify_metadata_records_by_step = {}
+        if not hasattr(self, "_verify_stream_timing_events"):
+            self._verify_stream_timing_events = []
+        if not hasattr(self, "_verify_stream_ms_by_step"):
+            self._verify_stream_ms_by_step = {}
+        if not hasattr(self, "_verify_cost_model"):
+            self._verify_cost_model = None
+        if not hasattr(self, "_verify_cost_proxy"):
+            self._verify_cost_proxy = None
+        if not hasattr(self, "_verify_cost_round_active"):
+            self._verify_cost_round_active = False
+        if not hasattr(self, "_verify_cost_latest_prediction"):
+            self._verify_cost_latest_prediction = None
+        if not hasattr(self, "_draft_perfect_trace_enabled"):
+            self._draft_perfect_trace_enabled = False
+        if not hasattr(self, "_draft_perfect_refill_rejected"):
+            self._draft_perfect_refill_rejected = False
+        if not hasattr(self, "_draft_perfect_detail_limit"):
+            self._draft_perfect_detail_limit = 256
+        if not hasattr(self, "_draft_perfect_profile"):
+            self._draft_perfect_profile = defaultdict(float)
+        if not hasattr(self, "_draft_perfect_records"):
+            self._draft_perfect_records = []
+        if not hasattr(self, "_draft_perfect_last_verify_meta"):
+            self._draft_perfect_last_verify_meta = None
+        if not hasattr(self, "_draft_perfect_pending"):
+            self._draft_perfect_pending = None
+        if not hasattr(self, "_draft_perfect_draft_meta_by_step"):
+            self._draft_perfect_draft_meta_by_step = {}
 
     def _record_profile(self, key: str, dt_sec: float) -> None:
         self._ensure_prefetch_internal_state()
@@ -868,7 +940,9 @@ class ModelRunner:
         runtime_meta,
         *,
         mode: str,
+        step_id: int | None = None,
     ) -> None:
+        self._ensure_prefetch_internal_state()
         if runtime_meta is None or str(mode) not in {"verify", "verify_kt_hybrid"}:
             return
         loop_t0 = perf_counter()
@@ -885,10 +959,18 @@ class ModelRunner:
         miss_experts_sum = 0.0
         active_experts_sum = 0.0
         route_ratio_sum = 0.0
+        execution_layer_count = 0
+        execution_total_routes_sum = 0.0
+        execution_cpu_routes_sum = 0.0
+        execution_cpu_experts_sum = 0.0
         layer_cpu_experts: dict[int, float] = {}
         layer_cpu_routes: dict[int, float] = {}
         layer_active_experts: dict[int, float] = {}
         layer_active_routes: dict[int, float] = {}
+        layer_execution_cpu_experts: dict[int, float] = {}
+        layer_execution_cpu_routes: dict[int, float] = {}
+        layer_execution_cpu_route_counts: dict[int, list[int]] = {}
+        layer_execution_route_counts: dict[int, list[int]] = {}
         for _layer_idx, meta in runtime_meta.items():
             layer_idx = int(_layer_idx)
             layer_count += 1
@@ -917,6 +999,39 @@ class ModelRunner:
                     miss_experts = float(miss_mask.sum().item())
             else:
                 miss_experts = float(getattr(meta, "miss_count", 0.0) or 0.0)
+            execution_counts = getattr(meta, "execution_activation_count", None)
+            if execution_counts is not None:
+                if execution_counts.device.type != "cpu":
+                    execution_counts = execution_counts.to(device="cpu")
+                execution_counts = execution_counts.to(dtype=torch.int64)
+                execution_layer_count += 1
+                execution_total_routes = float(execution_counts.sum().item())
+                if status is not None:
+                    status_cpu = status
+                    if status_cpu.device.type != "cpu":
+                        status_cpu = status_cpu.to(device="cpu")
+                    execution_cpu_counts = torch.where(
+                        status_cpu == 2,
+                        execution_counts,
+                        torch.zeros_like(execution_counts),
+                    )
+                else:
+                    execution_cpu_counts = torch.zeros_like(execution_counts)
+                execution_cpu_routes = float(execution_cpu_counts.sum().item())
+                execution_cpu_experts = float(
+                    (execution_cpu_counts > 0).sum().item()
+                )
+                execution_total_routes_sum += execution_total_routes
+                execution_cpu_routes_sum += execution_cpu_routes
+                execution_cpu_experts_sum += execution_cpu_experts
+                layer_execution_cpu_routes[layer_idx] = execution_cpu_routes
+                layer_execution_cpu_experts[layer_idx] = execution_cpu_experts
+                layer_execution_cpu_route_counts[layer_idx] = [
+                    int(value) for value in execution_cpu_counts.tolist()
+                ]
+                layer_execution_route_counts[layer_idx] = [
+                    int(value) for value in execution_counts.tolist()
+                ]
             total_routes = max(total_routes, 1.0)
             total_routes_sum += total_routes
             miss_routes_sum += miss_routes
@@ -934,6 +1049,18 @@ class ModelRunner:
                 self._profile["verify_metadata_profile_async_count"] += 1.0
                 self._profile["verify_metadata_profile_async_loop_ms"] += loop_ms
                 self._profile["verify_metadata_profile_async_layer_count"] += float(layer_count)
+                self._profile["verify_execution_profile_layer_count"] += float(
+                    execution_layer_count
+                )
+                self._profile["verify_execution_active_routes_sum"] += float(
+                    execution_total_routes_sum
+                )
+                self._profile["verify_execution_cpu_routes_sum"] += float(
+                    execution_cpu_routes_sum
+                )
+                self._profile["verify_execution_cpu_experts_sum"] += float(
+                    execution_cpu_experts_sum
+                )
                 for prefix in ("", "verify_"):
                     self._profile[f"{prefix}moe_profile_count"] += float(layer_count)
                     self._profile[f"{prefix}pre_transfer_cache_miss_sum"] += miss_routes_sum
@@ -950,6 +1077,109 @@ class ModelRunner:
                         self._profile[f"{base}active_expert_count_sum"] += layer_active_experts.get(layer_idx, 0.0)
                         self._profile[f"{base}active_routes_sum"] += layer_active_routes.get(layer_idx, 0.0)
                         self._profile[f"{base}moe_profile_count"] += 1.0
+                if step_id is not None:
+                    step_rec = self._verify_metadata_records_by_step.setdefault(int(step_id), {})
+                    step_rec["metadata_item_count"] = float(step_rec.get("metadata_item_count", 0.0)) + 1.0
+                    step_rec["metadata_layer_count"] = (
+                        float(step_rec.get("metadata_layer_count", 0.0)) + float(layer_count)
+                    )
+                    step_rec["metadata_cpu_routes_sum"] = (
+                        float(step_rec.get("metadata_cpu_routes_sum", 0.0)) + miss_routes_sum
+                    )
+                    step_rec["metadata_realized_cpu_expert_count_sum"] = (
+                        float(step_rec.get("metadata_realized_cpu_expert_count_sum", 0.0)) + miss_experts_sum
+                    )
+                    step_rec["metadata_pre_transfer_cache_miss_sum"] = (
+                        float(step_rec.get("metadata_pre_transfer_cache_miss_sum", 0.0)) + miss_routes_sum
+                    )
+                    step_rec["metadata_pre_transfer_active_count_sum"] = (
+                        float(step_rec.get("metadata_pre_transfer_active_count_sum", 0.0)) + total_routes_sum
+                    )
+                    step_rec["metadata_activated_expert_set_size_sum"] = (
+                        float(step_rec.get("metadata_activated_expert_set_size_sum", 0.0)) + active_experts_sum
+                    )
+                    step_rec["metadata_cpu_route_ratio_sum"] = (
+                        float(step_rec.get("metadata_cpu_route_ratio_sum", 0.0)) + route_ratio_sum
+                    )
+                    step_rec["metadata_execution_layer_count"] = (
+                        float(step_rec.get("metadata_execution_layer_count", 0.0))
+                        + float(execution_layer_count)
+                    )
+                    step_rec["metadata_execution_active_routes_sum"] = (
+                        float(step_rec.get("metadata_execution_active_routes_sum", 0.0))
+                        + execution_total_routes_sum
+                    )
+                    step_rec["metadata_execution_cpu_routes_sum"] = (
+                        float(step_rec.get("metadata_execution_cpu_routes_sum", 0.0))
+                        + execution_cpu_routes_sum
+                    )
+                    step_rec["metadata_execution_cpu_experts_sum"] = (
+                        float(step_rec.get("metadata_execution_cpu_experts_sum", 0.0))
+                        + execution_cpu_experts_sum
+                    )
+                    layer_cpu_experts_rec = step_rec.setdefault("metadata_layer_cpu_experts", {})
+                    layer_cpu_routes_rec = step_rec.setdefault("metadata_layer_cpu_routes", {})
+                    layer_active_experts_rec = step_rec.setdefault("metadata_layer_active_experts", {})
+                    layer_active_routes_rec = step_rec.setdefault("metadata_layer_active_routes", {})
+                    layer_execution_cpu_experts_rec = step_rec.setdefault(
+                        "metadata_layer_execution_cpu_experts", {}
+                    )
+                    layer_execution_cpu_routes_rec = step_rec.setdefault(
+                        "metadata_layer_execution_cpu_routes", {}
+                    )
+                    layer_execution_route_counts_rec = step_rec.setdefault(
+                        "metadata_layer_execution_cpu_route_counts", {}
+                    )
+                    layer_execution_all_route_counts_rec = step_rec.setdefault(
+                        "metadata_layer_execution_route_counts", {}
+                    )
+                    for layer_idx, cpu_experts in layer_cpu_experts.items():
+                        key = str(int(layer_idx))
+                        layer_cpu_experts_rec[key] = (
+                            float(layer_cpu_experts_rec.get(key, 0.0)) + float(cpu_experts)
+                        )
+                        layer_cpu_routes_rec[key] = (
+                            float(layer_cpu_routes_rec.get(key, 0.0))
+                            + float(layer_cpu_routes.get(layer_idx, 0.0))
+                        )
+                        layer_active_experts_rec[key] = (
+                            float(layer_active_experts_rec.get(key, 0.0))
+                            + float(layer_active_experts.get(layer_idx, 0.0))
+                        )
+                        layer_active_routes_rec[key] = (
+                            float(layer_active_routes_rec.get(key, 0.0))
+                            + float(layer_active_routes.get(layer_idx, 0.0))
+                        )
+                    for layer_idx, cpu_routes in layer_execution_cpu_routes.items():
+                        key = str(int(layer_idx))
+                        layer_execution_cpu_routes_rec[key] = (
+                            float(layer_execution_cpu_routes_rec.get(key, 0.0))
+                            + float(cpu_routes)
+                        )
+                        layer_execution_cpu_experts_rec[key] = (
+                            float(layer_execution_cpu_experts_rec.get(key, 0.0))
+                            + float(layer_execution_cpu_experts.get(layer_idx, 0.0))
+                        )
+                        current = layer_execution_route_counts_rec.get(key)
+                        incoming = layer_execution_cpu_route_counts[layer_idx]
+                        if isinstance(current, list) and len(current) == len(incoming):
+                            layer_execution_route_counts_rec[key] = [
+                                int(left) + int(right)
+                                for left, right in zip(current, incoming, strict=True)
+                            ]
+                        else:
+                            layer_execution_route_counts_rec[key] = list(incoming)
+                        current_all = layer_execution_all_route_counts_rec.get(key)
+                        incoming_all = layer_execution_route_counts[layer_idx]
+                        if isinstance(current_all, list) and len(current_all) == len(incoming_all):
+                            layer_execution_all_route_counts_rec[key] = [
+                                int(left) + int(right)
+                                for left, right in zip(
+                                    current_all, incoming_all, strict=True
+                                )
+                            ]
+                        else:
+                            layer_execution_all_route_counts_rec[key] = list(incoming_all)
 
     def _process_prefetch_metadata_item(
         self,
@@ -978,9 +1208,15 @@ class ModelRunner:
         collect_t0 = perf_counter()
         runtime_meta = runtime_meta_recorder.collect(handle, wait=False)
         collect_ms = (perf_counter() - collect_t0) * 1000.0
+        self._observe_perfect_match_metadata(
+            mode=str(item["mode"]),
+            step_id=int(item["step_id"]),
+            runtime_meta=runtime_meta,
+        )
         self._record_verify_metadata_profile_from_runtime_meta(
             runtime_meta,
             mode=str(item["mode"]),
+            step_id=int(item["step_id"]),
         )
 
         observe_stats: dict[str, float] = {}
@@ -1245,19 +1481,510 @@ class ModelRunner:
 
         self._pending_prefetch_metadata = pending
 
+    def _clone_perfect_match_meta(self, runtime_meta) -> dict[int, dict[str, torch.Tensor]]:
+        out: dict[int, dict[str, torch.Tensor]] = {}
+        if not runtime_meta:
+            return out
+        for layer_idx, meta in runtime_meta.items():
+            selected = getattr(meta, "selected_experts", None)
+            if selected is None:
+                continue
+            layer: dict[str, torch.Tensor] = {
+                "selected_experts": selected.detach().to("cpu", dtype=torch.int64).clone(),
+            }
+            routing = getattr(meta, "routing_weights", None)
+            if routing is not None:
+                layer["routing_weights"] = routing.detach().to(
+                    "cpu", dtype=torch.float32
+                ).clone()
+            route_status = getattr(meta, "route_status", None)
+            if route_status is not None:
+                layer["route_status"] = route_status.detach().to(
+                    "cpu", dtype=torch.int8
+                ).clone()
+            out[int(layer_idx)] = layer
+        return out
+
+    def _observe_perfect_match_metadata(self, mode: str, step_id: int, runtime_meta) -> None:
+        self._ensure_prefetch_internal_state()
+        if not bool(getattr(self, "_draft_perfect_trace_enabled", False)):
+            return
+        if str(mode) in {"verify", "verify_kt_hybrid"}:
+            cloned = self._clone_perfect_match_meta(runtime_meta)
+            if cloned:
+                self._draft_perfect_last_verify_meta = cloned
+            return
+        if str(mode) != "draft":
+            return
+
+        pending = getattr(self, "_draft_perfect_pending", None)
+        if not pending:
+            return
+        min_step_id = int(pending.get("min_draft_step_id", -1))
+        if int(step_id) < min_step_id:
+            self._draft_perfect_profile["stale_draft_metadata_ignored_count"] += 1.0
+            return
+        cloned = self._clone_perfect_match_meta(runtime_meta)
+        if not cloned:
+            return
+        step_key = int(step_id)
+        pending_by_step = self._draft_perfect_draft_meta_by_step.setdefault(step_key, {})
+        pending_by_step.update(cloned)
+        expected_layers = len(getattr(self, "layer_caches", {}) or {})
+        if expected_layers > 0 and len(pending_by_step) < expected_layers:
+            return
+        self._record_perfect_match_draft_token(pending, step_key, dict(pending_by_step))
+        self._draft_perfect_draft_meta_by_step.pop(step_key, None)
+
+    def _record_perfect_match_draft_token(
+        self,
+        pending: dict[str, object],
+        step_id: int,
+        draft_meta: dict[int, dict[str, torch.Tensor]],
+    ) -> None:
+        token_index = int(pending.get("checked_tokens", 0))
+        max_check = int(pending.get("max_check_tokens", 0))
+        if max_check > 0 and token_index >= max_check:
+            return
+
+        expected_layers = len(getattr(self, "layer_caches", {}) or {})
+        present_layers = 0
+        route_total = route_miss = route_hit = 0
+        coverage_total = coverage_hit = 0
+        pred_row_total = pred_row_hit = 0
+        input_row_total = input_row_hit = 0
+        pred_row_layer_exact_total = pred_row_layer_exact_hit = 0
+        input_row_layer_exact_total = input_row_layer_exact_hit = 0
+
+        verify_meta = pending.get("verify_meta")
+        if not isinstance(verify_meta, dict):
+            verify_meta = {}
+        accepted = int(pending.get("accepted_draft_tokens", 0))
+        rejected_start = int(pending.get("rejected_verify_row_start", accepted))
+
+        for layer_idx, layer in draft_meta.items():
+            selected = layer.get("selected_experts")
+            if selected is None or selected.numel() == 0:
+                continue
+            draft_row = selected.reshape(selected.shape[0], -1)[0]
+            present_layers += 1
+
+            status = layer.get("route_status")
+            if status is not None and status.numel() > 0:
+                status_row = status.reshape(status.shape[0], -1)[0]
+                route_total += int(status_row.numel())
+                route_miss += int((status_row == 2).sum().item())
+                route_hit += int((status_row == 1).sum().item())
+            else:
+                route_total += int(draft_row.numel())
+
+            prev_layer = verify_meta.get(int(layer_idx))
+            if not isinstance(prev_layer, dict):
+                continue
+            prev_selected = prev_layer.get("selected_experts")
+            if prev_selected is None or prev_selected.numel() == 0:
+                continue
+            prev_selected = prev_selected.reshape(prev_selected.shape[0], -1)
+            prev_rows = int(prev_selected.shape[0])
+
+            if rejected_start < prev_rows:
+                union_rows = prev_selected[rejected_start:prev_rows].reshape(-1)
+                if union_rows.numel() > 0:
+                    union = {int(x) for x in union_rows.tolist()}
+                    coverage_total += int(draft_row.numel())
+                    coverage_hit += sum(
+                        1 for expert_id in draft_row.tolist() if int(expert_id) in union
+                    )
+
+            pred_row = accepted + token_index
+            if 0 <= pred_row < prev_rows:
+                prev_row = prev_selected[pred_row].reshape(-1)
+                n = min(int(prev_row.numel()), int(draft_row.numel()))
+                pred_row_total += n
+                if n > 0:
+                    pred_row_hit += int((draft_row[:n] == prev_row[:n]).sum().item())
+                    pred_row_layer_exact_total += 1
+                    pred_row_layer_exact_hit += int(
+                        n == int(draft_row.numel())
+                        and n == int(prev_row.numel())
+                        and bool(torch.equal(draft_row, prev_row))
+                    )
+
+            input_row = accepted + 1 + token_index
+            if 0 <= input_row < prev_rows:
+                prev_row = prev_selected[input_row].reshape(-1)
+                n = min(int(prev_row.numel()), int(draft_row.numel()))
+                input_row_total += n
+                if n > 0:
+                    input_row_hit += int((draft_row[:n] == prev_row[:n]).sum().item())
+                    input_row_layer_exact_total += 1
+                    input_row_layer_exact_hit += int(
+                        n == int(draft_row.numel())
+                        and n == int(prev_row.numel())
+                        and bool(torch.equal(draft_row, prev_row))
+                    )
+
+        token_perfect = (
+            present_layers > 0
+            and (expected_layers <= 0 or present_layers >= expected_layers)
+            and route_total > 0
+            and route_miss == 0
+            and route_hit == route_total
+        )
+        pending["checked_tokens"] = token_index + 1
+        for key, value in (
+            ("route_total", route_total),
+            ("route_miss", route_miss),
+            ("coverage_total", coverage_total),
+            ("coverage_hit", coverage_hit),
+            ("pred_row_total", pred_row_total),
+            ("pred_row_hit", pred_row_hit),
+            ("input_row_total", input_row_total),
+            ("input_row_hit", input_row_hit),
+            ("pred_row_layer_exact_total", pred_row_layer_exact_total),
+            ("pred_row_layer_exact_hit", pred_row_layer_exact_hit),
+            ("input_row_layer_exact_total", input_row_layer_exact_total),
+            ("input_row_layer_exact_hit", input_row_layer_exact_hit),
+        ):
+            pending[key] = int(pending.get(key, 0)) + int(value)
+
+        if bool(pending.get("prefix_open", True)) and token_perfect:
+            pending["perfect_prefix_len"] = int(pending.get("perfect_prefix_len", 0)) + 1
+        else:
+            pending["prefix_open"] = False
+        if token_perfect:
+            pending["perfect_tokens"] = int(pending.get("perfect_tokens", 0)) + 1
+
+        oracle_covered = coverage_total > 0 and coverage_hit == coverage_total
+        if bool(pending.get("oracle_prefix_open", True)) and oracle_covered:
+            pending["oracle_prefix_len"] = int(pending.get("oracle_prefix_len", 0)) + 1
+        else:
+            pending["oracle_prefix_open"] = False
+        if oracle_covered:
+            pending["oracle_covered_tokens"] = int(pending.get("oracle_covered_tokens", 0)) + 1
+
+        token_records = pending.setdefault("token_records", [])
+        if isinstance(token_records, list) and len(token_records) < 32:
+            token_records.append(
+                {
+                    "draft_step_id": int(step_id),
+                    "token_index": int(token_index),
+                    "perfect": bool(token_perfect),
+                    "present_layers": int(present_layers),
+                    "route_total": int(route_total),
+                    "route_miss": int(route_miss),
+                    "coverage_total": int(coverage_total),
+                    "coverage_hit": int(coverage_hit),
+                    "oracle_covered": bool(oracle_covered),
+                    "pred_row_total": int(pred_row_total),
+                    "pred_row_hit": int(pred_row_hit),
+                    "input_row_total": int(input_row_total),
+                    "input_row_hit": int(input_row_hit),
+                }
+            )
+
+    def _finalize_perfect_match_pending(self) -> None:
+        self._ensure_prefetch_internal_state()
+        pending = getattr(self, "_draft_perfect_pending", None)
+        if not pending:
+            return
+        checked = int(pending.get("checked_tokens", 0))
+        prefix_len = int(pending.get("perfect_prefix_len", 0))
+        perfect_tokens = int(pending.get("perfect_tokens", 0))
+        oracle_prefix_len = int(pending.get("oracle_prefix_len", 0))
+        oracle_covered_tokens = int(pending.get("oracle_covered_tokens", 0))
+        route_total = int(pending.get("route_total", 0))
+        route_miss = int(pending.get("route_miss", 0))
+        coverage_total = int(pending.get("coverage_total", 0))
+        coverage_hit = int(pending.get("coverage_hit", 0))
+        profile = self._draft_perfect_profile
+        if checked > 0:
+            profile["followup_events"] += 1.0
+            profile["checked_tokens"] += float(checked)
+            profile["perfect_tokens"] += float(perfect_tokens)
+            profile["perfect_prefix_token_sum"] += float(prefix_len)
+            profile["oracle_covered_tokens"] += float(oracle_covered_tokens)
+            profile["oracle_prefix_token_sum"] += float(oracle_prefix_len)
+            profile["route_total"] += float(route_total)
+            profile["route_miss"] += float(route_miss)
+            profile["coverage_total"] += float(coverage_total)
+            profile["coverage_hit"] += float(coverage_hit)
+            for key in (
+                "pred_row_total",
+                "pred_row_hit",
+                "input_row_total",
+                "input_row_hit",
+                "pred_row_layer_exact_total",
+                "pred_row_layer_exact_hit",
+                "input_row_layer_exact_total",
+                "input_row_layer_exact_hit",
+            ):
+                profile[key] += float(int(pending.get(key, 0)))
+            if prefix_len > 0:
+                profile["prefix_ge1_events"] += 1.0
+            if prefix_len >= checked:
+                profile["prefix_full_checked_events"] += 1.0
+            if oracle_prefix_len > 0:
+                profile["oracle_prefix_ge1_events"] += 1.0
+            if oracle_prefix_len >= checked:
+                profile["oracle_prefix_full_checked_events"] += 1.0
+        else:
+            profile["no_followup_events"] += 1.0
+
+        record = {
+            "origin_step_index": int(pending.get("origin_step_index", -1)),
+            "drafted_tokens": int(pending.get("drafted_tokens", 0)),
+            "accepted_draft_tokens": int(pending.get("accepted_draft_tokens", 0)),
+            "rejected_tokens": int(pending.get("rejected_tokens", 0)),
+            "verify_trace_len": int(pending.get("verify_trace_len", 0)),
+            "checked_tokens": checked,
+            "perfect_tokens": perfect_tokens,
+            "perfect_prefix_len": prefix_len,
+            "oracle_covered_tokens": oracle_covered_tokens,
+            "oracle_prefix_len": oracle_prefix_len,
+            "route_total": route_total,
+            "route_miss": route_miss,
+            "coverage_total": coverage_total,
+            "coverage_hit": coverage_hit,
+            "pred_row_total": int(pending.get("pred_row_total", 0)),
+            "pred_row_hit": int(pending.get("pred_row_hit", 0)),
+            "input_row_total": int(pending.get("input_row_total", 0)),
+            "input_row_hit": int(pending.get("input_row_hit", 0)),
+            "refill_enabled": bool(pending.get("refill_enabled", False)),
+            "refill_promoted": int(pending.get("refill_promoted", 0)),
+            "refill_cpu_experts": int(pending.get("refill_cpu_experts", 0)),
+            "refill_skipped_inflight": int(pending.get("refill_skipped_inflight", 0)),
+            "token_records": list(pending.get("token_records", [])),
+        }
+        if len(self._draft_perfect_records) < int(getattr(self, "_draft_perfect_detail_limit", 256)):
+            self._draft_perfect_records.append(record)
+        self._draft_perfect_pending = None
+        self._draft_perfect_draft_meta_by_step.clear()
+
+    def _refill_rejected_verify_experts_for_perfect_match(
+        self,
+        pending: dict[str, object],
+    ) -> None:
+        if not bool(getattr(self, "_draft_perfect_refill_rejected", False)):
+            return
+        verify_meta = pending.get("verify_meta")
+        if not isinstance(verify_meta, dict):
+            return
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is not None:
+            with self._prefetch_runtime_lock:
+                publish_direct = getattr(prefetch_runtime, "publish_direct_active_ready", None)
+                if publish_direct is not None:
+                    publish_direct(step_id=int(getattr(self, "_prefetch_step_id", 0)))
+                publish_ready = getattr(prefetch_runtime, "publish_ready", None)
+                if publish_ready is not None:
+                    publish_ready(step_id=int(getattr(self, "_prefetch_step_id", 0)))
+                inflight_count = len(getattr(prefetch_runtime, "inflight", {}) or {})
+            if inflight_count > 0:
+                pending["refill_enabled"] = True
+                pending["refill_skipped_inflight"] = int(inflight_count)
+                self._draft_perfect_profile["refill_skipped_inflight_events"] += 1.0
+                self._draft_perfect_profile["refill_skipped_inflight_count"] += float(inflight_count)
+                return
+        row_start = int(pending.get("rejected_verify_row_start", 0))
+        profile = self._draft_perfect_profile
+        promoted_total = cpu_total = evicted_total = skipped_total = 0
+        transfer_ms_total = 0.0
+        for layer_idx, layer in verify_meta.items():
+            cache = getattr(self, "layer_caches", {}).get(int(layer_idx))
+            if cache is None:
+                continue
+            selected = layer.get("selected_experts")
+            if selected is None or selected.numel() == 0:
+                continue
+            selected = selected.reshape(selected.shape[0], -1)
+            if row_start >= int(selected.shape[0]):
+                continue
+            rows = selected[row_start:]
+            if rows.numel() == 0:
+                continue
+            routing = layer.get("routing_weights")
+            if routing is None:
+                routing_rows = torch.ones(rows.shape, dtype=torch.float32)
+            else:
+                routing = routing.reshape(routing.shape[0], -1)
+                routing_rows = routing[row_start:].to(dtype=torch.float32)
+            result = apply_verify_cache_fill_policy(
+                layer_idx=int(layer_idx),
+                selected_experts=rows,
+                routing_weights=routing_rows,
+                expert_cache=cache,
+                step_id=int(getattr(self, "_prefetch_step_id", 0)),
+                profile=None,
+            )
+            promoted_total += int(result.promoted_expert_count)
+            cpu_total += int(result.cpu_expert_count)
+            evicted_total += len(result.evicted_expert_ids)
+            skipped_total += int(result.skipped_pending_count)
+            transfer_ms_total += float(result.transfer_ms)
+        if promoted_total > 0 and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        pending["refill_enabled"] = True
+        pending["refill_promoted"] = promoted_total
+        pending["refill_cpu_experts"] = cpu_total
+        pending["refill_evicted"] = evicted_total
+        pending["refill_skipped_pending"] = skipped_total
+        profile["refill_events"] += 1.0
+        profile["refill_promoted"] += float(promoted_total)
+        profile["refill_cpu_experts"] += float(cpu_total)
+        profile["refill_evicted"] += float(evicted_total)
+        profile["refill_skipped_pending"] += float(skipped_total)
+        profile["refill_transfer_ms"] += transfer_ms_total
+
+    def record_spec_acceptance_for_perfect_match(self, outcome: dict) -> None:
+        self._ensure_prefetch_internal_state()
+        if not bool(getattr(self, "_draft_perfect_trace_enabled", False)):
+            return
+        self._flush_pending_prefetch_metadata(block=True)
+        self._finalize_perfect_match_pending()
+
+        drafted = int(outcome.get("drafted_tokens", 0) or 0)
+        accepted = int(outcome.get("accepted_draft_tokens", 0) or 0)
+        rejected = int(outcome.get("rejected_tokens", max(0, drafted - accepted)) or 0)
+        if drafted <= 0 or rejected <= 0:
+            return
+        verify_meta = self._draft_perfect_last_verify_meta
+        if not verify_meta:
+            self._draft_perfect_profile["reject_events_missing_verify_meta"] += 1.0
+            return
+        verify_trace_len = int(outcome.get("verify_trace_len", drafted + 1) or drafted + 1)
+        max_check = int(
+            os.getenv(
+                "NANOVLLM_DRAFT_PERFECT_MATCH_MAX_CHECK_TOKENS",
+                str(max(1, int(getattr(self.config, "max_draft_tokens", 1)))),
+            )
+            or "1"
+        )
+        pending: dict[str, object] = {
+            "origin_step_index": int(outcome.get("step_index", -1) or -1),
+            "drafted_tokens": drafted,
+            "accepted_draft_tokens": accepted,
+            "rejected_tokens": rejected,
+            "verify_trace_len": verify_trace_len,
+            "verify_meta": verify_meta,
+            "rejected_verify_row_start": max(0, min(accepted, verify_trace_len)),
+            "min_draft_step_id": int(getattr(self, "_prefetch_step_id", 0)) + 1,
+            "max_check_tokens": max(1, max_check),
+            "checked_tokens": 0,
+            "perfect_tokens": 0,
+            "perfect_prefix_len": 0,
+            "prefix_open": True,
+            "oracle_covered_tokens": 0,
+            "oracle_prefix_len": 0,
+            "oracle_prefix_open": True,
+            "route_total": 0,
+            "route_miss": 0,
+            "coverage_total": 0,
+            "coverage_hit": 0,
+            "pred_row_total": 0,
+            "pred_row_hit": 0,
+            "input_row_total": 0,
+            "input_row_hit": 0,
+            "pred_row_layer_exact_total": 0,
+            "pred_row_layer_exact_hit": 0,
+            "input_row_layer_exact_total": 0,
+            "input_row_layer_exact_hit": 0,
+            "token_records": [],
+        }
+        self._draft_perfect_profile["reject_events"] += 1.0
+        self._draft_perfect_profile["rejected_tokens"] += float(rejected)
+        self._draft_perfect_pending = pending
+        self._refill_rejected_verify_experts_for_perfect_match(pending)
+
     def get_profile(self, reset: bool = False) -> dict:
         self._ensure_prefetch_internal_state()
         if self.rank != 0:
             return {}
         self._poll_verify_layer_timing_events()
+        self._poll_verify_stream_timings(block=bool(reset))
         dual_queue = self._dual_queue_prefetch_enabled()
-        self._poll_dual_queue_segment_timings(block=not dual_queue)
-        self._flush_pending_prefetch_metadata(block=not dual_queue)
+        profile_flush_block = bool(reset) or not dual_queue
+        self._poll_dual_queue_segment_timings(block=profile_flush_block)
+        self._flush_pending_prefetch_metadata(block=profile_flush_block)
         self._wait_for_verify_boundary_prefetch_drain()
         with self._prefetch_profile_lock:
             out = {k: (int(v) if k.endswith("_count") else float(v)) for k, v in self._profile.items()}
             out["verify_op_event_records"] = list(getattr(self, "_verify_op_event_records", []))
             out["draft_op_event_records"] = list(getattr(self, "_draft_op_event_records", []))
+            metadata_by_step = getattr(self, "_verify_metadata_records_by_step", {})
+            stream_ms_by_step = getattr(self, "_verify_stream_ms_by_step", {})
+            verify_call_records: list[dict[str, object]] = []
+            for record in getattr(self, "_verify_call_records", []):
+                merged = dict(record)
+                stream_ms = stream_ms_by_step.get(int(merged.get("step_id", -1)))
+                merged["stream_ms_available"] = stream_ms is not None
+                merged["stream_ms"] = float(stream_ms or 0.0)
+                meta = metadata_by_step.get(int(merged.get("step_id", -1)))
+                if meta:
+                    for key, value in meta.items():
+                        if isinstance(value, dict):
+                            merged[key] = dict(value)
+                        else:
+                            merged[key] = float(value)
+                    token_count = float(merged.get("token_count", 0.0) or 0.0)
+                    routes = float(merged.get("metadata_cpu_routes_sum", 0.0) or 0.0)
+                    experts = float(merged.get("metadata_realized_cpu_expert_count_sum", 0.0) or 0.0)
+                    active = float(merged.get("metadata_pre_transfer_active_count_sum", 0.0) or 0.0)
+                    layer_count = float(merged.get("metadata_layer_count", 0.0) or 0.0)
+                    merged["metadata_available"] = True
+                    merged["metadata_cpu_routes_per_token"] = routes / token_count if token_count > 0.0 else 0.0
+                    merged["metadata_cpu_experts_per_token"] = experts / token_count if token_count > 0.0 else 0.0
+                    merged["metadata_cpu_route_miss_ratio"] = routes / active if active > 0.0 else 0.0
+                    merged["metadata_cpu_experts_per_layer"] = experts / layer_count if layer_count > 0.0 else 0.0
+                    execution_layer_count = float(
+                        merged.get("metadata_execution_layer_count", 0.0) or 0.0
+                    )
+                    execution_routes = float(
+                        merged.get("metadata_execution_cpu_routes_sum", 0.0) or 0.0
+                    )
+                    execution_experts = float(
+                        merged.get("metadata_execution_cpu_experts_sum", 0.0) or 0.0
+                    )
+                    merged["metadata_execution_available"] = bool(
+                        execution_layer_count > 0.0
+                    )
+                    merged.setdefault("metadata_execution_layer_count", 0.0)
+                    merged.setdefault("metadata_execution_active_routes_sum", 0.0)
+                    merged.setdefault("metadata_execution_cpu_routes_sum", 0.0)
+                    merged.setdefault("metadata_execution_cpu_experts_sum", 0.0)
+                    merged["metadata_execution_cpu_routes_per_layer"] = (
+                        execution_routes / execution_layer_count
+                        if execution_layer_count > 0.0
+                        else 0.0
+                    )
+                    merged["metadata_execution_cpu_experts_per_layer"] = (
+                        execution_experts / execution_layer_count
+                        if execution_layer_count > 0.0
+                        else 0.0
+                    )
+                else:
+                    merged["metadata_available"] = False
+                    merged.setdefault("metadata_cpu_routes_sum", 0.0)
+                    merged.setdefault("metadata_realized_cpu_expert_count_sum", 0.0)
+                    merged.setdefault("metadata_pre_transfer_active_count_sum", 0.0)
+                    merged.setdefault("metadata_cpu_routes_per_token", 0.0)
+                    merged.setdefault("metadata_cpu_experts_per_token", 0.0)
+                    merged.setdefault("metadata_cpu_route_miss_ratio", 0.0)
+                    merged.setdefault("metadata_cpu_experts_per_layer", 0.0)
+                    merged.setdefault("metadata_execution_layer_count", 0.0)
+                    merged.setdefault("metadata_execution_active_routes_sum", 0.0)
+                    merged.setdefault("metadata_execution_cpu_routes_sum", 0.0)
+                    merged.setdefault("metadata_execution_cpu_experts_sum", 0.0)
+                    merged.setdefault("metadata_execution_available", False)
+                    merged.setdefault("metadata_execution_cpu_routes_per_layer", 0.0)
+                    merged.setdefault("metadata_execution_cpu_experts_per_layer", 0.0)
+                merged["padding_token_count"] = max(
+                    0,
+                    int(merged.get("bucket", 0) or 0)
+                    - int(merged.get("token_count", 0) or 0),
+                )
+                verify_call_records.append(merged)
+            out["verify_call_records"] = verify_call_records
         decode_count = int(self._profile.get("decode_count", 0))
         graph_hit_count = int(self._profile.get("graph_hit_count", 0))
         out["graph_hit_rate"] = float(graph_hit_count / decode_count) if decode_count > 0 else 0.0
@@ -1287,12 +2014,70 @@ class ModelRunner:
         out["prefetch_async_exposed_wait_ms"] = exposed_ms
         out["prefetch_async_hidden_ms"] = max(0.0, worker_turnaround_ms - exposed_ms)
         out["prefetch_async_hidden_ratio"] = float(out["prefetch_async_hidden_ms"] / worker_turnaround_ms) if worker_turnaround_ms > 0.0 else 0.0
+        if bool(getattr(self, "_draft_perfect_trace_enabled", False)):
+            self._flush_pending_prefetch_metadata(block=True)
+            self._finalize_perfect_match_pending()
+            perfect_profile = getattr(self, "_draft_perfect_profile", {})
+            for key, value in perfect_profile.items():
+                out[f"draft_perfect_{key}"] = float(value)
+            checked = float(out.get("draft_perfect_checked_tokens", 0.0))
+            route_total = float(out.get("draft_perfect_route_total", 0.0))
+            coverage_total = float(out.get("draft_perfect_coverage_total", 0.0))
+            pred_row_total = float(out.get("draft_perfect_pred_row_total", 0.0))
+            input_row_total = float(out.get("draft_perfect_input_row_total", 0.0))
+            followup_events = float(out.get("draft_perfect_followup_events", 0.0))
+            out["draft_perfect_trace_enabled"] = True
+            out["draft_perfect_refill_rejected_enabled"] = bool(
+                getattr(self, "_draft_perfect_refill_rejected", False)
+            )
+            out["draft_perfect_token_rate"] = (
+                float(out.get("draft_perfect_perfect_tokens", 0.0)) / checked
+                if checked > 0.0 else 0.0
+            )
+            out["draft_perfect_route_miss_ratio"] = (
+                float(out.get("draft_perfect_route_miss", 0.0)) / route_total
+                if route_total > 0.0 else 0.0
+            )
+            out["draft_perfect_coverage_ratio"] = (
+                float(out.get("draft_perfect_coverage_hit", 0.0)) / coverage_total
+                if coverage_total > 0.0 else 0.0
+            )
+            out["draft_perfect_pred_row_match_ratio"] = (
+                float(out.get("draft_perfect_pred_row_hit", 0.0)) / pred_row_total
+                if pred_row_total > 0.0 else 0.0
+            )
+            out["draft_perfect_input_row_match_ratio"] = (
+                float(out.get("draft_perfect_input_row_hit", 0.0)) / input_row_total
+                if input_row_total > 0.0 else 0.0
+            )
+            out["draft_perfect_prefix_ge1_rate"] = (
+                float(out.get("draft_perfect_prefix_ge1_events", 0.0)) / followup_events
+                if followup_events > 0.0 else 0.0
+            )
+            out["draft_perfect_oracle_covered_token_rate"] = (
+                float(out.get("draft_perfect_oracle_covered_tokens", 0.0)) / checked
+                if checked > 0.0 else 0.0
+            )
+            out["draft_perfect_oracle_prefix_ge1_rate"] = (
+                float(out.get("draft_perfect_oracle_prefix_ge1_events", 0.0)) / followup_events
+                if followup_events > 0.0 else 0.0
+            )
+            out["draft_perfect_records"] = list(getattr(self, "_draft_perfect_records", []))
         if reset:
             with self._prefetch_profile_lock:
                 self._profile.clear()
                 self._prefetch_trace_events.clear()
                 self._verify_op_event_records.clear()
                 self._draft_op_event_records.clear()
+                self._verify_call_records.clear()
+                self._verify_metadata_records_by_step.clear()
+                self._verify_stream_timing_events.clear()
+                self._verify_stream_ms_by_step.clear()
+        if bool(getattr(self, "_draft_perfect_trace_enabled", False)):
+            self._draft_perfect_profile.clear()
+            self._draft_perfect_records.clear()
+            self._draft_perfect_pending = None
+            self._draft_perfect_draft_meta_by_step.clear()
             pending = getattr(self, "_pending_prefetch_metadata", None)
             if pending is not None:
                 pending.clear()
@@ -1681,7 +2466,7 @@ class ModelRunner:
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
         if not getattr(self.config, "draft_cuda_graph_enabled", True):
             return False
-        if self.enforce_eager:
+        if getattr(self, "enforce_eager", False):
             return False
         if getattr(self.config, "draft_top_c", 0) != 0 and not self._can_use_draft_cpu_cudagraph():
             return False
@@ -1792,13 +2577,352 @@ class ModelRunner:
         if extractor is not None and seq_ids:
             extractor.forget(seq_ids)
 
+    def _configure_verify_cost_proxy(self) -> None:
+        mode = str(
+            getattr(self.config, "draft_tpot_verify_model_mode", "off")
+        ).strip().lower()
+        if mode == "off" or self.rank != 0:
+            return
+        from nanovllm.engine.speculative.verify_cost_model import (
+            DraftRouteCostProxy,
+            VerifyTimeCostModel,
+        )
+
+        model = VerifyTimeCostModel.load(
+            str(getattr(self.config, "draft_tpot_verify_model_path", ""))
+        )
+        hf_config = self.config.hf_config
+        expected = (
+            int(hf_config.num_hidden_layers),
+            int(hf_config.num_experts),
+            int(hf_config.num_experts_per_tok),
+        )
+        calibrated = (model.num_layers, model.num_experts, model.top_k)
+        if calibrated != expected:
+            raise ValueError(
+                f"verify cost model shape {calibrated} does not match runtime {expected}"
+            )
+        if mode == "active" and not bool(model.artifact.get("accuracy_gate_passed")):
+            raise ValueError("active verify cost model did not pass its accuracy gate")
+        if mode == "active":
+            acceptance_strategy = str(
+                getattr(self.config, "acceptance_strategy", "greedy")
+            ).strip().lower()
+            is_sampling = acceptance_strategy in {
+                "standard_sampling",
+                "sampling",
+                "spec_sampling",
+            }
+            if getattr(model, "protocol_adjustment", None) is not None:
+                model.validate_protocol(acceptance_strategy=acceptance_strategy)
+            deployment_field = (
+                "sampling_deployment_validation"
+                if is_sampling
+                else "deployment_validation"
+            )
+            deployment = model.artifact.get(deployment_field, {})
+            if not isinstance(deployment, dict) or not bool(deployment.get("passed")):
+                raise ValueError(
+                    "active verify cost model lacks a passing "
+                    + ("sampling " if is_sampling else "")
+                    + "shadow deployment validation"
+                )
+            if str(deployment.get("gate_version", "")) != "v2":
+                raise ValueError(
+                    "active verify cost model requires a v2 "
+                    + ("sampling " if is_sampling else "")
+                    + "shadow deployment gate"
+                )
+            validated_model_id = str(deployment.get("model_id", "") or "")
+            if validated_model_id != str(model.model_id):
+                raise ValueError(
+                    "shadow deployment validation is not bound to the active "
+                    f"model id: validated={validated_model_id!r} "
+                    f"active={model.model_id!r}"
+                )
+            if (
+                model.proxy_workload_model is None
+                or not bool(model.artifact.get("proxy_workload_gate_passed"))
+            ):
+                raise ValueError(
+                    "active verify cost model did not pass its causal workload "
+                    "proxy gate"
+                )
+            if str(model.artifact.get("proxy_workload_gate_version", "")) != "v2":
+                raise ValueError(
+                    "active verify cost model requires a v2 causal workload proxy gate"
+                )
+            setattr(
+                self.config,
+                "draft_tpot_verify_model_sampling_validated",
+                bool(is_sampling),
+            )
+            protocol_adjustment = (
+                getattr(model, "protocol_adjustment", None) or {}
+            )
+            setattr(
+                self.config,
+                "draft_tpot_verify_model_temperature",
+                protocol_adjustment.get("temperature"),
+            )
+
+        resolved_backend = str(getattr(self.config, "kt_direct_backend", "auto"))
+        resolved_threads = int(getattr(self.config, "kt_num_threads", 0))
+        for layer in getattr(getattr(self.model, "model", None), "layers", []):
+            backend = getattr(getattr(layer, "mlp", None), "cpu_backend", None)
+            if backend is None:
+                continue
+            resolved_backend = str(
+                getattr(backend, "kt_selected_backend", resolved_backend)
+            )
+            runtime = getattr(backend, "runtime", None)
+            resolved_threads = int(
+                getattr(runtime, "kt_num_threads", resolved_threads)
+            )
+            break
+        try:
+            kt_version = importlib.metadata.version("kt-kernel")
+        except importlib.metadata.PackageNotFoundError:
+            kt_version = "unknown"
+        model.validate_fingerprint(
+            {
+                "cpu_model": _cpu_model_name(),
+                "gpu_model": torch.cuda.get_device_name(torch.cuda.current_device()),
+                "kt_kernel_version": kt_version,
+                "kt_num_threads": resolved_threads,
+                "kt_backend": resolved_backend,
+            }
+        )
+        self._verify_cost_model = model
+        self._verify_cost_proxy = DraftRouteCostProxy(model)
+        self._verify_cost_cache_masks = tuple(
+            (int(layer_idx), cache.cached_expert_mask_host)
+            for layer_idx, cache in getattr(self, "layer_caches", {}).items()
+            if hasattr(cache, "cached_expert_mask_host")
+        )
+        extractor = getattr(self, "_acceptance_extractor", None)
+        if extractor is not None:
+            extractor.original_route_readback_enabled = (
+                mode == "shadow"
+                or str(getattr(self.config, "draft_stop_policy", "none"))
+                .strip()
+                .lower()
+                == "tpot"
+            )
+
+    def _predict_verify_cost_from_draft_routes(
+        self,
+        *,
+        seq_count: int,
+        original_routes=None,
+        reset_round: bool = False,
+        predict: bool = True,
+        lookahead_logical_tokens: int | None = None,
+    ) -> dict[str, object] | None:
+        proxy = getattr(self, "_verify_cost_proxy", None)
+        model = getattr(self, "_verify_cost_model", None)
+        if proxy is None or model is None:
+            return None
+        profile_proxy = bool(self.profile_enabled and self.rank == 0)
+        total_t0 = perf_counter() if profile_proxy else 0.0
+        observe_t0 = perf_counter() if profile_proxy else 0.0
+        if reset_round or not bool(getattr(self, "_verify_cost_round_active", False)):
+            proxy.reset()
+            self._verify_cost_round_active = True
+            self._verify_cost_latest_prediction = None
+        if original_routes is not None:
+            proxy.observe(original_routes)
+        observe_ms = (
+            (perf_counter() - observe_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        if not predict:
+            if profile_proxy:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_cost_route_observe_only_count"] += 1.0
+                    self._profile["verify_cost_route_observe_only_ms"] += observe_ms
+            return None
+        logical_tokens = int(proxy.known_rows) + int(seq_count)
+        if bool(getattr(self.config, "verify_cuda_graph", False)):
+            bucket = int(self._select_verify_bucket(logical_tokens))
+        else:
+            bucket = logical_tokens
+        cache_t0 = perf_counter() if profile_proxy else 0.0
+        ready_direct_active = 0
+        ready_experts: list[tuple[int, int]] = []
+        prefetch_runtime = getattr(self, "prefetch_runtime", None)
+        if prefetch_runtime is not None:
+            with self._prefetch_runtime_lock:
+                for ticket in getattr(prefetch_runtime, "inflight", {}).values():
+                    if not bool(getattr(ticket, "direct_active", False)):
+                        continue
+                    ready = bool(getattr(ticket, "ready", False))
+                    ready_event = getattr(ticket, "ready_event", None)
+                    if not ready and ready_event is not None:
+                        ready = bool(ready_event.query())
+                    if not ready:
+                        continue
+                    layer_idx = int(ticket.layer_idx)
+                    ready_experts.append((layer_idx, int(ticket.expert_idx)))
+                    ready_direct_active += 1
+                uncached_mask = proxy.build_uncached_mask_from_host_masks(
+                    getattr(self, "_verify_cost_cache_masks", ()),
+                    additional_cached_experts=ready_experts,
+                )
+        else:
+            uncached_mask = proxy.build_uncached_mask_from_host_masks(
+                getattr(self, "_verify_cost_cache_masks", ()),
+            )
+        cached_expert_count = int(uncached_mask.size - uncached_mask.sum())
+        cache_ms = (
+            (perf_counter() - cache_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        estimate_t0 = perf_counter() if profile_proxy else 0.0
+        estimate = proxy.estimate_summary(
+            bucket=bucket,
+            logical_tokens=logical_tokens,
+            uncached_mask=uncached_mask,
+        )
+        estimate_ms = (
+            (perf_counter() - estimate_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        prediction_t0 = perf_counter() if profile_proxy else 0.0
+        prediction = model.predict_proxy_summary(
+            estimate,
+            cached_expert_count=cached_expert_count,
+            ready_direct_active_experts=ready_direct_active,
+        )
+        prediction_ms = (
+            (perf_counter() - prediction_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        result: dict[str, object] = {
+            "verify_cost_model_id": str(model.model_id),
+            "verify_cost_prediction_ms": float(prediction.total_ms),
+            "verify_cost_fixed_ms": float(prediction.fixed_ms),
+            "verify_cost_exposed_cpu_ms": float(prediction.exposed_cpu_ms),
+            "verify_cost_error_p90_ms": float(prediction.error_p90_ms),
+            "verify_cost_bucket": int(estimate.bucket),
+            "verify_cost_logical_tokens": int(estimate.logical_tokens),
+            "verify_cost_known_rows": int(estimate.known_rows),
+            "verify_cost_unknown_rows": int(estimate.unknown_rows),
+            "verify_cost_known_cpu_routes": float(estimate.known_cpu_routes),
+            "verify_cost_prior_cpu_routes": float(estimate.prior_cpu_routes),
+            "verify_cost_cpu_routes": float(prediction.estimated_cpu_routes),
+            "verify_cost_cpu_experts": float(prediction.estimated_cpu_experts),
+            "verify_cost_proxy_cpu_routes": float(estimate.proxy_cpu_routes),
+            "verify_cost_proxy_cpu_experts": float(estimate.proxy_cpu_experts),
+            "verify_cost_cached_expert_count": int(cached_expert_count),
+            "verify_cost_ready_direct_active_experts": int(ready_direct_active),
+        }
+        lookahead_t0 = perf_counter() if profile_proxy else 0.0
+        current_logical_tokens = int(proxy.known_rows) + int(seq_count)
+        if lookahead_logical_tokens is None:
+            lookahead_logical_tokens = current_logical_tokens + int(seq_count)
+        else:
+            lookahead_logical_tokens = int(lookahead_logical_tokens)
+            if lookahead_logical_tokens <= current_logical_tokens:
+                raise ValueError(
+                    "verify-cost lookahead target must be beyond the current "
+                    f"logical length: current={current_logical_tokens} "
+                    f"target={lookahead_logical_tokens}"
+                )
+        if lookahead_logical_tokens <= max(model.buckets, default=0):
+            lookahead_bucket = (
+                int(self._select_verify_bucket(lookahead_logical_tokens))
+                if bool(getattr(self.config, "verify_cuda_graph", False))
+                else lookahead_logical_tokens
+            )
+            lookahead_estimate = proxy.estimate_summary(
+                bucket=lookahead_bucket,
+                logical_tokens=lookahead_logical_tokens,
+                uncached_mask=uncached_mask,
+            )
+            lookahead_prediction = model.predict_proxy_summary(
+                lookahead_estimate,
+                cached_expert_count=cached_expert_count,
+                ready_direct_active_experts=ready_direct_active,
+            )
+            result.update(
+                {
+                    "verify_cost_lookahead_prediction_ms": float(
+                        lookahead_prediction.total_ms
+                    ),
+                    "verify_cost_lookahead_bucket": int(lookahead_bucket),
+                    "verify_cost_lookahead_logical_tokens": int(
+                        lookahead_logical_tokens
+                    ),
+                    "verify_cost_lookahead_cpu_routes": float(
+                        lookahead_prediction.estimated_cpu_routes
+                    ),
+                    "verify_cost_lookahead_cpu_experts": float(
+                        lookahead_prediction.estimated_cpu_experts
+                    ),
+                }
+            )
+        lookahead_ms = (
+            (perf_counter() - lookahead_t0) * 1000.0 if profile_proxy else 0.0
+        )
+        if profile_proxy:
+            result["verify_cost_layer_proxy_cpu_routes"] = [
+                float(value)
+                for value in estimate.layer_route_counts.sum(axis=1)
+            ]
+            result["verify_cost_layer_proxy_cpu_experts"] = [
+                float(value)
+                for value in estimate.layer_route_counts.clip(0.0, 1.0).sum(axis=1)
+            ]
+        if profile_proxy:
+            total_ms = (perf_counter() - total_t0) * 1000.0
+            result.update(
+                {
+                    "verify_cost_runtime_route_observe_ms": observe_ms,
+                    "verify_cost_runtime_cache_snapshot_ms": cache_ms,
+                    "verify_cost_runtime_current_estimate_ms": estimate_ms,
+                    "verify_cost_runtime_model_predict_ms": prediction_ms,
+                    "verify_cost_runtime_lookahead_ms": lookahead_ms,
+                    "verify_cost_runtime_total_ms": total_ms,
+                }
+            )
+        self._verify_cost_latest_prediction = dict(result)
+        if profile_proxy:
+            with self._prefetch_profile_lock:
+                self._profile["verify_cost_proxy_prediction_count"] += 1.0
+                self._profile["verify_cost_proxy_prediction_ms_sum"] += float(
+                    prediction.total_ms
+                )
+                self._profile["verify_cost_route_observe_ms"] += observe_ms
+                self._profile["verify_cost_cache_snapshot_ms"] += cache_ms
+                self._profile["verify_cost_current_estimate_ms"] += estimate_ms
+                self._profile["verify_cost_model_predict_ms"] += prediction_ms
+                self._profile["verify_cost_lookahead_ms"] += lookahead_ms
+                self._profile["verify_cost_proxy_total_ms"] += total_ms
+        return result
+
+    def start_verify_cost_round(
+        self,
+        seq_count: int,
+        predict: bool = True,
+    ) -> dict[str, object] | None:
+        """Predict the no-draft verify baseline before the first draft call."""
+        return self._predict_verify_cost_from_draft_routes(
+            seq_count=int(seq_count),
+            reset_round=True,
+            predict=bool(predict),
+        )
+
     def _set_speculative_execution_mode(self, mode: str):
         if hasattr(self.model, "set_speculative_execution_mode"):
             draft_top_c = getattr(self.config, "draft_top_c", 0)
             self.model.set_speculative_execution_mode(mode, self.draft_scheduler, draft_top_c)
 
     @torch.inference_mode()
-    def run_draft(self, seqs: list[Sequence], return_logits: bool = False) -> tuple:
+    def run_draft(
+        self,
+        seqs: list[Sequence],
+        return_logits: bool = False,
+        observe_verify_cost: bool = True,
+        predict_verify_cost: bool = True,
+        verify_cost_lookahead_tokens: int | None = None,
+    ) -> tuple:
         """Draft decode path with explicit draft plan execution inside MoE blocks."""
         self._ensure_prefetch_internal_state()
         t0 = perf_counter()
@@ -1910,10 +3034,54 @@ class ModelRunner:
                 draft_logits = None
 
             acceptance_alpha = None
+            verify_cost_prediction = None
             if acceptance_extractor is not None and getattr(self, "_pending_acceptance", False):
                 # Reads alpha + updated history state (one D2H, after the sampler
                 # sync already forced by self.run) and advances host history state.
-                acceptance_alpha = acceptance_extractor.read_outputs(seqs)
+                include_routes = (
+                    getattr(self, "_verify_cost_proxy", None) is not None
+                    and bool(observe_verify_cost)
+                )
+                readback_t0 = (
+                    perf_counter()
+                    if self.profile_enabled and self.rank == 0
+                    else 0.0
+                )
+                acceptance_outputs = acceptance_extractor.read_outputs(
+                    seqs,
+                    include_original_routes=include_routes,
+                )
+                if self.profile_enabled and self.rank == 0:
+                    readback_ms = (perf_counter() - readback_t0) * 1000.0
+                    with self._prefetch_profile_lock:
+                        self._profile["acceptance_readback_ms"] += readback_ms
+                        self._profile["acceptance_readback_count"] += 1.0
+                if include_routes:
+                    acceptance_alpha, original_routes = acceptance_outputs
+                    verify_cost_prediction = self._predict_verify_cost_from_draft_routes(
+                        seq_count=len(seqs),
+                        original_routes=original_routes,
+                        predict=bool(predict_verify_cost),
+                        lookahead_logical_tokens=verify_cost_lookahead_tokens,
+                    )
+                    if (
+                        verify_cost_prediction is not None
+                        and self.profile_enabled
+                        and self.rank == 0
+                    ):
+                        verify_cost_prediction["verify_cost_runtime_readback_ms"] = (
+                            readback_ms
+                        )
+                        verify_cost_prediction["verify_cost_runtime_hotpath_ms"] = (
+                            readback_ms
+                            + float(
+                                verify_cost_prediction.get(
+                                    "verify_cost_runtime_total_ms", 0.0
+                                )
+                            )
+                        )
+                else:
+                    acceptance_alpha = acceptance_outputs
                 self._pending_acceptance = False
             core_run_ms = (perf_counter() - core_run_t0) * 1000.0
             if self.profile_enabled and self.rank == 0:
@@ -1957,6 +3125,8 @@ class ModelRunner:
             prefetch_state = {"prefetch_step_id": step_id}
             if acceptance_alpha is not None:
                 prefetch_state["acceptance_alpha"] = acceptance_alpha
+            if verify_cost_prediction is not None:
+                prefetch_state.update(verify_cost_prediction)
             if return_logits and self.rank == 0:
                 return token_ids, prefetch_state, draft_logits
             return token_ids, prefetch_state
@@ -2094,6 +3264,52 @@ class ModelRunner:
                         float(self._profile.get(f"{phase}_segment_{int(segment_id)}_cuda_event_ms", 0.0)) + elapsed_ms
                     )
         self._dual_queue_segment_timing_events = remaining
+
+    def _verify_stream_timing_enabled(self) -> bool:
+        return (
+            torch.cuda.is_available()
+            and (
+                os.getenv("NANOVLLM_VERIFY_COST_MODEL_PROFILE", "").strip().lower()
+                in {"1", "true", "yes", "y", "on"}
+                or os.getenv("NANOVLLM_VERIFY_STREAM_EVENT_TIMING", "").strip().lower()
+                in {"1", "true", "yes", "y", "on"}
+            )
+        )
+
+    def _start_verify_stream_timing(self):
+        if not self._verify_stream_timing_enabled():
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(torch.cuda.current_stream())
+        return start, end
+
+    def _finish_verify_stream_timing(self, step_id: int, timing) -> None:
+        if timing is None:
+            return
+        start, end = timing
+        end.record(torch.cuda.current_stream())
+        self._verify_stream_timing_events.append((int(step_id), start, end))
+
+    def _poll_verify_stream_timings(self, *, block: bool) -> None:
+        self._ensure_prefetch_internal_state()
+        pending = getattr(self, "_verify_stream_timing_events", [])
+        if not pending:
+            return
+        remaining = []
+        for step_id, start, end in pending:
+            if block:
+                end.synchronize()
+            elif not bool(end.query()):
+                remaining.append((step_id, start, end))
+                continue
+            elapsed_ms = float(start.elapsed_time(end))
+            self._verify_stream_ms_by_step[int(step_id)] = elapsed_ms
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_stream_event_count"] += 1.0
+                    self._profile["verify_stream_event_ms"] += elapsed_ms
+        self._verify_stream_timing_events = remaining
 
     def _collect_verify_op_event_timings(
         self,
@@ -2276,19 +3492,64 @@ class ModelRunner:
     ):
         """Run one-shot verify in prefill-like mode and return traces or logits."""
         self._ensure_prefetch_internal_state()
+        had_verify_cost_round = bool(getattr(self, "_verify_cost_round_active", False))
+        self._verify_cost_round_active = False
+        if not had_verify_cost_round:
+            self._verify_cost_latest_prediction = None
+        self._poll_verify_stream_timings(block=False)
         total_t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
         runtime_meta_recorder = getattr(self, "runtime_meta_recorder", None)
         if prefetch_runtime is not None and runtime_meta_recorder is not None:
             self._flush_pending_prefetch_metadata(block=False)
+        verify_delta_keys = (
+            "verify_cpu_routes_sum",
+            "verify_realized_cpu_expert_count_sum",
+            "verify_pre_transfer_cache_miss_sum",
+            "verify_pre_transfer_active_count_sum",
+            "verify_activated_expert_set_size_sum",
+            "verify_moe_profile_count",
+            "verify_kt_hybrid_segment_graph_replay_count",
+            "verify_kt_hybrid_graph_replay_count",
+            "verify_segment_graph_replay_enqueue_count",
+            "verify_segment_graph_replay_enqueue_ms",
+            "verify_segment_metadata_enqueue_count",
+            "verify_segment_metadata_enqueue_ms",
+            "verify_deferred_segment_metadata_enqueue_total_ms",
+            "run_verify_kt_hybrid_metadata_wait_ms",
+            "run_verify_kt_hybrid_metadata_collect_ms",
+            "run_verify_kt_hybrid_metadata_observe_ms",
+            "run_verify_kt_hybrid_metadata_enqueue_ms",
+            "run_verify_kt_hybrid_metadata_record_consumed_ms",
+            "run_verify_kt_hybrid_metadata_mark_access_ms",
+            "verify_tpot_dynamic_budget_applied_count",
+            "verify_tpot_dynamic_budget_token_sum",
+            "verify_tpot_dynamic_budget_value_sum",
+        )
+        if self.profile_enabled and self.rank == 0:
+            with self._prefetch_profile_lock:
+                _verify_profile_start = {
+                    key: float(self._profile.get(key, 0.0))
+                    for key in verify_delta_keys
+                }
+        else:
+            _verify_profile_start = {}
         self._set_speculative_execution_mode("verify")
         t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs)
         self._record_profile("verify_prepare_prefill_ms", perf_counter() - t0)
         token_count = int(input_ids.numel())
+        verify_bucket = (
+            int(self._select_verify_bucket(token_count))
+            if bool(getattr(self.config, "verify_cuda_graph", False))
+            and getattr(self, "verify_graph_bs", None)
+            else int(token_count)
+        )
+        verify_forward_ms = 0.0
         _original_verify_prefetch_max = None
         _dynamic_verify_prefetch_budget_applied = False
+        _dynamic_verify_prefetch_budget_value = int(getattr(self.config, "verify_prefetch_max_per_boundary", 0))
         if (
             bool(getattr(self.config, "verify_prefetch_tpot_dynamic_budget_enabled", False))
             and str(getattr(self.config, "draft_stop_policy", "")).strip().lower() == "tpot"
@@ -2306,6 +3567,7 @@ class ModelRunner:
             )))
             self.config.verify_prefetch_max_per_boundary = min(_original_verify_prefetch_max, small_budget)
             _dynamic_verify_prefetch_budget_applied = True
+            _dynamic_verify_prefetch_budget_value = int(self.config.verify_prefetch_max_per_boundary)
             if self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
                     self._profile["verify_tpot_dynamic_budget_applied_count"] += 1.0
@@ -2344,6 +3606,7 @@ class ModelRunner:
         # Verify needs logits for every queried token position.
         try:
             t0 = perf_counter()
+            verify_stream_timing = self._start_verify_stream_timing()
 
             def _execute_verify_forward():
                 nonlocal used_verify_segment_graph
@@ -2433,9 +3696,11 @@ class ModelRunner:
                     logits = torch.cat(all_logits, dim=-1)
                 else:
                     dist.gather(logits, None, 0)
+            self._finish_verify_stream_timing(step_id, verify_stream_timing)
             if self.profile_enabled and self.profile_cuda_sync:
                 torch.cuda.synchronize()
-            self._record_profile("verify_forward_ms", perf_counter() - t0)
+            verify_forward_ms = (perf_counter() - t0) * 1000.0
+            self._record_profile("verify_forward_ms", verify_forward_ms / 1000.0)
         finally:
             if _dynamic_verify_prefetch_budget_applied and _original_verify_prefetch_max is not None:
                 self.config.verify_prefetch_max_per_boundary = _original_verify_prefetch_max
@@ -2456,6 +3721,53 @@ class ModelRunner:
 
         if self.rank != 0:
             return None
+
+        def _record_verify_call(outputs_ready: bool) -> None:
+            if not (self.profile_enabled and self.rank == 0):
+                return
+            total_ms = (perf_counter() - total_t0) * 1000.0
+            with self._prefetch_profile_lock:
+                deltas = {
+                    key: float(self._profile.get(key, 0.0)) - float(_verify_profile_start.get(key, 0.0))
+                    for key in verify_delta_keys
+                }
+                record = {
+                    "call_index": int(len(self._verify_call_records)),
+                    "step_id": int(step_id),
+                    "token_count": int(token_count),
+                    "verify_lengths": [int(x) for x in verify_lengths],
+                    "seq_count": int(len(seqs)),
+                    "bucket": int(verify_bucket),
+                    "used_cuda_graph": bool(self._can_use_verify_cudagraph(int(token_count))),
+                    "used_kt_hybrid": bool(getattr(self.config, "verify_cuda_graph_kt_hybrid", False)),
+                    "used_segment_graph": bool(used_verify_segment_graph),
+                    "dynamic_budget_applied": bool(_dynamic_verify_prefetch_budget_applied),
+                    "dynamic_budget_value": int(_dynamic_verify_prefetch_budget_value),
+                    "forward_ms": float(verify_forward_ms),
+                    "total_ms": float(total_ms),
+                    "outputs_ready": bool(outputs_ready),
+                    "return_logits": bool(return_logits),
+                }
+                latest_prediction = getattr(
+                    self, "_verify_cost_latest_prediction", None
+                )
+                if isinstance(latest_prediction, dict):
+                    record.update(latest_prediction)
+                    record["verify_cost_model_mode"] = str(
+                        getattr(
+                            self.config,
+                            "draft_tpot_verify_model_mode",
+                            "off",
+                        )
+                    )
+                record.update({f"delta_{key}": value for key, value in deltas.items()})
+                routes = float(record.get("delta_verify_cpu_routes_sum", 0.0))
+                experts = float(record.get("delta_verify_realized_cpu_expert_count_sum", 0.0))
+                active = float(record.get("delta_verify_pre_transfer_active_count_sum", 0.0))
+                record["cpu_routes_per_token"] = routes / float(token_count) if token_count > 0 else 0.0
+                record["cpu_experts_per_token"] = experts / float(token_count) if token_count > 0 else 0.0
+                record["cpu_route_miss_ratio"] = routes / active if active > 0.0 else 0.0
+                self._verify_call_records.append(record)
 
         if self.profile_enabled:
             self._record_profile("run_verify_total_ms", perf_counter() - total_t0)
@@ -2482,6 +3794,7 @@ class ModelRunner:
                 if self._prefetch_runtime_mode() == "draft_segment_indexed":
                     with self._prefetch_runtime_lock:
                         prefetch_runtime.end_draft_iteration()
+                _record_verify_call(outputs_ready=not return_logits)
                 return verify_outputs
             _used_segment_graph = used_verify_segment_graph
             if _used_segment_graph:
@@ -2514,6 +3827,7 @@ class ModelRunner:
             if self._prefetch_runtime_mode() == "draft_segment_indexed":
                 with self._prefetch_runtime_lock:
                     prefetch_runtime.end_draft_iteration()
+        _record_verify_call(outputs_ready=not return_logits)
         return verify_outputs
 
     @torch.inference_mode()
@@ -3462,7 +4776,9 @@ class ModelRunner:
             "1", "true", "yes", "y", "on"
         }:
             sync_t0 = perf_counter()
-            torch.cuda.synchronize()
+            ready = torch.cuda.Event(blocking=False)
+            ready.record(torch.cuda.current_stream())
+            ready.synchronize()
             sync_ms = (perf_counter() - sync_t0) * 1000.0
             if self.profile_enabled and self.rank == 0:
                 with self._prefetch_profile_lock:
@@ -3735,21 +5051,7 @@ class ModelRunner:
                         float(self._profile.get("verify_segment_graph_replay_enqueue_ms", 0.0)) + replay_enqueue_ms
                     )
                     self._profile[f"verify_segment_{seg_idx}_graph_replay_enqueue_ms"] += replay_enqueue_ms
-            if op_event_profile:
-                sync_t0 = perf_counter()
-                torch.cuda.synchronize()
-                sync_ms = (perf_counter() - sync_t0) * 1000.0
-                if self.profile_enabled and self.rank == 0:
-                    with self._prefetch_profile_lock:
-                        self._profile["verify_op_event_sync_count"] += 1.0
-                        self._profile["verify_op_event_sync_ms"] += sync_ms
-                self._collect_verify_op_event_timings(
-                    bucket=int(bucket),
-                    segment_id=int(seg_idx),
-                    step_id=int(step_id),
-                    token_count=int(num_tokens),
-                )
-            elif deep_profile_sync or breakdown_sync:
+            if not op_event_profile and (deep_profile_sync or breakdown_sync):
                 sync_t0 = perf_counter()
                 torch.cuda.synchronize()
                 sync_ms = (perf_counter() - sync_t0) * 1000.0
@@ -3796,6 +5098,24 @@ class ModelRunner:
                     self._profile["verify_segment_boundary_submit_ms"] += boundary_submit_ms
                     self._profile[f"verify_segment_{seg_idx}_boundary_submit_ms"] += boundary_submit_ms
             self._poll_dual_queue_segment_timings(block=False)
+
+        if op_event_profile:
+            sync_t0 = perf_counter()
+            ready = torch.cuda.Event(blocking=False)
+            ready.record(torch.cuda.current_stream())
+            ready.synchronize()
+            sync_ms = (perf_counter() - sync_t0) * 1000.0
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile["verify_op_event_sync_count"] += 1.0
+                    self._profile["verify_op_event_sync_ms"] += sync_ms
+            for seg_idx in range(num_segments):
+                self._collect_verify_op_event_timings(
+                    bucket=int(bucket),
+                    segment_id=int(seg_idx),
+                    step_id=int(step_id),
+                    token_count=int(num_tokens),
+                )
 
         if async_boundary_prefetch:
             self._wait_for_verify_boundary_prefetch_drain()

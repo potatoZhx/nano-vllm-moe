@@ -1,5 +1,7 @@
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -68,6 +70,45 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
         self.assertIsNone(out[0].routing_weights)
         self.assertEqual(out[0].aggregated_expert_ids.tolist(), [1, 2, 3])
         self.assertEqual(out[0].aggregated_activation_count.tolist(), [1, 2, 1])
+
+    def test_verify_cost_profile_keeps_padding_execution_counts_separate(self):
+        with patch.dict(os.environ, {"NANOVLLM_VERIFY_COST_MODEL_PROFILE": "1"}):
+            recorder = ModelRuntimeMetaRecorder(
+                config=SimpleNamespace(),
+                hf_config=SimpleNamespace(
+                    num_hidden_layers=1,
+                    num_experts_per_tok=2,
+                    num_experts=4,
+                ),
+            )
+        recorder.arm(
+            mode="verify_kt_hybrid",
+            step_id=9,
+            token_capacity=4,
+            logical_token_count=2,
+        )
+        selected = torch.tensor(
+            [[0, 1], [1, 2], [3, 3], [0, 3]], dtype=torch.int64
+        )
+        weights = torch.ones(4, 2, dtype=torch.float32)
+        uncached = torch.tensor(
+            [True, False, False, False, True, True, True, True],
+            dtype=torch.bool,
+        )
+        recorder.record_layer(
+            layer_idx=0,
+            selected_experts=selected,
+            routing_weights=weights,
+            uncached_route_mask=uncached,
+        )
+
+        out = recorder.collect(recorder.offload_async(stream=None), wait=True)
+        meta = out[0]
+        self.assertEqual(meta.token_count, 2)
+        self.assertEqual(meta.aggregated_expert_ids.tolist(), [0, 1, 2])
+        self.assertEqual(meta.aggregated_activation_count.tolist(), [1, 2, 1])
+        self.assertEqual(meta.execution_activation_count.tolist(), [2, 2, 1, 3])
+        self.assertEqual(meta.expert_status.tolist(), [2, 1, 1, 2])
 
     def test_collect_supports_host_buffer_pool_slot(self):
         recorder = ModelRuntimeMetaRecorder(

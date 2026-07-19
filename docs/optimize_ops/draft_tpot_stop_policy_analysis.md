@@ -2,6 +2,235 @@
 
 Date: 2026-07-08
 
+## 2026-07-13 High-K Early-Stop Follow-Up
+
+This is the latest decision section. The five-seed K6/vpb4 result remains the
+current formal baseline (`33.501 tok/s`, `29.877 ms` TPOT), but K6 is no longer
+the target policy. The target is now a higher maximum draft length with a
+controller that may stop only at efficient verify graph boundaries.
+
+### Root cause of the short-draft collapse
+
+The previous online lookahead stopped 112/121 rounds at K4. Full-K shadow
+curves show why: verify cost is sawtoothed at graph-bucket changes. A one-step
+controller at K6 sees the K7 transition from bucket 7 to bucket 10 and stops;
+it cannot see the amortized K9 endpoint. In addition, a configured
+`min_steps` previously retained an infeasible short T(0) comparison point.
+
+The controller now has a `bucket_lookahead` rule:
+
+- with buckets `3,5,7,10,13`, `Kmax=12`, and `min_steps=6`, the only decision
+  points are K6, K9, and K12;
+- at K6 it asks the causal CPU-expert proxy directly for K9, not K7; at K9 it
+  asks for K12;
+- only reachable boundary points update the best-cost reference;
+- no verify-cost model call is made at T(0), non-boundary steps, or Kmax;
+- a missing endpoint prediction fails open by continuing, rather than causing
+  an unmodeled short stop.
+
+The acceptance predictor is not the main cause. On the untouched calibration
+set, calibrated alpha bias by position band was `-0.0039` for positions 1-4,
+`-0.0015` for 5-8, and `+0.0031` for 9-12. On the online high-K sample, the
+predicted accepted length at K9 was `6.52`, below the realized `7.10`.
+
+### Multi-horizon verify prediction finding
+
+The current-state verify model remains accurate, but extending it several
+draft steps with a frozen cache snapshot is not accurate. A 256-token
+diagnostic used a permissive margin so the same rounds reached later
+boundaries:
+
+| comparison | pairs | early prediction | reached/actual | bias |
+|:---|---:|---:|---:|---:|
+| K6 prediction for K9 vs actual K9 verify | 18 | 111.885 ms | 87.473 ms | +24.411 ms |
+| K9 prediction for K12 vs actual K12 verify | 10 | 139.377 ms | 112.026 ms | +27.351 ms |
+
+The missing term is cache/prefetch evolution during the three intervening
+draft calls. The endpoint model uses the K6/K9 cache snapshot, while draft
+continues to prefetch experts before verify. This is distinct from the
+validated current-state model and must not be reported as a failure of its
+5.776 ms deployment MAE.
+
+An explicit policy-layer correction was added:
+
+```text
+draft_tpot_lookahead_cache_credit_ms_per_step = 8.5
+```
+
+It subtracts only from a future endpoint projection, is disabled by default,
+and records raw prediction, credit, and adjusted prediction separately. The
+8.5 ms value is the weighted per-step bias from the two diagnostic horizons;
+it is a small-sample candidate, not a promoted calibration.
+
+### Online high-K result
+
+Only two 512-token online screens and one 256-token mechanism diagnostic were
+run; no large parameter sweep was performed.
+
+| policy | tok/s | TPOT | verify calls | mean K | K histogram |
+|:---|---:|---:|---:|---:|:---|
+| boundary, no credit, margin 5% | 32.121 | 31.132 ms | 86 | 5.94 | `{1:1, 6:85}` |
+| boundary, credit 8.5, margin 10% | 30.686 | 32.589 ms | 64 | 8.86 | `{3:1, 6:7, 9:50, 12:6}` |
+
+The high-K controller achieved the intended draft distribution and reduced
+verify rounds by 25.6%, but it did not improve TPOT. It executed 56 additional
+draft calls (about 1.1 seconds) while saving only about 0.54 seconds of verify
+time. K9 rounds averaged `31.96 ms` realized round TPOT, close to but still
+above the K6 active screen's `31.06 ms`. All outputs passed the fixed-length
+and degeneration checks. These are single-seed stochastic screens, so they are
+mechanism evidence, not a promotion result.
+
+These absolute TPOT values use `decode_sec / (generated_output_tokens - 1)`.
+The benchmark excludes prefill time, and prefill already emits the first
+completion token. An audit found that the earlier report divided by all 512
+tokens. The raw `decode_sec` fields were retained, so the reports were rebuilt
+with 511 inter-token intervals. This changes every 512-token absolute rate by
+only `511/512`; paired speedups, policy ranking, and confidence intervals are
+unchanged.
+
+The experimental high-K configuration is:
+
+```text
+cache_ratio                                  = 0.3125
+max_draft_tokens                             = 12
+draft_stop_policy                            = tpot
+draft_tpot_stop_rule                         = bucket_lookahead
+draft_tpot_min_steps                         = 6
+draft_tpot_stop_margin                       = 0.10
+draft_tpot_lookahead_cache_credit_ms_per_step = 8.5
+verify_prefetch_max_per_boundary             = 10
+verify graph buckets                         = 3,5,7,10,13
+acceptance_strategy / temperature            = standard_sampling / 0.8
+```
+
+Reproduction:
+
+```bash
+python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --optimized-config k12_bucket_stop \
+  --draft-tpot-verify-model-path \
+    results/verify_cost_sampling_shadow_20260713/verify_time_cost_model.active.sampling.v2.json \
+  --draft-tpot-alpha-calibration-path \
+    results/acceptance_alpha_sampling_calibration_20260713/acceptance_alpha_calibration.standard_sampling.json \
+  --output-lens 512 \
+  --output-dir results/tpot_k12_bucket_stop \
+  --save-token-ids true --save-text true --skip-existing false
+```
+
+The acceptance token-feature path was also reduced from full-vocabulary FP32
+conversion before top-k to top-k in the logits dtype followed by conversion of
+only 32 values. Unit tests prove feature equivalence; no throughput claim is
+made for this code-only draft-step optimization.
+
+Evidence:
+
+```text
+results/tpot_high_k_boundary_analysis_20260713/offline_boundary_analysis.json
+results/tpot_high_k_boundary_online_20260713/margin05_seed71/
+results/tpot_high_k_boundary_online_20260713/margin20_diag_seed71_l256/
+results/tpot_high_k_boundary_online_20260713/credit85_margin10_seed71/
+```
+
+## Earlier 2026-07-13 Decision Update
+
+The implementation plan in this note was completed: acceptance alpha was
+calibrated, verify time was modeled from full-bucket CPU expert execution,
+sampling received a protocol-specific deployment shadow, and lookahead,
+hysteresis, patience, and minimum-step controls were implemented. The current
+decision is deliberately split between model correctness and TPOT policy
+performance.
+
+### What passed
+
+- Sampling alpha calibration passed on 2,230 external points: Brier score
+  improved `23.41%`, and mean bias changed from `-0.03212` to `-0.00243`.
+- The sampling verify-time model passed a fresh, instrumentation-off shadow:
+  MAE `5.776 ms`, P90 `10.311 ms`, ranking `0.837`, and all buckets passed.
+- Active prediction is deferred until `draft_tpot_min_steps` and skipped at the
+  final maximum-draft step, where another stop decision cannot save work.
+- Fixed-K benchmark collection can disable the unused acceptance predictor, so
+  the baseline no longer pays feature extraction, predictor tail-graph, and
+  host-readback work that it does not consume.
+
+### What did not pass
+
+The active early-stop policy did not beat fixed K6 in either targeted screen:
+
+| screen | fixed K6 | best active | delta |
+|:---|---:|---:|---:|
+| max K9 policy screen | 31.702 tok/s | 31.329 tok/s | -1.18% |
+| K6/K7 floor screen | 32.688 tok/s | 31.932 tok/s | -2.32% |
+
+The mechanism profile explains the loss. With `max_K=9`, `min_steps=3`, and
+lookahead margin 5%, 112 of 121 verify rounds stopped at draft length 4. That
+created 120 early stops and exposed the fixed cost of many short verify calls.
+The measured draft path remained about `18-19 ms` per step, so an early stop is
+profitable only when it avoids rejected draft work without adding enough
+verify rounds to lose CPU-expert batching and graph efficiency. The current
+active controller did not satisfy that condition.
+
+The sampling verify model is therefore allowed for shadow/controlled active
+experiments under its validated vpb10 protocol, but active early stop is not
+the production default. It cannot be combined with the vpb4 setting below
+without a new vpb4 calibration and instrumentation-off deployment shadow.
+
+### Accepted TPOT configuration
+
+The accepted optimization is fixed K6 plus a shorter verify prefetch budget:
+
+```text
+cache_ratio                       = 0.3125
+max_draft_tokens                  = 6
+draft_stop_policy                 = none
+acceptance_predictor_enabled      = false
+verify_prefetch_max_per_boundary  = 4
+verify graph buckets              = 3,5,7,10,13
+temperature                       = 0.8
+acceptance_strategy               = standard_sampling
+```
+
+K6 is important because its verify input has 7 tokens and exactly fills graph
+bucket 7. A three-seed vpb4 K sweep selected K6 with a `34.273 tok/s`
+geomean. The complete curve was K4 `33.137`, K5 `29.325`, K6 `34.273`, K7
+`29.844`, K8 `29.243`, K9 `31.586`, and K12 `30.047` tok/s.
+
+The budget change was then frozen and checked with five paired
+independent-process seeds:
+
+| setting | decode tok/s geomean | mean TPOT |
+|:---|---:|---:|
+| vpb10 | 31.370 | 31.969 ms |
+| vpb4 | 33.501 | 29.877 ms |
+
+The vpb4 gain is `6.79%` geomean, with paired cluster-bootstrap 95% CI
+`[+2.39%, +11.12%]`; mean TPOT fell `6.26%`. Four of five pairs improved,
+and all output quality checks passed. Output digests changed in every pair, so
+the result is an end-to-end stochastic workload improvement and is not used as
+a same-token operator-latency claim.
+
+Reproduction:
+
+```bash
+python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --optimized-config k6_decode \
+  --output-lens 512 \
+  --output-dir results/tpot_k6_decode \
+  --save-token-ids true --save-text true --skip-existing false
+```
+
+Evidence:
+
+```text
+results/verify_cost_sampling_shadow_20260713/
+results/acceptance_alpha_sampling_calibration_20260713/
+results/tpot_active_sampling_tuning_20260713/stage1/policy_validation.json
+results/tpot_active_sampling_tuning_20260713/stage2/policy_validation.json
+results/tpot_target_fixed_k_vpb4_predictor_off_20260713/fixed_k_analysis.json
+results/tpot_vpb4_final_analysis_20260713/policy_validation.json
+```
+
 ## Goal
 
 Enable `--draft-stop-policy tpot` for the K=12 optimized decode workload, try

@@ -516,11 +516,16 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
 
         if self.runtime_meta_recorder is not None:
+            uncached_route_mask = None
+            if bool(getattr(self.runtime_meta_recorder, "wants_route_status", False)):
+                _, gpu_mask_for_meta = self.expert_cache.remap_experts_to_slots(selected_experts)
+                uncached_route_mask = (~gpu_mask_for_meta).reshape(-1)
             with verify_op_event("moe.runtime_metadata_record", layer_idx):
                 self.runtime_meta_recorder.record_layer(
                     layer_idx=self.layer_idx,
                     selected_experts=selected_experts,
                     routing_weights=routing_weights,
+                    uncached_route_mask=uncached_route_mask,
                 )
 
         t_plan0 = perf_counter()

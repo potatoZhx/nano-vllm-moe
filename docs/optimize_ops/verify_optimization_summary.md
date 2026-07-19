@@ -6,6 +6,128 @@ This document summarizes the verify latency investigation, the code changes
 that were made, the rollback knobs, the validation results, and the optimized
 benchmark script.
 
+For the later `draft-stop-policy=tpot` investigation and per-verify cost model,
+see `docs/optimize_ops/verify_time_cost_model_tpot.md`.
+
+## 2026-07-13 High-K Follow-Up
+
+The five-seed K6/vpb4 result below remains the current formal best, but it is
+now treated as a baseline rather than the target design. A new
+`k12_bucket_stop` path implements high maximum draft length with decisions only
+at graph-efficient K6/K9/K12 boundaries.
+
+The first high-K online candidate achieved mean K `8.86` and reduced verify
+calls from 86 to 64, but reached only `30.686 tok/s` (`32.589 ms` TPOT). The
+extra draft work exceeded the saved verify work. The key verify-model finding
+is that a K6-time forecast for K9 overpredicted actual K9 verify by `24.411 ms`
+on 18 paired rounds because it froze cache state across three draft/prefetch
+steps. Current-state verify prediction remains valid; multi-horizon cache
+evolution is the missing model term.
+
+The implementation now includes boundary endpoint lookahead, reachable-only
+cost references, deferred model calls, explicit cache-warmup credit, correct
+candidate-matched trace errors, and a token-feature hot-path change that avoids
+full-vocabulary FP32 materialization. The latter has feature-equivalence tests
+but has not been performance measured.
+
+No large high-K sweep was run. The accepted formal number is still the K6/vpb4
+five-seed result, while `k12_bucket_stop` remains an experimental configuration.
+The reported absolute decode rate uses 511 inter-token intervals for a
+512-token output because the excluded prefill step emits the first token. The
+saved timing fields allowed the earlier all-token denominator to be corrected
+without rerunning performance experiments; relative comparisons are unchanged.
+
+## Earlier 2026-07-13 TPOT Fast-Path Result
+
+The current production recommendation supersedes the older K4/K12 tuning
+recommendations later in this document for the exact `cache_ratio=0.3125`,
+512-token, sampling workload.
+
+The verify-time work now has two separate outcomes:
+
+1. The sampling-specific CPU-expert verify-time model passed its fresh
+   instrumentation-off v2 shadow: MAE `5.776 ms`, P90 `10.311 ms`, ranking
+   `0.837`, with every graph bucket passing its fixed gate.
+2. The active early-stop policy did not beat fixed K6. Its best two screens
+   were `-1.18%` and `-2.32%` versus their fixed baselines, so model promotion
+   did not automatically promote the policy.
+
+The sampling model is validated for the vpb10 collection protocol. The vpb4
+production result below uses no verify-time model; using active mode with vpb4
+would require a separate vpb4 shadow gate.
+
+For production TPOT, fixed K6 removes the early-stop control cost and aligns
+verify length 7 with graph bucket 7. The fixed policy does not consume
+acceptance alpha or draft-route cost predictions, so its predictor is disabled.
+Reducing `verify_prefetch_max_per_boundary` from 10 to 4 then limits
+best-effort transfers that otherwise contend with the short verify critical
+path.
+
+The frozen five-seed comparison is:
+
+| setting | decode tok/s geomean | mean TPOT | quality failures |
+|:---|---:|---:|---:|
+| K6, predictor off, vpb10 | 31.370 | 31.969 ms | 0/5 |
+| K6, predictor off, vpb4 | 33.501 | 29.877 ms | 0/5 |
+
+The paired improvement is `6.79%` geomean with bootstrap 95% CI
+`[+2.39%, +11.12%]`. A three-seed full K sweep also selected K6 under vpb4:
+K6 reached `34.273 tok/s`, versus `33.137` for K4 and `31.586` for K9.
+
+Run the accepted configuration with:
+
+```bash
+python scripts/bench_eval_workload_tpot.py \
+  --request-mode per_layer_slots \
+  --optimized-config k6_decode \
+  --output-lens 512 \
+  --output-dir results/tpot_k6_decode \
+  --save-token-ids true --save-text true --skip-existing false
+```
+
+`acceptance_predictor_enabled` is now automatic in the workload benchmark:
+fixed `stop_policy=none` disables it, while TPOT/alpha/verify-proxy policies
+enable it. An explicit attempt to disable a predictor required by a policy
+fails before model load. The policy collector applies the same rule per
+variant, preventing the fixed baseline from paying predictor overhead.
+
+## 2026-07-11 Verify-Time Model Correction
+
+The earlier TPOT analysis in this document and the previous version of the
+linked note counted logical verify rows. CUDA-graph verify and KT CPUInfer
+execute the complete bucket, including padding rows. Conclusions that CPU
+routes were weak predictors were therefore based on a mismatched workload and
+timing target and are superseded by the clean analysis in
+[`verify_time_cost_model_tpot.md`](verify_time_cost_model_tpot.md).
+
+Current validated status:
+
+| stage | data | result | status |
+|:---|:---|:---|:---:|
+| real execution workload -> acceptance-ready verify time | 3,049 calls, grouped holdout | MAE 4.772 ms, P90 9.075 ms, ranking 0.946 | PASS |
+| draft-route proxy -> execution workload -> verify time | 579-call grouped holdout | MAE 5.968 ms, P90 11.255 ms, ranking 0.838 | FAIL |
+| instrumentation-off, offset-2 deployment shadow | 2,381 calls | MAE 6.387 ms, P90 12.132 ms, ranking 0.890 | FAIL |
+
+The clean model shows that verify latency is strongly related to full-bucket
+CPU expert workload. Within a fixed bucket, CPU expert count has correlation
+`0.938-0.977` with acceptance-ready latency. A diagnostic op-event run also
+shows `kt.cpuinfer_sync` correlation `0.987` with acceptance-ready latency,
+while attention is nearly constant (mean 5.367 ms, P90 5.416 ms). Op events are
+nested and synchronized, so they are diagnostic only and are not used to fit
+the model.
+
+Production `active` mode remains disabled because the causal workload proxy and
+the independent shadow did not pass the fixed gates. No new decode-tokens/s
+improvement is claimed. The historical verify and K=12 benchmark tables below
+remain useful as records of those specific runs, but they must not be used as
+evidence that the new verify-cost model is deployable.
+
+Pooling the output-64 and output-96 calibration workloads did not resolve the
+failure: replaying the frozen causal CPU-count predictions on the untouched
+shadow changed MAE/P90 only from `6.387/12.132 ms` to `6.263/11.834 ms`, with
+ranking `0.891`. The replay reproduced the original stored predictions with
+maximum delta `0.0 ms`; it remains diagnostic and transfers no deployment gate.
+
 ## Target
 
 The optimized verify target is:

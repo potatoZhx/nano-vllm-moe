@@ -18,11 +18,12 @@ import sys
 import unittest
 from math import prod
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from nanovllm.engine.speculative.spec_engine import expected_tpot_ms
+from nanovllm.engine.speculative.spec_engine import SpeculativeEngine, expected_tpot_ms
 
 
 def brute_force_tpot(step_alphas, num_seqs, td, tv):
@@ -73,6 +74,19 @@ class TestExpectedTpot(unittest.TestCase):
 
     def test_zero_seqs_is_inf(self):
         self.assertEqual(expected_tpot_ms([], 0, 19.0, 80.0), float("inf"))
+
+    def test_active_verify_model_uses_prediction_but_shadow_does_not(self):
+        config = SimpleNamespace(
+            max_draft_tokens=4,
+            acceptance_strategy="greedy",
+            acceptance_threshold=0.7,
+            draft_tpot_tv_ms=80.0,
+            draft_tpot_verify_model_mode="active",
+        )
+        engine = SpeculativeEngine(None, None, config)
+        self.assertEqual(engine._tpot_verify_cost_ms(3, 123.0), 123.0)
+        engine.draft_tpot_verify_model_mode = "shadow"
+        self.assertEqual(engine._tpot_verify_cost_ms(3, 123.0), 80.0)
 
 
 class TestReactiveStop(unittest.TestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -96,6 +97,7 @@ class LayerExpertCache:
             dtype=torch.bool,
             device=device,
         )
+        self.cached_expert_mask_host = np.zeros(self.num_experts, dtype=bool)
 
         self.last_access_step = [-1] * self.num_experts
         self.access_count = [0] * self.num_experts
@@ -137,6 +139,7 @@ class LayerExpertCache:
             del self.expert_to_slot[prev_expert]
             self.expert_to_slot_lut[prev_expert] = -1
             self.cached_expert_mask[prev_expert] = False
+            self.cached_expert_mask_host[prev_expert] = False
 
         self.gate_up_buffer[slot_idx].copy_(gate_up_cpu, non_blocking=True)
         self.down_buffer[slot_idx].copy_(down_cpu, non_blocking=True)
@@ -145,6 +148,7 @@ class LayerExpertCache:
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         self.slot_generation[slot_idx] += 1
 
@@ -322,12 +326,14 @@ class LayerExpertCache:
             del self.expert_to_slot[prev_expert]
             self.expert_to_slot_lut[prev_expert] = -1
             self.cached_expert_mask[prev_expert] = False
+            self.cached_expert_mask_host[prev_expert] = False
 
         self.slot_to_expert[slot_idx] = expert_idx
         self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         self.slot_generation[slot_idx] += 1
 
@@ -357,6 +363,7 @@ class LayerExpertCache:
             del self.expert_to_slot[prev_expert]
             self.expert_to_slot_lut[prev_expert] = -1
             self.cached_expert_mask[prev_expert] = False
+            self.cached_expert_mask_host[prev_expert] = False
 
         self.slot_to_expert[active_slot_idx] = -1
         self.slot_to_expert_lut[active_slot_idx] = -1
@@ -437,6 +444,7 @@ class LayerExpertCache:
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         return PublishedExpert(
             layer_idx=reservation.layer_idx,
@@ -464,12 +472,14 @@ class LayerExpertCache:
             del self.expert_to_slot[prev_expert]
             self.expert_to_slot_lut[prev_expert] = -1
             self.cached_expert_mask[prev_expert] = False
+            self.cached_expert_mask_host[prev_expert] = False
 
         self.slot_to_expert[slot_idx] = expert_idx
         self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
         self.expert_to_slot_lut[expert_idx] = slot_idx
         self.cached_expert_mask[expert_idx] = True
+        self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         return PublishedExpert(
             layer_idx=reservation.layer_idx,
@@ -510,6 +520,9 @@ class LayerExpertCache:
 
     def get_cached_expert_mask(self) -> torch.Tensor:
         return self.cached_expert_mask
+
+    def get_cached_expert_mask_host(self) -> np.ndarray:
+        return self.cached_expert_mask_host
 
     def get_slot_to_expert_lut(self) -> torch.Tensor:
         return self.slot_to_expert_lut

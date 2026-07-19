@@ -139,9 +139,14 @@ class Config:
     draft_tpot_history_alpha: float = 0.2
     draft_tpot_min_steps: int = 0
     draft_tpot_stop_margin: float = 0.0
+    draft_tpot_stop_patience: int = 1
+    draft_tpot_lookahead_cache_credit_ms_per_step: float = 0.0
     draft_tpot_short_verify_penalty_ms: float = 0.0
     draft_tpot_verify_cost_floor_ms: float = 0.0
-    draft_tpot_stop_rule: str = "first_increase"  # "first_increase" | "best_margin"
+    draft_tpot_stop_rule: str = "first_increase"  # includes "bucket_lookahead"
+    draft_tpot_verify_model_mode: str = "off"  # "off" | "shadow" | "active"
+    draft_tpot_verify_model_path: str = ""
+    draft_tpot_alpha_calibration_path: str = ""
     verify_prefetch_tpot_dynamic_budget_enabled: bool = False
     verify_prefetch_tpot_dynamic_budget_token_threshold: int = 10
     verify_prefetch_tpot_dynamic_budget_small: int = 4
@@ -296,9 +301,40 @@ class Config:
         assert 0.0 < self.draft_tpot_history_alpha <= 1.0
         assert self.draft_tpot_min_steps >= 0
         assert self.draft_tpot_stop_margin >= 0.0
+        assert self.draft_tpot_stop_patience >= 1
+        assert self.draft_tpot_lookahead_cache_credit_ms_per_step >= 0.0
         assert self.draft_tpot_short_verify_penalty_ms >= 0.0
         assert self.draft_tpot_verify_cost_floor_ms >= 0.0
-        assert self.draft_tpot_stop_rule in {"first_increase", "best_margin"}
+        assert self.draft_tpot_stop_rule in {
+            "first_increase",
+            "best_margin",
+            "lookahead",
+            "lookahead_hysteresis",
+            "bucket_lookahead",
+        }
+        assert self.draft_tpot_verify_model_mode in {"off", "shadow", "active"}
+        if self.draft_tpot_alpha_calibration_path:
+            assert self.acceptance_predictor_enabled, (
+                "alpha calibration requires acceptance_predictor_enabled=True"
+            )
+            assert os.path.isfile(self.draft_tpot_alpha_calibration_path), (
+                "draft_tpot_alpha_calibration_path must be a calibration artifact"
+            )
+        if self.draft_tpot_verify_model_mode != "off":
+            assert self.draft_tpot_verify_model_path, (
+                "draft_tpot_verify_model_path is required for shadow/active mode"
+            )
+            assert self.acceptance_predictor_enabled, (
+                "verify cost route proxy requires acceptance_predictor_enabled=True"
+            )
+        if self.draft_tpot_verify_model_mode == "active":
+            assert self.draft_stop_policy == "tpot", (
+                "active verify cost model requires draft_stop_policy='tpot'"
+            )
+        if self.draft_tpot_stop_rule == "bucket_lookahead":
+            assert self.draft_tpot_verify_model_mode == "active", (
+                "bucket_lookahead requires draft_tpot_verify_model_mode='active'"
+            )
         assert self.verify_prefetch_tpot_dynamic_budget_token_threshold >= 1
         assert self.verify_prefetch_tpot_dynamic_budget_small >= 0
 
