@@ -119,6 +119,9 @@ MODEL_PATH = "/data1/models/Qwen3-30B-A3B"
 DEFAULT_PROFILE = "results/reroute_impl_20260531/offline_profile_20260531_203257.safetensors"
 DEFAULT_PREDICTOR_PATH = "random_cache_srdp_scripts-1/res/run_20260614_133025"
 DEFAULT_WARMUP_PROMPT = "Warmup request for verify layer profile."
+TRANSFER_AWARE_V3_ARTIFACT = (
+    "results/transfer_v3_artifact_20260719/verify_cost_v3.json"
+)
 PER_LAYER_SLOTS_PROMPT_TEXT = (
     "Sparse mixture-of-experts inference keeps only part of each layer's expert weights "
     "in GPU memory. Explain how speculative decoding can overlap expert prefetch with "
@@ -386,6 +389,100 @@ def resolve_acceptance_predictor(args: argparse.Namespace) -> dict[str, Any]:
         "effective": effective,
         "required_by": required_by,
     }
+
+
+def resolved_runtime_config(args: argparse.Namespace) -> dict[str, Any]:
+    mode = str(args.inference_mode)
+    prefetch_enabled = bool(args.spec_enable_prefetch) and mode == "spec"
+    runtime_class = None
+    if prefetch_enabled:
+        runtime_class = {
+            "legacy": "PrefetchRuntime",
+            "predictive": "PredictivePrefetchRuntime",
+            "dual_queue": "DualQueuePrefetchRuntime",
+        }[str(args.prefetch_runtime_kind)]
+    return {
+        "inference_mode": mode,
+        "enable_heterogeneous": mode in {"heter", "spec"},
+        "enable_speculative": mode == "spec",
+        "enforce_eager": bool(args.enforce_eager),
+        "spec_enable_prefetch": bool(args.spec_enable_prefetch),
+        "prefetch_runtime_mode": str(args.prefetch_runtime_mode),
+        "prefetch_runtime_kind": str(args.prefetch_runtime_kind),
+        "prefetch_runtime_class": runtime_class,
+        "draft_cuda_graph_enabled": bool(args.draft_cuda_graph_enabled),
+        "verify_cuda_graph": bool(args.verify_cuda_graph),
+        "draft_reroute_policy": str(args.draft_reroute_policy),
+        "cache_strategy": str(args.cache_strategy),
+    }
+
+
+def validate_runtime_config(args: argparse.Namespace) -> None:
+    mode = str(args.inference_mode)
+    if bool(args.spec_enable_prefetch) and mode != "spec":
+        raise ValueError(
+            "--spec-enable-prefetch=true requires --inference-mode=spec"
+        )
+    if mode == "heter":
+        incompatible: list[str] = []
+        if bool(args.spec_enable_prefetch):
+            incompatible.append("speculative prefetch")
+        if bool(args.acceptance_predictor_enabled):
+            incompatible.append("acceptance predictor")
+        if str(args.draft_stop_policy) != "none":
+            incompatible.append("draft early stop")
+        if incompatible:
+            raise ValueError(
+                "--inference-mode=heter cannot enable "
+                + ", ".join(incompatible)
+            )
+
+    if bool(args.enforce_eager) and (
+        bool(args.draft_cuda_graph_enabled) or bool(args.verify_cuda_graph)
+    ):
+        raise ValueError(
+            "--enforce-eager=true requires both "
+            "--draft-cuda-graph-enabled=false and --verify-cuda-graph=false"
+        )
+
+    if str(args.draft_tpot_stop_rule) == "transfer_aware_step":
+        errors: list[str] = []
+        if mode != "spec":
+            errors.append("inference_mode must be spec")
+        if not bool(args.spec_enable_prefetch):
+            errors.append("spec_enable_prefetch must be true")
+        if str(args.prefetch_runtime_kind) != "predictive":
+            errors.append("prefetch_runtime_kind must be predictive")
+        if str(args.prefetch_runtime_mode) != "draft_segment_indexed":
+            errors.append(
+                "prefetch_runtime_mode must be draft_segment_indexed"
+            )
+        segment_sizes = _parse_csv(args.segment_sizes, int)
+        if segment_sizes != [12]:
+            errors.append("segment_sizes must resolve to exactly 12")
+        if not bool(args.verify_cuda_graph):
+            errors.append("verify_cuda_graph must be true")
+        requested_artifact = Path(
+            str(args.draft_tpot_verify_model_path)
+        ).expanduser()
+        expected_artifact = (
+            Path(__file__).resolve().parents[1]
+            / TRANSFER_AWARE_V3_ARTIFACT
+        )
+        if requested_artifact.resolve() != expected_artifact.resolve():
+            errors.append(
+                "draft_tpot_verify_model_path must be "
+                f"{TRANSFER_AWARE_V3_ARTIFACT}"
+            )
+        elif not requested_artifact.is_file():
+            errors.append(
+                f"transfer-aware artifact does not exist: {requested_artifact}"
+            )
+        if errors:
+            raise ValueError(
+                "invalid transfer_aware_step configuration: "
+                + "; ".join(errors)
+            )
 
 
 def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
@@ -1339,17 +1436,18 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         slots = int(round(num_experts * float(case["cache_ratio"])))
 
     segment_size = int(case["segment_size"])
+    mode = str(args.inference_mode)
     return LLM(
         args.model_path,
         dist_port=int(args.dist_port_base) + int(case_index),
-        enforce_eager=False,
+        enforce_eager=bool(args.enforce_eager),
         max_num_batched_tokens=int(args.max_num_batched_tokens),
         max_num_seqs=1,
         max_model_len=int(args.max_model_len),
         gpu_memory_utilization=float(args.gpu_memory_utilization),
-        inference_mode="spec",
-        enable_heterogeneous=True,
-        enable_speculative=True,
+        inference_mode=mode,
+        enable_heterogeneous=mode in {"heter", "spec"},
+        enable_speculative=mode == "spec",
         heterogeneous_slots_per_layer=slots,
         heterogeneous_slot_allocation=str(case["allocation_mode"]),
         heterogeneous_slot_buckets=int(args.slot_buckets),
@@ -1411,12 +1509,12 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         spec_profile=False,
         engine_profile=bool(args.engine_profile),
         engine_profile_cuda_sync=bool(args.engine_profile_cuda_sync),
-        spec_enable_prefetch=True,
+        spec_enable_prefetch=bool(args.spec_enable_prefetch),
         cache_strategy=str(args.cache_strategy),
         rank_guard_threshold=float(args.rank_guard_threshold),
         rank_guard_ema_alpha=float(args.rank_guard_ema_alpha),
         prefetch_strategy="history_window",
-        prefetch_runtime_mode="draft_segment_indexed",
+        prefetch_runtime_mode=str(args.prefetch_runtime_mode),
         prefetch_runtime_kind=str(args.prefetch_runtime_kind),
         dual_queue_segment_size=segment_size,
         dual_queue_ground_truth_decay=float(args.dual_queue_ground_truth_decay),
@@ -1446,14 +1544,14 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
         prefetch_use_prefill_history=bool(args.prefetch_use_prefill_history),
         prefetch_use_verify_history=bool(args.prefetch_use_verify_history),
         prefetch_use_draft_live=bool(args.prefetch_use_draft_live),
-        draft_cuda_graph_enabled=True,
+        draft_cuda_graph_enabled=bool(args.draft_cuda_graph_enabled),
         draft_cuda_graph_cpu_backend="none",
         draft_prefetch_segment_size=segment_size,
         draft_prefetch_segment_host_buffer_pool_size=int(args.draft_segment_host_buffer_pool_size),
         draft_prefetch_visible_budget_ms=float(args.draft_prefetch_visible_budget_ms),
         draft_prefetch_min_per_boundary=0,
         draft_prefetch_max_per_boundary=int(args.draft_prefetch_max_per_boundary),
-        verify_cuda_graph=True,
+        verify_cuda_graph=bool(args.verify_cuda_graph),
         verify_cuda_graph_bucket_steps=_parse_csv(args.verify_cuda_graph_bucket_steps, int),
         verify_prefetch_segment_size=segment_size,
         verify_prefetch_visible_budget_ms=float(args.verify_prefetch_visible_budget_ms),
@@ -2029,6 +2127,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     args, "_optimized_config_applied", {}
                 ),
                 "optimized_env_overrides": optimized_env_overrides,
+                **resolved_runtime_config(args),
                 "acceptance_predictor_enabled": bool(
                     args.acceptance_predictor_enabled
                 ),
@@ -2177,6 +2276,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args, "_optimized_config_applied", {}
             ),
             "optimized_env_overrides": optimized_env_overrides,
+            **resolved_runtime_config(args),
             "num_samples": _num_samples_label(int(args.num_samples)),
             "sample_offset": int(args.sample_offset),
             "shuffle": bool(args.shuffle),
@@ -2256,7 +2356,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "rank_guard_threshold": float(args.rank_guard_threshold),
             "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
-            "prefetch_runtime_kind": str(args.prefetch_runtime_kind),
             "predictive_phase1_budget": int(args.predictive_phase1_budget),
             "prefetch_history_decay": float(args.prefetch_history_decay),
             "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
@@ -2401,6 +2500,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-ratios", default="0.3125")
     parser.add_argument("--max-draft-tokens-values", default="12")
     parser.add_argument("--segment-sizes", default="12")
+    parser.add_argument(
+        "--inference-mode",
+        choices=["heter", "spec"],
+        default="spec",
+    )
+    parser.add_argument(
+        "--spec-enable-prefetch",
+        type=str2bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        type=str2bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--draft-cuda-graph-enabled",
+        type=str2bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--verify-cuda-graph",
+        type=str2bool,
+        default=True,
+    )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
         "--repeat-index-offset",
@@ -2496,8 +2620,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-step-budget", type=int, default=16)
     parser.add_argument(
         "--prefetch-runtime-kind",
-        choices=["predictive", "dual_queue"],
+        choices=["legacy", "predictive", "dual_queue"],
         default="predictive",
+    )
+    parser.add_argument(
+        "--prefetch-runtime-mode",
+        choices=[
+            "baseline_staging",
+            "draft_direct_active",
+            "draft_segment_indexed",
+        ],
+        default="draft_segment_indexed",
     )
     parser.add_argument("--prefetch-max-inflight", type=int, default=16)
     parser.add_argument("--prefetch-transfer-stream-count", type=int, default=1)
@@ -2654,6 +2787,7 @@ def main() -> None:
     args = build_parser().parse_args(argv)
     args._optimized_config_applied = apply_optimized_config(args, argv)
     args._acceptance_predictor_resolution = resolve_acceptance_predictor(args)
+    validate_runtime_config(args)
     if bool(args.verify_cost_model_profile) or bool(
         args.transfer_aware_profile
     ):
