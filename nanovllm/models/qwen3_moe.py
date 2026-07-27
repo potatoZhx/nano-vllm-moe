@@ -343,6 +343,20 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.cache_strategy = "lru"
         self._parallel_stream: torch.cuda.Stream | None = None
         self._last_profile: dict[str, float] = {}
+        # Updated by the graph-capturable KT-direct hybrid path.  Keeping these
+        # as fixed-shape device buffers lets the standard decode graph expose
+        # exact miss-route evidence after replay without capture-unsafe host
+        # reads in the MoE forward itself.
+        self.register_buffer(
+            "_graph_kt_cpu_route_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_graph_kt_active_route_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=False,
+        )
         self.runtime_meta_recorder: ModelRuntimeMetaRecorder | None = None
         self.draft_feature_recorder = None
         self.gpu_fallback_workspace: GpuFallbackWorkspace | None = None
@@ -763,6 +777,10 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 expert_cache=self.expert_cache,
                 num_experts=self.num_experts,
             )
+            self._graph_kt_cpu_route_count.copy_(
+                plan.cpu_route_mask.sum(dtype=torch.int64)
+            )
+            self._graph_kt_active_route_count.fill_(selected_experts.numel())
 
         if self.runtime_meta_recorder is not None:
             with verify_op_event("moe.runtime_metadata_record", layer_idx):
@@ -807,6 +825,28 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
             output = token_output.to(dtype=hidden_states.dtype)
             output.add_(kt_output.to(dtype=hidden_states.dtype, device=hidden_states.device))
         return output
+
+    def graph_kt_hybrid_profile(self) -> dict[str, float]:
+        """Read the latest fixed-shape KT hybrid route counters after replay."""
+        cpu_routes = float(self._graph_kt_cpu_route_count.item())
+        active_routes = float(self._graph_kt_active_route_count.item())
+        route_ratio = cpu_routes / active_routes if active_routes > 0.0 else 0.0
+        layer_prefix = f"layer_{int(self.layer_idx)}_"
+        return {
+            "pre_transfer_cache_miss_sum": cpu_routes,
+            "pre_transfer_active_count_sum": active_routes,
+            "moe_profile_count": 1.0,
+            "cpu_route_ratio_sum": route_ratio,
+            "cpu_routes_sum": cpu_routes,
+            "cpu_weight_mass_ratio_sum": 0.0,
+            "realized_cpu_expert_count_sum": 0.0,
+            "activated_expert_set_size_sum": 0.0,
+            f"{layer_prefix}realized_cpu_expert_count_sum": 0.0,
+            f"{layer_prefix}cpu_routes_sum": cpu_routes,
+            f"{layer_prefix}active_expert_count_sum": 0.0,
+            f"{layer_prefix}active_routes_sum": active_routes,
+            f"{layer_prefix}moe_profile_count": 1.0,
+        }
 
     def consume_profile(self) -> dict[str, float]:
         out = self._last_profile
@@ -1355,6 +1395,29 @@ class Qwen3MoeForCausalLM(nn.Module):
                 continue
             prof = layer.mlp.consume_profile()
             for key, value in prof.items():
+                agg[key] = float(agg.get(key, 0.0) + value)
+        return agg
+
+    def forward_graph_kt_hybrid(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Exact graph-safe decode using cached GPU experts and KT CPU misses."""
+        hidden_states = self.model.embed_tokens(input_ids)
+        return self.model.forward_verify_kt_hybrid_layers(
+            hidden_states,
+            position_ids,
+            apply_norm=True,
+        )
+
+    def get_graph_kt_hybrid_profile(self) -> dict[str, float]:
+        """Aggregate route counters written by the latest hybrid graph replay."""
+        agg: dict[str, float] = {}
+        for layer in self.model.layers:
+            if not isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                continue
+            for key, value in layer.mlp.graph_kt_hybrid_profile().items():
                 agg[key] = float(agg.get(key, 0.0) + value)
         return agg
 

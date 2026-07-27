@@ -2365,6 +2365,17 @@ class ModelRunner:
             self._profile["standard_graph_replay_ms"] += replay_ms
         else:
             graph.replay()
+        if (
+            self.profile_enabled
+            and self.rank == 0
+            and self._standard_graph_uses_kt_hybrid()
+        ):
+            prof = self.model.get_graph_kt_hybrid_profile()
+            for key, value in prof.items():
+                self._profile[key] = float(
+                    self._profile.get(key, 0.0) + float(value)
+                )
+            self._profile["standard_kt_hybrid_graph_replay_count"] += 1
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def _replay_draft_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -4408,16 +4419,40 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [
+            batch_size
+            for batch_size in [1, 2, 4, 8]
+            if batch_size <= max_bs
+        ] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
+
+        use_kt_hybrid = self._standard_graph_uses_kt_hybrid()
+        if bool(getattr(config, "enable_heterogeneous", False)) and not use_kt_hybrid:
+            raise RuntimeError(
+                "standard CUDA graph for heterogeneous MoE requires exact "
+                "KT-direct CPU miss execution "
+                "(cpu_expert_execution_enabled=true, "
+                "cpu_expert_backend=kt_direct, spec_verify_miss_policy=cpu)"
+            )
+
+        def forward_graph(
+            graph_input_ids: torch.Tensor,
+            graph_positions: torch.Tensor,
+        ) -> torch.Tensor:
+            if use_kt_hybrid:
+                return self.model.forward_graph_kt_hybrid(
+                    graph_input_ids,
+                    graph_positions,
+                )
+            return self.model(graph_input_ids, graph_positions)
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            outputs[:bs] = forward_graph(input_ids[:bs], positions[:bs])
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = forward_graph(input_ids[:bs], positions[:bs])
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -4431,6 +4466,18 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+        )
+
+    def _standard_graph_uses_kt_hybrid(self) -> bool:
+        config = self.config
+        return bool(
+            getattr(config, "inference_mode", "") == "heter"
+            and getattr(config, "enable_heterogeneous", False)
+            and getattr(config, "cpu_expert_execution_enabled", False)
+            and getattr(config, "cpu_expert_backend", "") == "kt_direct"
+            and getattr(config, "spec_verify_miss_policy", "") == "cpu"
+            and hasattr(self.model, "forward_graph_kt_hybrid")
+            and hasattr(self.model, "get_graph_kt_hybrid_profile")
         )
 
     @torch.inference_mode()

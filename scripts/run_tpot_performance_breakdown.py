@@ -64,9 +64,37 @@ FIXED_K_ARGS = (
 
 STAGES = (
     Stage(
+        "p0_eager",
+        "p0_eager_exact_hetero_ar",
+        "P0 Eager Ref.",
+        37969,
+        False,
+        (
+            "--inference-mode",
+            "heter",
+            "--spec-enable-prefetch",
+            "false",
+            "--prefetch-runtime-kind",
+            "legacy",
+            "--prefetch-runtime-mode",
+            "baseline_staging",
+            "--enforce-eager",
+            "true",
+            "--draft-cuda-graph-enabled",
+            "false",
+            "--verify-cuda-graph",
+            "false",
+            "--segment-sizes",
+            "48",
+            "--draft-reroute-policy",
+            "round_robin",
+            *FIXED_K_ARGS,
+        ),
+    ),
+    Stage(
         "p0",
         "p0_exact_hetero_ar",
-        "Exact Hetero AR",
+        "Exact Hetero AR + Graph",
         37970,
         True,
         (
@@ -281,7 +309,16 @@ STAGES = (
 )
 
 STAGE_BY_ID = {stage.stage_id: stage for stage in STAGES}
-PLOT_STAGE_IDS = ("p0", "p1", "p2", "p3", "r_eager", "p4", "p5")
+PLOT_STAGE_IDS = (
+    "p0_eager",
+    "p0",
+    "p1",
+    "p2",
+    "p3",
+    "r_eager",
+    "p4",
+    "p5",
+)
 MAIN_STAGE_IDS = ("p0", "p1", "p2", "p3", "p4", "p5")
 
 
@@ -726,7 +763,7 @@ def mechanism_validation(
         "prefetch_runtime_class": metadata.get("prefetch_runtime_class"),
     }
 
-    if stage.stage_id == "p0":
+    if stage.stage_id in {"p0_eager", "p0"}:
         standard = numeric(
             profile,
             "model_standard_graph_replay_count",
@@ -742,8 +779,27 @@ def mechanism_validation(
             standard_graph_replay_count=standard,
             cpu_routes_sum=cpu_routes,
         )
-        if standard <= 0:
-            errors.append("standard CUDA graph replay was not observed")
+        if stage.stage_id == "p0":
+            hybrid = numeric(
+                profile,
+                "model_standard_kt_hybrid_graph_replay_count",
+                "standard_kt_hybrid_graph_replay_count",
+            )
+            observed["standard_kt_hybrid_graph_replay_count"] = hybrid
+            if standard <= 0:
+                errors.append("standard CUDA graph replay was not observed")
+            if hybrid <= 0:
+                errors.append(
+                    "exact KT-direct hybrid standard graph replay was not observed"
+                )
+        else:
+            nonzero = {
+                key: value for key, value in graphs.items() if value != 0
+            }
+            if nonzero:
+                errors.append(
+                    f"P0 eager reference replayed CUDA graphs: {nonzero}"
+                )
         if cpu_routes <= 0:
             errors.append("kt_direct CPU routes were not observed")
         if any(value != 0 for value in transfers.values()):
@@ -1260,6 +1316,7 @@ def write_svg(path: Path, rows: list[dict[str, Any]]) -> None:
 
     centers: dict[str, float] = {}
     palette = {
+        "p0_eager": "#9aa2ad",
         "p0": "#315a9b",
         "p1": "#3e6dac",
         "p2": "#4b80bd",
@@ -1376,6 +1433,28 @@ def write_svg(path: Path, rows: list[dict[str, Any]]) -> None:
                 ),
             ]
         )
+    if "p0_eager" in centers and "p0" in centers:
+        x1 = centers["p0_eager"]
+        x2 = centers["p0"]
+        bracket_y = baseline_y + 105
+        lines.extend(
+            [
+                (
+                    f'<path d="M {x1:.1f} {bracket_y + 9:.1f} '
+                    f'V {bracket_y:.1f} H {x2:.1f} '
+                    f'V {bracket_y + 9:.1f}" fill="none" '
+                    'stroke="#697386" stroke-width="1.5"/>'
+                ),
+                svg_text(
+                    (x1 + x2) / 2,
+                    bracket_y + 28,
+                    "P0 Graph vs Eager",
+                    size=12,
+                    weight="bold",
+                    fill="#697386",
+                ),
+            ]
+        )
     lines.append("</svg>")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1440,6 +1519,8 @@ def parse_stage_selection(values: list[str]) -> tuple[Stage, ...]:
         return STAGES
     requested: list[str] = []
     aliases = {
+        "p0-eager": "p0_eager",
+        "p0eager": "p0_eager",
         "r-eager": "r_eager",
         "reager": "r_eager",
     }
@@ -1461,7 +1542,7 @@ def parse_stage_selection(values: list[str]) -> tuple[Stage, ...]:
         raise ValueError(
             "unknown stage(s): "
             + ", ".join(unknown)
-            + "; expected p0,p1,p2,r_eager,p3,p4,p5,all"
+            + "; expected p0_eager,p0,p1,p2,r_eager,p3,p4,p5,all"
         )
     if len(requested) != len(set(requested)):
         raise ValueError("--stage contains duplicates")
@@ -1653,7 +1734,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Run one or more fixed manifest stages. Repeat the option or use "
-            "commas: p0,p1,p2,r_eager,p3,p4,p5. Default: all."
+            "commas: p0_eager,p0,p1,p2,r_eager,p3,p4,p5. Default: all."
         ),
     )
     parser.add_argument(
