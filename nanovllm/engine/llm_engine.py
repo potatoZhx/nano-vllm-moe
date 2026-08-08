@@ -193,7 +193,9 @@ class LLMEngine:
 
     def step(self):
         step_t0 = perf_counter()
+        schedule_t0 = step_t0
         seqs, is_prefill = self.scheduler.schedule()
+        schedule_ms = (perf_counter() - schedule_t0) * 1000.0
         if self.profile_enabled:
             self._profile["step_count"] += 1
             self._profile["scheduled_seqs_total"] += len(seqs)
@@ -201,8 +203,10 @@ class LLMEngine:
                 self._profile["prefill_step_count"] += 1
             elif self.config.inference_mode == "spec":
                 self._profile["spec_step_count"] += 1
+                self._profile["decode_schedule_ms"] += schedule_ms
             else:
                 self._profile["decode_step_count"] += 1
+                self._profile["decode_schedule_ms"] += schedule_ms
 
         if is_prefill:
             t0 = perf_counter()
@@ -220,25 +224,44 @@ class LLMEngine:
         elif self.config.inference_mode == "spec":
             t0 = perf_counter()
             token_ids = self.spec_engine.speculative_step(seqs)
+            spec_engine_ms = (perf_counter() - t0) * 1000.0
             if self.profile_enabled:
-                self._profile["spec_engine_ms"] += (perf_counter() - t0) * 1000.0
+                self._profile["spec_engine_ms"] += spec_engine_ms
+                self._profile["decode_spec_engine_ms"] += spec_engine_ms
+            post_t0 = perf_counter()
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
             num_tokens = -len(seqs)
             if self.profile_enabled:
-                self._profile["step_ms"] += (perf_counter() - step_t0) * 1000.0
+                post_ms = (perf_counter() - post_t0) * 1000.0
+                step_ms = (perf_counter() - step_t0) * 1000.0
+                self._profile["decode_postprocess_ms"] += post_ms
+                self._profile["decode_step_wall_ms"] += step_ms
+                self._profile["decode_engine_other_ms"] += (
+                    step_ms - schedule_ms - spec_engine_ms - post_ms
+                )
+                self._profile["step_ms"] += step_ms
             return outputs, num_tokens
         else:
             t0 = perf_counter()
             token_ids = self.model_runner.call("run", seqs, False)
+            runner_ms = (perf_counter() - t0) * 1000.0
             if self.profile_enabled:
-                self._profile["decode_runner_ms"] += (perf_counter() - t0) * 1000.0
+                self._profile["decode_runner_ms"] += runner_ms
         t1 = perf_counter()
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         if self.profile_enabled:
             self._profile["postprocess_ms"] += (perf_counter() - t1) * 1000.0
-            self._profile["step_ms"] += (perf_counter() - step_t0) * 1000.0
+            step_ms = (perf_counter() - step_t0) * 1000.0
+            self._profile["step_ms"] += step_ms
+            if not is_prefill:
+                post_ms = (perf_counter() - t1) * 1000.0
+                self._profile["decode_postprocess_ms"] += post_ms
+                self._profile["decode_step_wall_ms"] += step_ms
+                self._profile["decode_engine_other_ms"] += (
+                    step_ms - schedule_ms - runner_ms - post_ms
+                )
         return outputs, num_tokens
 
     def is_finished(self):

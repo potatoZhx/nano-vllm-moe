@@ -347,11 +347,17 @@ class SpeculativeEngine:
                 "next_token": None,
             })
 
-        t0 = perf_counter()
+        start_draft_t0 = perf_counter()
+        self._profile["draft_entry_ms"] += (
+            start_draft_t0 - step_t0
+        ) * 1000.0
         for seq in seqs:
             seq.start_draft()
             self.scheduler.start_draft_kv(seq)
-        self._profile["start_draft_ms"] += (perf_counter() - t0) * 1000.0
+        self._profile["start_draft_ms"] += (
+            perf_counter() - start_draft_t0
+        ) * 1000.0
+        post_start_draft_t0 = perf_counter()
 
         draft_tokens_map = {seq.seq_id: [] for seq in seqs}
         draft_logits_map = {seq.seq_id: [] for seq in seqs}
@@ -415,7 +421,10 @@ class SpeculativeEngine:
         tpot_stop_streak = 0
         draft_call_ms_series: list[float] = []
 
-        t0 = perf_counter()
+        draft_loop_t0 = perf_counter()
+        self._profile["draft_initial_policy_ms"] += (
+            draft_loop_t0 - post_start_draft_t0
+        ) * 1000.0
         for step_idx in range(draft_steps):
             infer_t0 = perf_counter()
             candidate_len = step_idx + 1
@@ -936,7 +945,9 @@ class SpeculativeEngine:
             if step_idx + 1 < draft_steps:
                 for seq in seqs:
                     self.scheduler.append_draft_kv(seq)
-        self._profile["draft_loop_ms"] += (perf_counter() - t0) * 1000.0
+        self._profile["draft_loop_ms"] += (
+            perf_counter() - draft_loop_t0
+        ) * 1000.0
         self._profile["run_draft_calls"] += draft_steps_actual
 
         t0 = perf_counter()
@@ -967,17 +978,25 @@ class SpeculativeEngine:
             verify_lengths.append(len(draft_tokens) + 1)
         self._profile["prepare_verify_ms"] += (perf_counter() - t0) * 1000.0
 
+        verify_prefetch_call_ms = 0.0
         if draft_prefetch_state is not None and "prefetch_step_id" in draft_prefetch_state:
+            wait_call_t0 = perf_counter()
             wait_prof = self.model_runner.call(
                 "wait_prefetch_for_verify",
                 draft_prefetch_state["prefetch_step_id"],
             )
+            verify_prefetch_call_ms = (
+                perf_counter() - wait_call_t0
+            ) * 1000.0
+            self._profile["verify_prefetch_call_ms"] += verify_prefetch_call_ms
             if isinstance(wait_prof, dict):
                 for key, value in wait_prof.items():
                     self._profile[key] += float(value)
 
         verify_call_index = int(self._profile["run_verify_calls"])
         infer_t0 = perf_counter()
+        draft_total_ms = (infer_t0 - step_t0) * 1000.0
+        self._profile["draft_total_ms"] += draft_total_ms
         verify_results = self.model_runner.call("run_verify", seqs, verify_lengths, return_logits)
         infer_ms = (perf_counter() - infer_t0) * 1000.0
         self._profile["verify_ms"] += infer_ms
@@ -1106,6 +1125,10 @@ class SpeculativeEngine:
         step_trace["verify_model_call_ms"] = float(infer_ms)
         step_trace["verify_accept_ms"] = float(accept_ms)
         step_trace["verify_accept_ready_ms"] = float(verify_accept_ready_ms)
+        step_trace["draft_total_ms"] = float(draft_total_ms)
+        step_trace["verify_prefetch_call_ms"] = float(
+            verify_prefetch_call_ms
+        )
         step_trace["draft_call_ms"] = list(draft_call_ms_series)
         if verify_cost_prediction_series:
             step_trace["verify_cost_predictions"] = deepcopy(

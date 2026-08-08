@@ -492,15 +492,20 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
     transfer_aware_profile = bool(
         getattr(args, "transfer_aware_profile", False)
     )
+    latency_breakdown_profile = bool(
+        getattr(args, "latency_breakdown_profile", False)
+    )
     should_configure = (
         optimized_config != "none"
         or rank_multiplier is not None
         or verify_cost_profile
         or transfer_aware_profile
+        or latency_breakdown_profile
     )
     if not should_configure:
         os.environ.pop("NANOVLLM_VERIFY_COST_MODEL_PROFILE", None)
         os.environ.pop("NANOVLLM_TRANSFER_AWARE_PROFILE", None)
+        os.environ.pop("NANOVLLM_LATENCY_BREAKDOWN", None)
         return {}
 
     env_overrides: dict[str, str] = {}
@@ -529,6 +534,22 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
         env_overrides["NANOVLLM_VERIFY_COST_MODEL_PROFILE"] = "1"
     else:
         os.environ.pop("NANOVLLM_TRANSFER_AWARE_PROFILE", None)
+
+    if latency_breakdown_profile:
+        env_overrides.update(
+            {
+                "NANOVLLM_LATENCY_BREAKDOWN": "1",
+                "NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING": "1",
+                "NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING": "1",
+                "NANOVLLM_VERIFY_STREAM_EVENT_TIMING": "1",
+            }
+        )
+    else:
+        os.environ.pop("NANOVLLM_LATENCY_BREAKDOWN", None)
+        os.environ.pop(
+            "NANOVLLM_DRAFT_SEGMENT_CUDA_EVENT_TIMING", None
+        )
+        os.environ.pop("NANOVLLM_VERIFY_STREAM_EVENT_TIMING", None)
 
     for key, value in env_overrides.items():
         os.environ[key] = value
@@ -2764,6 +2785,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--latency-breakdown-profile",
+        type=str2bool,
+        default=False,
+        help=(
+            "Collect low-perturbation TPOT latency-breakdown counters. "
+            "CUDA events are drained after natural synchronization or after "
+            "the timed request; legacy per-op forced synchronization stays off."
+        ),
+    )
+    parser.add_argument(
         "--transfer-aware-profile",
         type=str2bool,
         default=False,
@@ -2788,8 +2819,10 @@ def main() -> None:
     args._optimized_config_applied = apply_optimized_config(args, argv)
     args._acceptance_predictor_resolution = resolve_acceptance_predictor(args)
     validate_runtime_config(args)
-    if bool(args.verify_cost_model_profile) or bool(
-        args.transfer_aware_profile
+    if (
+        bool(args.verify_cost_model_profile)
+        or bool(args.transfer_aware_profile)
+        or bool(args.latency_breakdown_profile)
     ):
         args.collect_profile = True
         args.engine_profile = True

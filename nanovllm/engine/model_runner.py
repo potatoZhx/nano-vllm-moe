@@ -179,6 +179,12 @@ class ModelRunner:
         self._verify_metadata_records_by_step: dict[int, dict[str, object]] = {}
         self._verify_stream_timing_events: list[tuple[int, object, object]] = []
         self._verify_stream_ms_by_step: dict[int, float] = {}
+        self._latency_cuda_timing_events: list[
+            tuple[str, object, object]
+        ] = []
+        self._latency_verify_op_pending: list[
+            tuple[int, tuple[int, ...], int, int]
+        ] = []
         self._verify_cost_model = None
         self._verify_cost_proxy = None
         self._verify_cost_schema_version = 0
@@ -502,6 +508,10 @@ class ModelRunner:
             self._verify_stream_timing_events = []
         if not hasattr(self, "_verify_stream_ms_by_step"):
             self._verify_stream_ms_by_step = {}
+        if not hasattr(self, "_latency_cuda_timing_events"):
+            self._latency_cuda_timing_events = []
+        if not hasattr(self, "_latency_verify_op_pending"):
+            self._latency_verify_op_pending = []
         if not hasattr(self, "_verify_cost_model"):
             self._verify_cost_model = None
         if not hasattr(self, "_verify_cost_proxy"):
@@ -1991,6 +2001,8 @@ class ModelRunner:
             return {}
         self._poll_verify_layer_timing_events()
         self._poll_verify_stream_timings(block=bool(reset))
+        self._poll_latency_cuda_timings(block=bool(reset))
+        self._collect_latency_verify_op_timings(block=bool(reset))
         dual_queue = self._dual_queue_prefetch_enabled()
         profile_flush_block = bool(reset) or not dual_queue
         self._poll_dual_queue_segment_timings(block=profile_flush_block)
@@ -2162,6 +2174,8 @@ class ModelRunner:
                 self._verify_metadata_records_by_step.clear()
                 self._verify_stream_timing_events.clear()
                 self._verify_stream_ms_by_step.clear()
+                self._latency_cuda_timing_events.clear()
+                self._latency_verify_op_pending.clear()
             if prefetch_runtime is not None:
                 with self._prefetch_runtime_lock:
                     _ = prefetch_runtime.get_profile(reset=True)
@@ -2550,6 +2564,7 @@ class ModelRunner:
             self._profile["draft_segment_graph_replay_ms"] += replay_ms
 
         final_hidden = graph_vars["outputs"][:bs]
+        tail_timing = self._start_latency_cuda_timing()
         extractor = getattr(self, "_acceptance_extractor", None)
         if extractor is not None:
             tail_graph = getattr(self, "draft_tail_graphs", {}).get(bucket)
@@ -2560,8 +2575,13 @@ class ModelRunner:
                 extractor.set_token_features_from_logits(logits)
                 tail_graph.replay()
                 self._pending_acceptance = True
+                self._finish_latency_cuda_timing(
+                    "draft_tail", tail_timing
+                )
                 return logits
-        return self.model.compute_logits(final_hidden)
+        logits = self.model.compute_logits(final_hidden)
+        self._finish_latency_cuda_timing("draft_tail", tail_timing)
+        return logits
 
     def _can_use_draft_cudagraph(self, bs: int) -> bool:
         if not getattr(self.config, "draft_cuda_graph_enabled", True):
@@ -2633,7 +2653,19 @@ class ModelRunner:
         self._record_profile(f"run_model_{phase}_ms", dt)
 
         t0 = perf_counter()
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        sample_timing = (
+            self._start_latency_cuda_timing()
+            if (
+                self.rank == 0
+                and str(getattr(self, "_decode_graph_policy", "standard"))
+                == "draft"
+            )
+            else None
+        )
+        sampled = self.sampler(logits, temperatures) if self.rank == 0 else None
+        self._finish_latency_cuda_timing("draft_sample", sample_timing)
+        token_ids = sampled.tolist() if sampled is not None else None
+        self._poll_latency_cuda_timings(block=False)
         if self.profile_enabled and self.profile_cuda_sync:
             torch.cuda.synchronize()
         dt = perf_counter() - t0
@@ -3755,6 +3787,79 @@ class ModelRunner:
                     )
         self._dual_queue_segment_timing_events = remaining
 
+    def _latency_breakdown_enabled(self) -> bool:
+        return os.getenv(
+            "NANOVLLM_LATENCY_BREAKDOWN", ""
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _start_latency_cuda_timing(self):
+        if (
+            not self._latency_breakdown_enabled()
+            or not torch.cuda.is_available()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(torch.cuda.current_stream())
+        return start, end
+
+    def _finish_latency_cuda_timing(self, name: str, timing) -> None:
+        if timing is None:
+            return
+        start, end = timing
+        end.record(torch.cuda.current_stream())
+        self._latency_cuda_timing_events.append(
+            (str(name), start, end)
+        )
+
+    def _poll_latency_cuda_timings(self, *, block: bool) -> None:
+        pending = getattr(self, "_latency_cuda_timing_events", [])
+        if not pending:
+            return
+        remaining = []
+        for name, start, end in pending:
+            if block:
+                end.synchronize()
+            elif not bool(end.query()):
+                remaining.append((name, start, end))
+                continue
+            elapsed_ms = float(start.elapsed_time(end))
+            if self.profile_enabled and self.rank == 0:
+                with self._prefetch_profile_lock:
+                    self._profile[
+                        f"latency_{name}_cuda_event_count"
+                    ] += 1.0
+                    self._profile[
+                        f"latency_{name}_cuda_event_ms"
+                    ] += elapsed_ms
+        self._latency_cuda_timing_events = remaining
+
+    def _collect_latency_verify_op_timings(self, *, block: bool) -> None:
+        pending = getattr(self, "_latency_verify_op_pending", [])
+        if not pending:
+            return
+        if block and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        remaining: list[tuple[int, tuple[int, ...], int, int]] = []
+        for bucket, segments, step_id, token_count in pending:
+            try:
+                for segment_id in segments:
+                    self._collect_verify_op_event_timings(
+                        bucket=int(bucket),
+                        segment_id=int(segment_id),
+                        step_id=int(step_id),
+                        token_count=int(token_count),
+                    )
+            except RuntimeError:
+                if not block:
+                    remaining.append(
+                        (bucket, segments, step_id, token_count)
+                    )
+                    continue
+                raise
+        self._latency_verify_op_pending = remaining
+
     def _verify_stream_timing_enabled(self) -> bool:
         return (
             torch.cuda.is_available()
@@ -3987,6 +4092,8 @@ class ModelRunner:
         if not had_verify_cost_round:
             self._verify_cost_latest_prediction = None
         self._poll_verify_stream_timings(block=False)
+        self._poll_latency_cuda_timings(block=False)
+        self._collect_latency_verify_op_timings(block=False)
         total_t0 = perf_counter()
         step_id = self._next_prefetch_step_id()
         prefetch_runtime = getattr(self, "prefetch_runtime", None)
@@ -4197,7 +4304,11 @@ class ModelRunner:
                     else:
                         hidden = self._run_verify_with_prefix_graph(input_ids, positions)
                     lm_head_t0 = perf_counter()
+                    lm_head_timing = self._start_latency_cuda_timing()
                     logits_out = F.linear(hidden, self.model.lm_head.weight)
+                    self._finish_latency_cuda_timing(
+                        "verify_lm_head", lm_head_timing
+                    )
                     self._record_profile("verify_lm_head_enqueue_ms", perf_counter() - lm_head_t0)
                     if self.profile_enabled and self.rank == 0:
                         with self._prefetch_profile_lock:
@@ -4209,7 +4320,11 @@ class ModelRunner:
                     return hidden, logits_out
                 hidden = self.model(input_ids, positions)
                 lm_head_t0 = perf_counter()
+                lm_head_timing = self._start_latency_cuda_timing()
                 logits_out = F.linear(hidden, self.model.lm_head.weight)
+                self._finish_latency_cuda_timing(
+                    "verify_lm_head", lm_head_timing
+                )
                 self._record_profile("verify_lm_head_enqueue_ms", perf_counter() - lm_head_t0)
                 if self.profile_enabled and self.rank == 0:
                     with self._prefetch_profile_lock:
@@ -5386,9 +5501,12 @@ class ModelRunner:
 
         graph = self.verify_kt_hybrid_graphs[bucket]
         graph.replay()
-        if os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
+        legacy_op_event_profile = os.getenv(
+            "NANOVLLM_VERIFY_OP_EVENT_TIMING", ""
+        ).strip().lower() in {
             "1", "true", "yes", "y", "on"
-        }:
+        }
+        if legacy_op_event_profile:
             sync_t0 = perf_counter()
             ready = torch.cuda.Event(blocking=False)
             ready.record(torch.cuda.current_stream())
@@ -5403,6 +5521,15 @@ class ModelRunner:
                 segment_id=-1,
                 step_id=int(step_id),
                 token_count=int(num_tokens),
+            )
+        elif self._latency_breakdown_enabled():
+            self._latency_verify_op_pending.append(
+                (
+                    int(bucket),
+                    (-1,),
+                    int(step_id),
+                    int(num_tokens),
+                )
             )
 
         skip_sync_profile_readback = bool(
@@ -5576,6 +5703,7 @@ class ModelRunner:
         op_event_profile = os.getenv("NANOVLLM_VERIFY_OP_EVENT_TIMING", "").strip().lower() in {
             "1", "true", "yes", "y", "on"
         }
+        latency_op_event_profile = self._latency_breakdown_enabled()
         defer_segment_metadata = os.getenv(
             "NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA",
             "1",
@@ -5731,6 +5859,15 @@ class ModelRunner:
                     step_id=int(step_id),
                     token_count=int(num_tokens),
                 )
+        elif latency_op_event_profile:
+            self._latency_verify_op_pending.append(
+                (
+                    int(bucket),
+                    tuple(range(num_segments)),
+                    int(step_id),
+                    int(num_tokens),
+                )
+            )
 
         if async_boundary_prefetch:
             self._wait_for_verify_boundary_prefetch_drain()

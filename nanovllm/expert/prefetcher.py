@@ -2259,12 +2259,19 @@ class PrefetchRuntime:
         waited = 0
         draft_waited = 0
         indexed_waited = 0
+        sync_wait_ms = 0.0
         for ticket in list(self.inflight.values()):
             if not ticket.direct_active:
                 continue
             if source is not None and str(ticket.source) != str(source):
                 continue
+            sync_t0 = time.perf_counter()
             ticket.ready_event.synchronize()
+            ticket_sync_ms = (time.perf_counter() - sync_t0) * 1000.0
+            sync_wait_ms += ticket_sync_ms
+            self._profile[
+                f"{ticket.source}_prefetch_sync_wait_ms"
+            ] += ticket_sync_ms
             waited += 1
             if ticket.source == "draft_direct_active":
                 draft_waited += 1
@@ -2274,6 +2281,7 @@ class PrefetchRuntime:
         drain_ms = (time.perf_counter() - t0) * 1000.0
         self._profile["direct_active_prefetch_drain_count"] += waited
         self._profile["direct_active_prefetch_drain_ms"] += drain_ms
+        self._profile["direct_active_prefetch_sync_wait_ms"] += sync_wait_ms
         if source == "draft_direct_active" or source is None:
             self._profile["draft_direct_active_prefetch_drain_count"] += draft_waited
             self._profile["draft_direct_active_prefetch_drain_ms"] += drain_ms
@@ -2293,8 +2301,12 @@ class PrefetchRuntime:
         self.publish_ready(step_id=step_id)
         self._profile["verify_ready_before_wait_count"] += self._count_ready_relevant_experts()
 
+        transfer_wait_ms = 0.0
         if timeout_ms > 0.0:
             deadline = t0 + timeout_ms / 1000.0
+            transfer_wait_t0 = (
+                time.perf_counter() if self.inflight else None
+            )
             while time.perf_counter() < deadline:
                 published = self.publish_direct_active_ready(step_id=step_id)
                 if published > 0 or not self.inflight:
@@ -2305,8 +2317,13 @@ class PrefetchRuntime:
                 time.sleep(0.0002)
             if self.inflight:
                 self._profile["prefetch_timeout_count"] += 1
+            if transfer_wait_t0 is not None:
+                transfer_wait_ms = (
+                    time.perf_counter() - transfer_wait_t0
+                ) * 1000.0
 
         self._profile["prefetch_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+        self._profile["verify_prefetch_transfer_wait_ms"] += transfer_wait_ms
         self._profile["verify_ready_after_wait_count"] += self._count_ready_relevant_experts()
 
     def _count_ready_relevant_experts(self) -> int:
@@ -2439,6 +2456,9 @@ class PrefetchRuntime:
                 self._transfer_lifecycle_events
             ),
             "prefetch_wait_ms": float(self._profile.get("prefetch_wait_ms", 0.0)),
+            "verify_prefetch_transfer_wait_ms": float(
+                self._profile.get("verify_prefetch_transfer_wait_ms", 0.0)
+            ),
             "prefetch_consumed_count": int(self._profile.get("prefetch_consumed_count", 0.0)),
             "prefetch_timeout_count": int(self._profile.get("prefetch_timeout_count", 0.0)),
             "publish_count": int(self._profile.get("publish_count", 0.0)),
@@ -2487,6 +2507,9 @@ class PrefetchRuntime:
             "direct_active_prefetch_publish_ms": float(self._profile.get("direct_active_prefetch_publish_ms", 0.0)),
             "direct_active_prefetch_drain_count": int(self._profile.get("direct_active_prefetch_drain_count", 0.0)),
             "direct_active_prefetch_drain_ms": float(self._profile.get("direct_active_prefetch_drain_ms", 0.0)),
+            "direct_active_prefetch_sync_wait_ms": float(
+                self._profile.get("direct_active_prefetch_sync_wait_ms", 0.0)
+            ),
             "history_prefetch_submit_count": int(self._profile.get("history_prefetch_submit_count", 0.0)),
             "verify_history_prefetch_submit_count": int(self._profile.get("verify_history_prefetch_submit_count", 0.0)),
             "draft_live_prefetch_submit_count": int(self._profile.get("draft_live_prefetch_submit_count", 0.0)),
@@ -2598,6 +2621,9 @@ class PrefetchRuntime:
             "draft_direct_active_prefetch_consumed_count": int(self._profile.get("draft_direct_active_prefetch_consumed_count", 0.0)),
             "draft_direct_active_prefetch_drain_count": int(self._profile.get("draft_direct_active_prefetch_drain_count", 0.0)),
             "draft_direct_active_prefetch_drain_ms": float(self._profile.get("draft_direct_active_prefetch_drain_ms", 0.0)),
+            "draft_direct_active_prefetch_sync_wait_ms": float(
+                self._profile.get("draft_direct_active_prefetch_sync_wait_ms", 0.0)
+            ),
             "draft_direct_active_prefetch_skipped_by_frontier_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_frontier_count", 0.0)),
             "draft_direct_active_prefetch_skipped_by_budget_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_budget_count", 0.0)),
             "draft_direct_active_prefetch_skipped_by_pending_count": int(self._profile.get("draft_direct_active_prefetch_skipped_by_pending_count", 0.0)),
@@ -2615,6 +2641,9 @@ class PrefetchRuntime:
             "draft_segment_indexed_prefetch_consumed_count": int(self._profile.get("draft_segment_indexed_prefetch_consumed_count", 0.0)),
             "draft_segment_indexed_prefetch_drain_count": int(self._profile.get("draft_segment_indexed_prefetch_drain_count", 0.0)),
             "draft_segment_indexed_prefetch_drain_ms": float(self._profile.get("draft_segment_indexed_prefetch_drain_ms", 0.0)),
+            "draft_segment_indexed_prefetch_sync_wait_ms": float(
+                self._profile.get("draft_segment_indexed_prefetch_sync_wait_ms", 0.0)
+            ),
             "draft_segment_indexed_prefetch_skipped_by_budget_count": int(self._profile.get("draft_segment_indexed_prefetch_skipped_by_budget_count", 0.0)),
             "draft_segment_indexed_prefetch_skipped_by_pending_count": int(self._profile.get("draft_segment_indexed_prefetch_skipped_by_pending_count", 0.0)),
             "draft_segment_indexed_prefetch_adaptive_budget": int(
