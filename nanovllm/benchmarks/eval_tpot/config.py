@@ -38,6 +38,7 @@ REQUEST_MODE_CHOICES = ("dataset", "per_layer_slots")
 OPTIMIZED_CONFIG_CHOICES = (
     "none",
     "k4_verify",
+    "k1_f16_3080",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -54,6 +55,31 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
         "kt_num_threads": 16,
         "verify_cuda_graph_bucket_steps": "3,5,7,10,13",
         "verify_prefetch_rank_multiplier": 1,
+    },
+    # Measured on RTX 3080 10 GiB + 2 x Xeon Gold 5218R.  F16 expert
+    # weights make the legacy llamafile CPU kernel substantially faster than
+    # BF16 on Cascade Lake, while K=1 keeps verify at the qlen=2 grouped fast
+    # path.  A budget of two prefetches per boundary was the best point in the
+    # measured 0/1/2/4 sweep.
+    "k1_f16_3080": {
+        "allocation_modes": "profile_weighted",
+        "cache_ratios": "0.075",
+        "max_draft_tokens_values": "1",
+        "segment_sizes": "12",
+        "verify_prefetch_max_per_boundary": 2,
+        "draft_stop_policy": "none",
+        "acceptance_predictor_enabled": False,
+        "cpu_expert_pin_memory": False,
+        "kt_num_threads": 16,
+        "kt_threadpool_count": 2,
+        "kt_numa_nodes": "0,1",
+        "kt_direct_backend": "llamafile_f16",
+        "kt_capture_bs": "1,2,4,8,16,32",
+        "verify_cuda_graph_bucket_steps": "2",
+        "verify_prefetch_rank_multiplier": 1,
+        "gpu_memory_utilization": 0.996,
+        "decode_driver": "generate",
+        "reset_seed_after_warmup": True,
     },
     "k3_3080": {
         "allocation_modes": "profile_weighted",
@@ -210,6 +236,8 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "kt_threadpool_count": "--kt-threadpool-count",
         "kt_numa_nodes": "--kt-numa-nodes",
         "kt_direct_backend": "--kt-direct-backend",
+        "kt_single_weight": "--kt-single-weight",
+        "kt_capture_bs": "--kt-capture-bs",
         "verify_cuda_graph_bucket_steps": "--verify-cuda-graph-bucket-steps",
         "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
         "gpu_memory_utilization": "--gpu-memory-utilization",

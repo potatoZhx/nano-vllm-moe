@@ -57,6 +57,31 @@ def test_k3_3080_preset_encodes_measured_low_latency_topology(tmp_path):
     assert args.gpu_memory_utilization == 0.996
 
 
+def test_k1_f16_3080_preset_encodes_measured_tpot_optimum(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k1_f16_3080",
+        ]
+    )
+
+    assert args.cache_ratios == "0.075"
+    assert args.max_draft_tokens_values == "1"
+    assert args.verify_prefetch_max_per_boundary == 2
+    assert args.verify_cuda_graph_bucket_steps == "2"
+    assert args.kt_direct_backend == "llamafile_f16"
+    assert args.kt_capture_bs == "1,2,4,8,16,32"
+    assert args.kt_num_threads == 16
+    assert args.kt_threadpool_count == 2
+    assert args.kt_numa_nodes == "0,1"
+    assert args.draft_stop_policy == "none"
+    assert args.acceptance_predictor_enabled is False
+    assert args.cpu_expert_pin_memory is False
+    assert args.gpu_memory_utilization == 0.996
+
+
 def test_parse_args_rejects_verify_buckets_that_force_eager_fallback(tmp_path):
     try:
         parse_args(
