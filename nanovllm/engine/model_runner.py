@@ -285,6 +285,7 @@ class ModelRunner:
                 kt_llamafile_extension_path=getattr(
                     config, "kt_llamafile_extension_path", ""
                 ),
+                kt_single_weight=getattr(config, "kt_single_weight", True),
                 kt_numa_nodes=getattr(config, "kt_numa_nodes", None) or None,
                 kt_capture_bs=getattr(config, "kt_capture_bs", None),
                 draft_reroute_policy=getattr(config, "draft_reroute_policy", "round_robin"),

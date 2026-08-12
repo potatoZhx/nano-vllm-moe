@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from nanovllm.expert.cache import LayerExpertCache
+from nanovllm.expert.cpu_weights import copy_expert_tensor
 from nanovllm.expert.placement import MoEExecutionPlan, build_moe_execution_plan
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.fuse_moe.cpu_backend import TorchPackedCpuMoeBackend, get_cpu_expert_weights
@@ -35,8 +36,8 @@ class GpuFallbackWorkspace:
                     self._expert_to_slot[eid] = i
                     mapping[eid] = i
                     params = cpu_expert_pool[eid]
-                    self.gate_up[i].copy_(params["gate_up"], non_blocking=True)
-                    self.down[i].copy_(params["down"], non_blocking=True)
+                    copy_expert_tensor(self.gate_up[i], params["gate_up"], non_blocking=True)
+                    copy_expert_tensor(self.down[i], params["down"], non_blocking=True)
                     break
         return mapping
 

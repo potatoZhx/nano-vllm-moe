@@ -78,6 +78,7 @@ def resolved_runtime_config(args: argparse.Namespace) -> dict[str, Any]:
         "kt_threadpool_count": int(args.kt_threadpool_count),
         "kt_direct_backend": str(args.kt_direct_backend),
         "kt_llamafile_extension_path": str(args.kt_llamafile_extension_path),
+        "kt_single_weight": bool(args.kt_single_weight),
         "kt_numa_nodes": (
             parse_csv(args.kt_numa_nodes, int) if args.kt_numa_nodes else []
         ),
@@ -157,6 +158,7 @@ def build_llm_kwargs(
         "kt_chunked_prefill_size": int(args.kt_chunked_prefill_size),
         "kt_direct_backend": str(args.kt_direct_backend),
         "kt_llamafile_extension_path": str(args.kt_llamafile_extension_path),
+        "kt_single_weight": bool(args.kt_single_weight),
         "kt_numa_nodes": parse_csv(args.kt_numa_nodes, int) if args.kt_numa_nodes else [],
         "kt_capture_bs": resolved_kt_capture_bs(args),
         "cpu_gpu_parallel_execution_enabled": "auto",

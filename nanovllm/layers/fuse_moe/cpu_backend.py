@@ -9,6 +9,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from nanovllm.expert.cpu_weights import NumaShardedExpertTensor
 from nanovllm.layers.fuse_moe.cpu_workspace import CpuMoeWorkspace
 from nanovllm.layers.fuse_moe.cuda_host_callback import (
     launch_host_callback,
@@ -114,6 +115,10 @@ def get_cpu_expert_weights(
 
     gate_up = params["gate_up"]
     down = params["down"]
+    if isinstance(gate_up, NumaShardedExpertTensor):
+        gate_up = gate_up.materialize(dtype=compute_dtype)
+    if isinstance(down, NumaShardedExpertTensor):
+        down = down.materialize(dtype=compute_dtype)
     if strict_packed_dtype:
         if gate_up.dtype != compute_dtype or down.dtype != compute_dtype:
             raise RuntimeError(

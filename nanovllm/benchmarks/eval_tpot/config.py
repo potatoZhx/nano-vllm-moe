@@ -731,6 +731,16 @@ def build_parser() -> argparse.ArgumentParser:
             "is not importable in the active Python environment."
         ),
     )
+    parser.add_argument(
+        "--kt-single-weight",
+        type=str2bool,
+        default=True,
+        help=(
+            "Reuse the legacy CPUInfer NUMA-local buffers as the CPU expert "
+            "pool, avoiding a second full raw-weight copy. Requires the "
+            "single-weight cpuinfer_ext patch."
+        ),
+    )
     parser.add_argument("--kt-numa-nodes", default="")
     parser.add_argument("--kt-capture-bs", default="1,2,4,8,16,32")
 

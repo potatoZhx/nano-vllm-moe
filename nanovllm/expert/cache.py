@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from nanovllm.expert.cpu_weights import ExpertTensor, copy_expert_tensor
+
 
 class _ImmediateEvent:
     def query(self) -> bool:
@@ -137,8 +139,8 @@ class LayerExpertCache:
         self,
         slot_idx: int,
         expert_idx: int,
-        gate_up_cpu: torch.Tensor,
-        down_cpu: torch.Tensor,
+        gate_up_cpu: ExpertTensor,
+        down_cpu: ExpertTensor,
     ) -> None:
         assert 0 <= slot_idx < self.num_slots
         prev_expert = self.slot_to_expert[slot_idx]
@@ -148,8 +150,8 @@ class LayerExpertCache:
             self.cached_expert_mask[prev_expert] = False
             self.cached_expert_mask_host[prev_expert] = False
 
-        self.gate_up_buffer[slot_idx].copy_(gate_up_cpu, non_blocking=True)
-        self.down_buffer[slot_idx].copy_(down_cpu, non_blocking=True)
+        copy_expert_tensor(self.gate_up_buffer[slot_idx], gate_up_cpu, non_blocking=True)
+        copy_expert_tensor(self.down_buffer[slot_idx], down_cpu, non_blocking=True)
         self.slot_to_expert[slot_idx] = expert_idx
         self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
@@ -259,8 +261,8 @@ class LayerExpertCache:
     def begin_async_put_to_staging(
         self,
         reservation: StagingReservation,
-        gate_up_cpu: torch.Tensor,
-        down_cpu: torch.Tensor,
+        gate_up_cpu: ExpertTensor,
+        down_cpu: ExpertTensor,
         stream: torch.cuda.Stream | None,
     ) -> torch.cuda.Event | _ImmediateEvent:
         if self.staging_gate_up_buffer is None or self.staging_down_buffer is None:
@@ -274,14 +276,14 @@ class LayerExpertCache:
         if target_gate_up.is_cuda:
             active_stream = stream if stream is not None else torch.cuda.current_stream()
             with torch.cuda.stream(active_stream):
-                target_gate_up.copy_(gate_up_cpu, non_blocking=True)
-                target_down.copy_(down_cpu, non_blocking=True)
+                copy_expert_tensor(target_gate_up, gate_up_cpu, non_blocking=True)
+                copy_expert_tensor(target_down, down_cpu, non_blocking=True)
                 event = torch.cuda.Event(blocking=False)
                 event.record(active_stream)
             return event
 
-        target_gate_up.copy_(gate_up_cpu)
-        target_down.copy_(down_cpu)
+        copy_expert_tensor(target_gate_up, gate_up_cpu)
+        copy_expert_tensor(target_down, down_cpu)
         return _ImmediateEvent()
 
     def mark_staging_ready(self, reservation: StagingReservation) -> bool:
@@ -415,8 +417,8 @@ class LayerExpertCache:
     def begin_async_put_to_active(
         self,
         reservation: ActiveReservation,
-        gate_up_cpu: torch.Tensor,
-        down_cpu: torch.Tensor,
+        gate_up_cpu: ExpertTensor,
+        down_cpu: ExpertTensor,
         stream: torch.cuda.Stream | None,
     ) -> torch.cuda.Event | _ImmediateEvent:
         idx = reservation.active_slot_idx
@@ -432,14 +434,14 @@ class LayerExpertCache:
         if target_gate_up.is_cuda:
             active_stream = stream if stream is not None else torch.cuda.current_stream()
             with torch.cuda.stream(active_stream):
-                target_gate_up.copy_(gate_up_cpu, non_blocking=True)
-                target_down.copy_(down_cpu, non_blocking=True)
+                copy_expert_tensor(target_gate_up, gate_up_cpu, non_blocking=True)
+                copy_expert_tensor(target_down, down_cpu, non_blocking=True)
                 event = torch.cuda.Event(blocking=False)
                 event.record(active_stream)
             return event
 
-        target_gate_up.copy_(gate_up_cpu)
-        target_down.copy_(down_cpu)
+        copy_expert_tensor(target_gate_up, gate_up_cpu)
+        copy_expert_tensor(target_down, down_cpu)
         return _ImmediateEvent()
 
     def commit_active_prefetch(self, reservation: ActiveReservation) -> PublishedExpert | None:

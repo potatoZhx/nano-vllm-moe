@@ -10,6 +10,7 @@ import torch
 
 from nanovllm.config import Config
 from nanovllm.expert.cache import ActiveReservation, LayerExpertCache, PublishedExpert, StagingReservation
+from nanovllm.expert.cpu_weights import copy_expert_tensor
 from nanovllm.expert.runtime_meta import LayerRuntimeMetaCPU, ModelRuntimeMetaRecorder
 from nanovllm.scheduling.cache_strategy import CacheStrategy, LFURankGuardStrategy
 from nanovllm.scheduling.prefetch_strategy import PrefetchStrategy
@@ -3259,12 +3260,12 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
 
         gate_up = representative["gate_up"]
         down = representative["down"]
-        target_gate_up = torch.empty_like(gate_up, device=torch.device("cuda"))
-        target_down = torch.empty_like(down, device=torch.device("cuda"))
+        target_gate_up = torch.empty(tuple(gate_up.shape), dtype=gate_up.dtype, device="cuda")
+        target_down = torch.empty(tuple(down.shape), dtype=down.dtype, device="cuda")
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
-            target_gate_up.copy_(gate_up, non_blocking=True)
-            target_down.copy_(down, non_blocking=True)
+            copy_expert_tensor(target_gate_up, gate_up, non_blocking=True)
+            copy_expert_tensor(target_down, down, non_blocking=True)
         stream.synchronize()
 
         samples: list[float] = []
@@ -3273,8 +3274,8 @@ class DualQueuePrefetchRuntime(PrefetchRuntime):
             end = torch.cuda.Event(enable_timing=True)
             with torch.cuda.stream(stream):
                 start.record(stream)
-                target_gate_up.copy_(gate_up, non_blocking=True)
-                target_down.copy_(down, non_blocking=True)
+                copy_expert_tensor(target_gate_up, gate_up, non_blocking=True)
+                copy_expert_tensor(target_down, down, non_blocking=True)
                 end.record(stream)
             end.synchronize()
             samples.append(float(start.elapsed_time(end)))

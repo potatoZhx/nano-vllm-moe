@@ -108,6 +108,7 @@ class Config:
     # llamafile backends can also import cpuinfer_ext normally when it is
     # installed in the active environment.
     kt_llamafile_extension_path: str = ""
+    kt_single_weight: bool = True
     kt_numa_nodes: list[int] = field(default_factory=list)
     kt_capture_bs: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
     gpu_plan_builder_enabled: bool = False

@@ -12,6 +12,7 @@ from typing import Callable
 
 import torch
 
+from nanovllm.expert.cpu_weights import NumaShardedExpertTensor
 from nanovllm.layers.fuse_moe.cpu_backend import CpuMoeResult
 from nanovllm.utils.verify_op_events import verify_op_event
 
@@ -562,6 +563,26 @@ def _pack_llamafile_bf16_weights(
     )
 
 
+def _tensor_view_from_address(
+    address: int,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, object]:
+    """Create a non-owning CPU tensor view over a native uint16 weight buffer."""
+    if dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError(f"unsupported CPUInfer weight dtype: {dtype}")
+    numel = 1
+    for size in shape:
+        numel *= int(size)
+    if int(address) <= 0:
+        raise RuntimeError("CPUInfer returned a null weight pointer")
+    buffer_type = ctypes.c_uint16 * numel
+    buffer = buffer_type.from_address(int(address))
+    tensor = torch.frombuffer(buffer, dtype=dtype, count=numel).reshape(shape)
+    return tensor, buffer
+
+
 class KtDirectCPUBuffer:
     buffer_depth = 2
     capture_bs: set[int] = {1, 2, 4, 8, 16, 32}
@@ -654,6 +675,7 @@ class KtDirectCpuMoeBackend:
         kt_llamafile_extension_path: str = "",
         kt_numa_nodes: list[int] | None = None,
         kt_capture_bs: list[int] | None = None,
+        kt_single_weight: bool = True,
         strict_dtype: bool = True,
         runtime: KtDirectGlobalRuntime | object | None = None,
     ) -> None:
@@ -664,6 +686,7 @@ class KtDirectCpuMoeBackend:
         self.num_experts = int(num_experts)
         self.num_experts_per_tok = int(num_experts_per_tok)
         self.strict_dtype = bool(strict_dtype)
+        self.kt_single_weight = bool(kt_single_weight)
         self.min_routes = 1
         self.load_count = 0
         self.forward_count = 0
@@ -829,12 +852,94 @@ class KtDirectCpuMoeBackend:
             )
         self.runtime.cpu_infer.sync()
         self.load_count = 1
+        if self._legacy_llamafile and self.kt_single_weight:
+            self._adopt_loaded_llamafile_weights(cpu_expert_pool)
         # Legacy load_weights() copies this layer into NUMA-local buffers.  Drop
-        # the temporary expert-major arrays immediately; the original per-expert
-        # tensors remain the source of truth for the GPU expert cache.
+        # the temporary expert-major arrays immediately.  In single-weight mode
+        # the pool above now views those native buffers; compatibility mode keeps
+        # the original per-expert tensors as the GPU cache source.
         if temporary_llamafile_weights is not None:
             del temporary_llamafile_weights, gate, up, down
             _trim_cpu_allocator()
+
+    def _adopt_loaded_llamafile_weights(
+        self,
+        cpu_expert_pool: dict[int, dict[str, object]],
+    ) -> None:
+        """Make CPUInfer's loaded buffers the sole CPU source of expert weights."""
+        getter = getattr(self.moe, "get_weight_ptrs", None)
+        if getter is None:
+            raise RuntimeError(
+                "kt_single_weight requires a cpuinfer_ext build exposing "
+                "MOE.get_weight_ptrs(); apply patches/ktransformers-single-weight.patch "
+                "and rebuild the extension"
+            )
+        pointer_rows = getter()
+        pool_count = int(self.runtime.kt_threadpool_count)
+        if len(pointer_rows) != pool_count:
+            raise RuntimeError(
+                "CPUInfer returned an unexpected number of NUMA weight shards: "
+                f"got {len(pointer_rows)}, expected {pool_count}"
+            )
+        if self.intermediate_size % pool_count != 0:
+            raise RuntimeError(
+                "single-weight llamafile requires intermediate_size divisible "
+                "by kt_threadpool_count"
+            )
+        local_intermediate = self.intermediate_size // pool_count
+        weight_dtype = (
+            torch.float16 if self._llamafile_weight_type == 1 else torch.bfloat16
+        )
+
+        gate_layers: list[torch.Tensor] = []
+        up_layers: list[torch.Tensor] = []
+        down_layers: list[torch.Tensor] = []
+        self._native_weight_buffers: list[object] = []
+        for row in pointer_rows:
+            if len(row) != 3:
+                raise RuntimeError(
+                    "CPUInfer get_weight_ptrs() must return gate/up/down pointers"
+                )
+            gate, gate_buffer = _tensor_view_from_address(
+                int(row[0]),
+                shape=(self.num_experts, local_intermediate, self.hidden_size),
+                dtype=weight_dtype,
+            )
+            up, up_buffer = _tensor_view_from_address(
+                int(row[1]),
+                shape=(self.num_experts, local_intermediate, self.hidden_size),
+                dtype=weight_dtype,
+            )
+            down, down_buffer = _tensor_view_from_address(
+                int(row[2]),
+                shape=(self.num_experts, self.hidden_size, local_intermediate),
+                dtype=weight_dtype,
+            )
+            gate_layers.append(gate)
+            up_layers.append(up)
+            down_layers.append(down)
+            self._native_weight_buffers.extend((gate_buffer, up_buffer, down_buffer))
+
+        for expert_idx in range(self.num_experts):
+            params = cpu_expert_pool.get(expert_idx)
+            if params is None:
+                raise RuntimeError(
+                    f"single-weight conversion is missing expert {expert_idx}"
+                )
+            gate_up_source = NumaShardedExpertTensor(
+                kind="gate_up",
+                gate_shards=tuple(layer[expert_idx] for layer in gate_layers),
+                up_shards=tuple(layer[expert_idx] for layer in up_layers),
+            )
+            down_source = NumaShardedExpertTensor(
+                kind="down",
+                down_shards=tuple(layer[expert_idx] for layer in down_layers),
+            )
+            # The dict is shared by LayerExpertCache and every prefetch runtime;
+            # replacing it in place releases the old raw tensors everywhere.
+            params.clear()
+            params["gate_up"] = gate_up_source
+            params["down"] = down_source
 
     def _cpu_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         if not bool(getattr(self, "_legacy_llamafile", False)):

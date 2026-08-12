@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
 
 from nanovllm.expert.cache import LayerExpertCache
+from nanovllm.expert.cpu_weights import NumaShardedExpertTensor
 from nanovllm.expert.placement import build_prefill_plan_gpu
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.fuse_moe.cpu_backend import CpuMoeResult
@@ -119,10 +123,30 @@ class _FakeLegacyMoe:
         self.config = config
         self.load_calls = 0
         self.forward_calls = 0
+        dtype = torch.float16 if config.gate_type == 1 else torch.bfloat16
+        self.gate = torch.empty(
+            config.num_experts,
+            config.intermediate_size,
+            config.hidden_size,
+            dtype=dtype,
+        )
+        self.up = torch.empty_like(self.gate)
+        self.down = torch.empty(
+            config.num_experts,
+            config.hidden_size,
+            config.intermediate_size,
+            dtype=dtype,
+        )
 
     def load_weights(self) -> _FakeTask:
         self.load_calls += 1
+        ctypes.memmove(self.gate.data_ptr(), self.config.gate_proj, self.gate.nbytes)
+        ctypes.memmove(self.up.data_ptr(), self.config.up_proj, self.up.nbytes)
+        ctypes.memmove(self.down.data_ptr(), self.config.down_proj, self.down.nbytes)
         return _FakeTask()
+
+    def get_weight_ptrs(self) -> list[list[int]]:
+        return [[self.gate.data_ptr(), self.up.data_ptr(), self.down.data_ptr()]]
 
     def forward(
         self,
@@ -296,9 +320,22 @@ class TestKtDirectBackend(unittest.TestCase):
     def test_llamafile_backend_uses_legacy_api_and_masks_gpu_routes(self) -> None:
         runtime = _FakeLegacyRuntime()
         gpu_mask_source = torch.tensor([True, False, False, True])
+        pool = _make_pool()
+        expected = {
+            expert_idx: {
+                "gate_up": weights["gate_up"].clone(),
+                "down": weights["down"].clone(),
+            }
+            for expert_idx, weights in pool.items()
+        }
+        raw_weight_refs = [
+            weakref.ref(tensor)
+            for weights in pool.values()
+            for tensor in (weights["gate_up"], weights["down"])
+        ]
         backend = KtDirectCpuMoeBackend(
             layer_idx=1,
-            cpu_expert_pool=_make_pool(),
+            cpu_expert_pool=pool,
             max_routes=8,
             moe_intermediate_size=4,
             hidden_size=8,
@@ -313,6 +350,27 @@ class TestKtDirectBackend(unittest.TestCase):
         self.assertEqual(backend.kt_selected_backend, "llamafile_bf16")
         self.assertEqual(backend.moe.load_calls, 1)
         self.assertEqual(backend.moe.config.gate_type, 30)
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in raw_weight_refs))
+        for expert_idx, weights in pool.items():
+            self.assertIsInstance(weights["gate_up"], NumaShardedExpertTensor)
+            self.assertIsInstance(weights["down"], NumaShardedExpertTensor)
+            self.assertTrue(
+                torch.equal(
+                    weights["gate_up"].materialize(),
+                    expected[expert_idx]["gate_up"],
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    weights["down"].materialize(),
+                    expected[expert_idx]["down"],
+                )
+            )
+            self.assertEqual(
+                weights["gate_up"].gate_shards[0].data_ptr(),
+                backend.moe.gate[expert_idx].data_ptr(),
+            )
         selected = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
         self.assertTrue(
             torch.equal(

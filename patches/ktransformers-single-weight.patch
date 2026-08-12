@@ -1,0 +1,28 @@
+diff --git a/csrc/ktransformers_ext/operators/llamafile/moe.hpp b/csrc/ktransformers_ext/operators/llamafile/moe.hpp
+--- a/csrc/ktransformers_ext/operators/llamafile/moe.hpp
++++ b/csrc/ktransformers_ext/operators/llamafile/moe.hpp
+@@ -99 +99,5 @@ public:
+-
++
++  std::vector<intptr_t> weight_ptrs() const {
++    return {(intptr_t)m_local_gate_proj_, (intptr_t)m_local_up_proj_, (intptr_t)m_local_down_proj_};
++  }
++
+@@ -768 +772,10 @@ public:
+-
++
++  std::vector<std::vector<intptr_t>> get_weight_ptrs() const {
++    std::vector<std::vector<intptr_t>> result;
++    result.reserve(this->tps.size());
++    for (const auto &tp : this->tps) {
++      result.push_back(tp->weight_ptrs());
++    }
++    return result;
++  }
++
+diff --git a/csrc/ktransformers_ext/ext_bindings.cpp b/csrc/ktransformers_ext/ext_bindings.cpp
+--- a/csrc/ktransformers_ext/ext_bindings.cpp
++++ b/csrc/ktransformers_ext/ext_bindings.cpp
+@@ -742 +742,2 @@ PYBIND11_MODULE(cpuinfer_ext, m) {
+       .def("load_weights", &MOEBindings<LLAMA_MOE_TP>::LoadWeightsBindings::cpuinfer_interface)
++      .def("get_weight_ptrs", &TP_MOE<LLAMA_MOE_TP>::get_weight_ptrs)
