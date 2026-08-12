@@ -103,7 +103,11 @@ class Config:
     kt_num_threads: int = 0                # kt-kernel CPU threads (0=auto)
     kt_threadpool_count: int = 1           # kt-kernel NUMA sub-pools
     kt_chunked_prefill_size: int = 4096    # kt-kernel prefill chunk size
-    kt_direct_backend: str = "auto"         # auto | amx_bf16 | avx2_bf16
+    kt_direct_backend: str = "auto"         # auto | amx_bf16 | avx2_bf16 | llamafile_bf16 | llamafile_f16
+    # Optional path to KTransformers' fixed legacy cpuinfer_ext.  The
+    # llamafile backends can also import cpuinfer_ext normally when it is
+    # installed in the active environment.
+    kt_llamafile_extension_path: str = ""
     kt_numa_nodes: list[int] = field(default_factory=list)
     kt_capture_bs: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
     gpu_plan_builder_enabled: bool = False
@@ -277,8 +281,33 @@ class Config:
         assert self.kt_num_threads >= 0
         assert self.kt_threadpool_count >= 1
         assert self.kt_chunked_prefill_size >= 1
-        assert self.kt_direct_backend in {"auto", "amx_bf16", "avx2_bf16"}
+        assert self.kt_direct_backend in {
+            "auto",
+            "amx_bf16",
+            "avx2_bf16",
+            "llamafile_bf16",
+            "llamafile_f16",
+        }
+        if self.kt_direct_backend.startswith("llamafile_") and self.kt_llamafile_extension_path:
+            assert os.path.isfile(self.kt_llamafile_extension_path), (
+                "kt_llamafile_extension_path must point to cpuinfer_ext when "
+                "using a llamafile kt_direct_backend"
+            )
         assert not self.kt_numa_nodes or len(self.kt_numa_nodes) == self.kt_threadpool_count
+        # kt_direct embeds pinned host pointers in CUDA-graph host callbacks.
+        # Every verify bucket therefore needs a persistent buffer; a temporary
+        # buffer can be replaced while later buckets are captured and leave an
+        # earlier graph with a stale pointer.  Keep the public knob, but make
+        # the safe relationship automatic for every entry point.
+        self.kt_capture_bs = sorted(
+            {
+                *(int(batch_size) for batch_size in self.kt_capture_bs),
+                *(
+                    int(batch_size)
+                    for batch_size in self.verify_cuda_graph_bucket_steps
+                ),
+            }
+        )
         assert self.kt_capture_bs
         assert all(batch_size >= 1 for batch_size in self.kt_capture_bs)
         assert self.perf_profile_level in {"basic", "detailed"}

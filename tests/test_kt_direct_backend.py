@@ -14,6 +14,8 @@ from nanovllm.layers.fuse_moe.heterogeneous import heterogeneous_moe_forward
 from nanovllm.layers.fuse_moe.kt_direct_backend import (
     KtDirectCpuMoeBackend,
     _build_bf16_weight_ptrs,
+    _pack_llamafile_bf16_weights,
+    _pack_llamafile_weights,
     _resolve_runtime_layout,
     _select_kt_bf16_moe_class,
     _split_threads,
@@ -95,6 +97,63 @@ class _FakeRuntime:
             MOEConfig=_FakeMoeConfig,
             AMXBF16_MOE=_FakeMoe,
             AVX2BF16_MOE=_FakeMoe,
+        )
+
+
+class _FakeLegacyMoeConfig:
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+    ) -> None:
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+
+
+class _FakeLegacyMoe:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.load_calls = 0
+        self.forward_calls = 0
+
+    def load_weights(self) -> _FakeTask:
+        self.load_calls += 1
+        return _FakeTask()
+
+    def forward(
+        self,
+        batch_size_ptr: int,
+        top_k: int,
+        expert_ids_ptr: int,
+        routing_weights_ptr: int,
+        input_ptr: int,
+        output_ptr: int,
+        incremental: bool,
+    ) -> _FakeTask:
+        self.forward_calls += 1
+        self.last_forward = {
+            "batch_size_ptr": batch_size_ptr,
+            "top_k": top_k,
+            "expert_ids_ptr": expert_ids_ptr,
+            "routing_weights_ptr": routing_weights_ptr,
+            "input_ptr": input_ptr,
+            "output_ptr": output_ptr,
+            "incremental": incremental,
+        }
+        return _FakeTask()
+
+
+class _FakeLegacyRuntime:
+    def __init__(self) -> None:
+        self.kt_threadpool_count = 1
+        self.cpu_infer = _FakeCpuInfer()
+        self.kt_moe = SimpleNamespace(
+            MOEConfig=_FakeLegacyMoeConfig,
+            MOE=_FakeLegacyMoe,
         )
 
 
@@ -214,6 +273,106 @@ class TestKtDirectBackend(unittest.TestCase):
                 threadpool_count=1,
                 strict_dtype=True,
             )
+
+    def test_pack_llamafile_weights_preserves_expert_and_projection_order(self) -> None:
+        pool = _make_pool()
+
+        gate, up, down = _pack_llamafile_bf16_weights(
+            cpu_expert_pool=pool,
+            num_experts=4,
+            hidden_size=8,
+            intermediate_size=4,
+            strict_dtype=True,
+        )
+
+        self.assertEqual(tuple(gate.shape), (4, 4, 8))
+        self.assertEqual(tuple(up.shape), (4, 4, 8))
+        self.assertEqual(tuple(down.shape), (4, 8, 4))
+        for expert_idx in range(4):
+            self.assertTrue(torch.equal(gate[expert_idx], pool[expert_idx]["gate_up"][:4]))
+            self.assertTrue(torch.equal(up[expert_idx], pool[expert_idx]["gate_up"][4:]))
+            self.assertTrue(torch.equal(down[expert_idx], pool[expert_idx]["down"]))
+
+    def test_llamafile_backend_uses_legacy_api_and_masks_gpu_routes(self) -> None:
+        runtime = _FakeLegacyRuntime()
+        gpu_mask_source = torch.tensor([True, False, False, True])
+        backend = KtDirectCpuMoeBackend(
+            layer_idx=1,
+            cpu_expert_pool=_make_pool(),
+            max_routes=8,
+            moe_intermediate_size=4,
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            gpu_expert_mask=gpu_mask_source,
+            kt_direct_backend="llamafile_bf16",
+            kt_capture_bs=[1, 2],
+            runtime=runtime,
+        )
+
+        self.assertEqual(backend.kt_selected_backend, "llamafile_bf16")
+        self.assertEqual(backend.moe.load_calls, 1)
+        self.assertEqual(backend.moe.config.gate_type, 30)
+        selected = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+        self.assertTrue(
+            torch.equal(
+                backend._cpu_topk_ids(selected),
+                torch.tensor([[-1, 1], [2, -1]], dtype=torch.int64),
+            )
+        )
+
+        routing_weights = torch.full((2, 2), 0.5, dtype=torch.float32)
+        result = backend.forward(
+            hidden_states=torch.randn(2, 8, dtype=torch.bfloat16),
+            flat_weights=routing_weights.reshape(-1),
+            top_k=2,
+            cpu_indices=torch.tensor([1, 2], dtype=torch.int64),
+            cpu_task_expert_ids=torch.tensor([1, 2], dtype=torch.int64),
+            cpu_task_offsets=torch.tensor([0, 1, 2], dtype=torch.int64),
+            act_fn=SiluAndMul(),
+            selected_experts=selected,
+            routing_weights=routing_weights,
+        )
+
+        self.assertEqual(backend.moe.forward_calls, 1)
+        self.assertEqual(backend.moe.last_forward["top_k"], 2)
+        self.assertEqual(tuple(result.outputs_cpu.shape), (2, 8))
+
+    def test_llamafile_f16_converts_weights_but_keeps_bf16_hidden_type(self) -> None:
+        pool = _make_pool()
+        gate, up, down = _pack_llamafile_weights(
+            cpu_expert_pool=pool,
+            num_experts=4,
+            hidden_size=8,
+            intermediate_size=4,
+            strict_dtype=True,
+            weight_dtype=torch.float16,
+        )
+        self.assertEqual(gate.dtype, torch.float16)
+        self.assertEqual(up.dtype, torch.float16)
+        self.assertEqual(down.dtype, torch.float16)
+        self.assertTrue(
+            torch.equal(gate[0], pool[0]["gate_up"][:4].to(torch.float16))
+        )
+
+        backend = KtDirectCpuMoeBackend(
+            layer_idx=1,
+            cpu_expert_pool=pool,
+            max_routes=8,
+            moe_intermediate_size=4,
+            hidden_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            gpu_expert_mask=torch.tensor([True, False, False, True]),
+            kt_direct_backend="llamafile_f16",
+            kt_capture_bs=[1, 2],
+            runtime=_FakeLegacyRuntime(),
+        )
+        self.assertEqual(backend.kt_selected_backend, "llamafile_f16")
+        self.assertEqual(backend.moe.config.gate_type, 1)
+        self.assertEqual(backend.moe.config.up_type, 1)
+        self.assertEqual(backend.moe.config.down_type, 1)
+        self.assertEqual(backend.moe.config.hidden_type, 30)
 
     def test_backend_packs_once_and_forwards_full_topk(self) -> None:
         runtime = _FakeRuntime()

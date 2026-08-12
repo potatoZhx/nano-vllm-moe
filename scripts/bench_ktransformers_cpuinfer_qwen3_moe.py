@@ -85,7 +85,14 @@ def _make_forward_task(moe, qlen_tensor, topk, expert_ids, weights, input_tensor
         )
 
 
-def _load_moes(cpuinfer_ext, cpuinfer, layer_num: int, group_min_len: int, group_max_len: int):
+def _load_moes(
+    cpuinfer_ext,
+    cpuinfer,
+    layer_num: int,
+    group_min_len: int,
+    group_max_len: int,
+    m_block: int,
+):
     moes = []
     weights_keepalive = []
     for layer_idx in range(layer_num):
@@ -118,6 +125,7 @@ def _load_moes(cpuinfer_ext, cpuinfer, layer_num: int, group_min_len: int, group
         config.pool = cpuinfer.backend_
         config.group_min_len = int(group_min_len)
         config.group_max_len = int(group_max_len)
+        config.m_block = int(m_block)
         config.gate_proj = gate_w.data_ptr()
         config.up_proj = up_w.data_ptr()
         config.down_proj = down_w.data_ptr()
@@ -142,6 +150,7 @@ def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
         args.layer_num,
         args.group_min_len,
         args.group_max_len,
+        args.m_block,
     )
     _ = weights_keepalive
 
@@ -221,6 +230,7 @@ def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
         "total_time_s": total_s,
         "group_min_len": args.group_min_len,
         "group_max_len": args.group_max_len,
+        "m_block": args.m_block,
     }
 
 
@@ -234,6 +244,7 @@ def parse_args():
     parser.add_argument("--iters", type=int, default=500)
     parser.add_argument("--group-min-len", type=int, default=10)
     parser.add_argument("--group-max-len", type=int, default=1024)
+    parser.add_argument("--m-block", type=int, default=4)
     parser.add_argument("--output", default="")
     return parser.parse_args()
 

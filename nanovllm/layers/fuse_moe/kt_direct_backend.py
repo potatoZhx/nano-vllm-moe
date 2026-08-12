@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import importlib
+import importlib.util
 import os
+import sys
+import warnings
 from time import perf_counter
 from typing import Callable
 
@@ -21,6 +25,26 @@ def _trim_cpu_allocator() -> None:
         malloc_trim(0)
     except (AttributeError, OSError):
         pass
+
+
+def _warn_if_process_affinity_is_restricted() -> None:
+    """Warn when an outer taskset can fight CPUInfer's own hwloc binding."""
+    try:
+        allowed = os.sched_getaffinity(0)
+    except Exception:
+        return
+    online_count = int(os.cpu_count() or len(allowed))
+    if len(allowed) >= online_count:
+        return
+    warnings.warn(
+        "kt_direct detected restricted process CPU affinity "
+        f"({len(allowed)}/{online_count} logical CPUs). CPUInfer already binds "
+        "its NUMA worker pools with hwloc; on this host an outer taskset made "
+        "the MoE kernel 7-10x slower. Run without taskset unless a controlled "
+        "microbenchmark proves the restricted mask is faster.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def _numa_physical_core_capacities() -> dict[int, int]:
@@ -214,6 +238,7 @@ class KtDirectGlobalRuntime:
         kt_numa_nodes: list[int] | None,
     ) -> None:
         _trim_cpu_allocator()
+        _warn_if_process_affinity_is_restricted()
         try:
             from kt_kernel import kt_kernel_ext
         except Exception as exc:
@@ -243,6 +268,129 @@ class KtDirectGlobalRuntime:
         self.kt_num_threads = threads
         self.kt_threadpool_count = pools
         self.kt_numa_nodes = numa_nodes_tuple
+        self._moe_refs: list[object] = []
+
+    def retain_moe(self, moe: object) -> None:
+        self._moe_refs.append(moe)
+
+
+def _load_cpuinfer_ext(extension_path: str):
+    """Load KTransformers' legacy llamafile extension without polluting PYTHONPATH."""
+    raw_path = str(extension_path).strip()
+    if not raw_path:
+        try:
+            return importlib.import_module("cpuinfer_ext")
+        except Exception as exc:
+            raise RuntimeError(
+                "a llamafile kt_direct_backend requires the fixed "
+                "KTransformers cpuinfer_ext; install it in this environment or "
+                "set kt_llamafile_extension_path"
+            ) from exc
+    requested_path = os.path.realpath(os.path.expanduser(raw_path))
+    if not os.path.isfile(requested_path):
+        raise FileNotFoundError(
+            f"KTransformers cpuinfer_ext does not exist: {requested_path}"
+        )
+
+    loaded = sys.modules.get("cpuinfer_ext")
+    if loaded is not None:
+        loaded_path = os.path.realpath(str(getattr(loaded, "__file__", "")))
+        if loaded_path != requested_path:
+            raise RuntimeError(
+                "cpuinfer_ext is already loaded from a different path: "
+                f"loaded={loaded_path}, requested={requested_path}"
+            )
+        return loaded
+
+    spec = importlib.util.spec_from_file_location("cpuinfer_ext", requested_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create an import spec for {requested_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cpuinfer_ext"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("cpuinfer_ext", None)
+        raise
+    return module
+
+
+class KtLlamafileGlobalRuntime:
+    """CPUInfer runtime backed by KTransformers' fixed legacy llamafile MOE."""
+
+    _instance: "KtLlamafileGlobalRuntime | None" = None
+
+    @classmethod
+    def get(
+        cls,
+        *,
+        kt_num_threads: int,
+        kt_threadpool_count: int,
+        kt_numa_nodes: list[int] | None = None,
+        extension_path: str = "",
+    ) -> "KtLlamafileGlobalRuntime":
+        pools = int(kt_threadpool_count)
+        threads, resolved_numa_nodes, _ = _resolve_runtime_layout(
+            kt_num_threads=kt_num_threads,
+            kt_threadpool_count=pools,
+            kt_numa_nodes=kt_numa_nodes,
+        )
+        requested_path = (
+            os.path.realpath(os.path.expanduser(str(extension_path)))
+            if extension_path
+            else ""
+        )
+        configured = (threads, pools, tuple(resolved_numa_nodes), requested_path)
+        if cls._instance is None:
+            cls._instance = cls(
+                kt_num_threads=threads,
+                kt_threadpool_count=pools,
+                kt_numa_nodes=resolved_numa_nodes,
+                extension_path=requested_path,
+            )
+        else:
+            current = cls._instance
+            current_config = (
+                current.kt_num_threads,
+                current.kt_threadpool_count,
+                current.kt_numa_nodes,
+                current.extension_path,
+            )
+            if configured != current_config:
+                raise RuntimeError(
+                    "llamafile CPUInfer is already initialized with "
+                    f"threads/pools/numa/path={current_config}, requested={configured}"
+                )
+        return cls._instance
+
+    def __init__(
+        self,
+        *,
+        kt_num_threads: int,
+        kt_threadpool_count: int,
+        kt_numa_nodes: list[int],
+        extension_path: str,
+    ) -> None:
+        _trim_cpu_allocator()
+        _warn_if_process_affinity_is_restricted()
+        extension = _load_cpuinfer_ext(extension_path)
+        threads, resolved_numa_nodes, thread_counts = _resolve_runtime_layout(
+            kt_num_threads=kt_num_threads,
+            kt_threadpool_count=kt_threadpool_count,
+            kt_numa_nodes=kt_numa_nodes,
+        )
+        worker_config = extension.WorkerPoolConfig()
+        worker_config.subpool_count = int(kt_threadpool_count)
+        worker_config.subpool_numa_map = list(resolved_numa_nodes)
+        worker_config.subpool_thread_count = list(thread_counts)
+
+        self.kt_kernel_ext = extension
+        self.kt_moe = extension.moe
+        self.cpu_infer = extension.CPUInfer(worker_config)
+        self.kt_num_threads = int(threads)
+        self.kt_threadpool_count = int(kt_threadpool_count)
+        self.kt_numa_nodes = tuple(resolved_numa_nodes)
+        self.extension_path = str(extension_path)
         self._moe_refs: list[object] = []
 
     def retain_moe(self, moe: object) -> None:
@@ -341,6 +489,79 @@ def _build_bf16_weight_ptrs(
     return gate_ptrs, up_ptrs, down_ptrs, refs
 
 
+def _pack_llamafile_weights(
+    *,
+    cpu_expert_pool: dict[int, dict[str, object]],
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    strict_dtype: bool,
+    weight_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build temporary expert-major arrays consumed by legacy load_weights()."""
+    if weight_dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError(f"unsupported llamafile weight dtype: {weight_dtype}")
+    backend_label = (
+        "llamafile_bf16" if weight_dtype == torch.bfloat16 else "llamafile_f16"
+    )
+    gates: list[torch.Tensor] = []
+    ups: list[torch.Tensor] = []
+    downs: list[torch.Tensor] = []
+    for expert_idx in range(int(num_experts)):
+        params = cpu_expert_pool.get(expert_idx)
+        if params is None:
+            raise RuntimeError(
+                f"{backend_label} requires every CPU expert; missing {expert_idx}"
+            )
+        gate_up, down = _get_raw_gate_up_down(
+            params,
+            expert_idx=expert_idx,
+            strict_dtype=strict_dtype,
+        )
+        expected_gate_up = (int(intermediate_size) * 2, int(hidden_size))
+        expected_down = (int(hidden_size), int(intermediate_size))
+        if tuple(gate_up.shape) != expected_gate_up:
+            raise RuntimeError(
+                f"{backend_label} expert {expert_idx} gate_up shape mismatch: "
+                f"got {tuple(gate_up.shape)}, expected {expected_gate_up}"
+            )
+        if tuple(down.shape) != expected_down:
+            raise RuntimeError(
+                f"{backend_label} expert {expert_idx} down shape mismatch: "
+                f"got {tuple(down.shape)}, expected {expected_down}"
+            )
+        gates.append(gate_up[:intermediate_size])
+        ups.append(gate_up[intermediate_size:])
+        downs.append(down)
+    packed = (
+        torch.stack(gates, dim=0).contiguous(),
+        torch.stack(ups, dim=0).contiguous(),
+        torch.stack(downs, dim=0).contiguous(),
+    )
+    if weight_dtype == torch.bfloat16:
+        return packed
+    return tuple(tensor.to(dtype=weight_dtype) for tensor in packed)
+
+
+def _pack_llamafile_bf16_weights(
+    *,
+    cpu_expert_pool: dict[int, dict[str, object]],
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    strict_dtype: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper for callers/tests of the original BF16 path."""
+    return _pack_llamafile_weights(
+        cpu_expert_pool=cpu_expert_pool,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        strict_dtype=strict_dtype,
+        weight_dtype=torch.bfloat16,
+    )
+
+
 class KtDirectCPUBuffer:
     buffer_depth = 2
     capture_bs: set[int] = {1, 2, 4, 8, 16, 32}
@@ -430,6 +651,7 @@ class KtDirectCpuMoeBackend:
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
         kt_direct_backend: str = "auto",
+        kt_llamafile_extension_path: str = "",
         kt_numa_nodes: list[int] | None = None,
         kt_capture_bs: list[int] | None = None,
         strict_dtype: bool = True,
@@ -446,12 +668,28 @@ class KtDirectCpuMoeBackend:
         self.load_count = 0
         self.forward_count = 0
 
+        normalized_backend = str(kt_direct_backend).strip().lower()
+        self._legacy_llamafile = normalized_backend in {
+            "llamafile_bf16",
+            "llamafile_f16",
+        }
+        self._llamafile_weight_type = (
+            1 if normalized_backend == "llamafile_f16" else 30
+        )
         if runtime is None:
-            runtime = KtDirectGlobalRuntime.get(
-                kt_num_threads=kt_num_threads,
-                kt_threadpool_count=kt_threadpool_count,
-                kt_numa_nodes=kt_numa_nodes,
-            )
+            if self._legacy_llamafile:
+                runtime = KtLlamafileGlobalRuntime.get(
+                    kt_num_threads=kt_num_threads,
+                    kt_threadpool_count=kt_threadpool_count,
+                    kt_numa_nodes=kt_numa_nodes,
+                    extension_path=kt_llamafile_extension_path,
+                )
+            else:
+                runtime = KtDirectGlobalRuntime.get(
+                    kt_num_threads=kt_num_threads,
+                    kt_threadpool_count=kt_threadpool_count,
+                    kt_numa_nodes=kt_numa_nodes,
+                )
         self.runtime = runtime
         capture_batch_sizes = (
             [int(batch_size) for batch_size in kt_capture_bs]
@@ -482,52 +720,99 @@ class KtDirectCpuMoeBackend:
         )
         self._refresh_gpu_expert_mask(non_blocking=False)
 
-        gate_ptrs, up_ptrs, down_ptrs, refs = _build_bf16_weight_ptrs(
-            cpu_expert_pool=cpu_expert_pool,
-            num_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            threadpool_count=self.runtime.kt_threadpool_count,
-            strict_dtype=self.strict_dtype,
-        )
-        self._weight_refs = refs
-
-        moe_config = self.runtime.kt_moe.MOEConfig(
-            self.num_experts,
-            self.num_experts_per_tok,
-            self.hidden_size,
-            self.intermediate_size,
-            self.gpu_expert_mask_cpu.data_ptr(),
-        )
+        temporary_llamafile_weights: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ] | None = None
+        if self._legacy_llamafile:
+            weight_dtype = (
+                torch.float16
+                if self._llamafile_weight_type == 1
+                else torch.bfloat16
+            )
+            temporary_llamafile_weights = _pack_llamafile_weights(
+                cpu_expert_pool=cpu_expert_pool,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                strict_dtype=self.strict_dtype,
+                weight_dtype=weight_dtype,
+            )
+            gate, up, down = temporary_llamafile_weights
+            moe_config = self.runtime.kt_moe.MOEConfig(
+                self.num_experts,
+                self.num_experts_per_tok,
+                self.hidden_size,
+                self.intermediate_size,
+            )
+            self._weight_refs: list[torch.Tensor] = []
+        else:
+            gate_ptrs, up_ptrs, down_ptrs, refs = _build_bf16_weight_ptrs(
+                cpu_expert_pool=cpu_expert_pool,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                threadpool_count=self.runtime.kt_threadpool_count,
+                strict_dtype=self.strict_dtype,
+            )
+            self._weight_refs = refs
+            moe_config = self.runtime.kt_moe.MOEConfig(
+                self.num_experts,
+                self.num_experts_per_tok,
+                self.hidden_size,
+                self.intermediate_size,
+                self.gpu_expert_mask_cpu.data_ptr(),
+            )
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.runtime.cpu_infer.backend_
         moe_config.max_len = self.max_tokens
-        moe_config.gate_proj = 0
-        moe_config.up_proj = 0
-        moe_config.down_proj = 0
-        moe_config.gate_projs = gate_ptrs
-        moe_config.up_projs = up_ptrs
-        moe_config.down_projs = down_ptrs
-        moe_config.gate_scales = [
-            [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
-        ]
-        moe_config.up_scales = [
-            [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
-        ]
-        moe_config.down_scales = [
-            [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
-        ]
-        if hasattr(moe_config, "load"):
-            moe_config.load = False
-        if hasattr(moe_config, "save"):
-            moe_config.save = False
+        if self._legacy_llamafile:
+            # The historical threshold (10) serializes qlen=2..9 through
+            # forward_one.  On this dual-socket AVX2 host, the grouped path is
+            # neutral at qlen=1 and 8-21% faster at qlen=2..7, which covers
+            # both true-batch decode and speculative verify buckets.
+            moe_config.m_block = 32
+            moe_config.group_min_len = 1
+            moe_config.group_max_len = self.max_tokens
+            moe_config.gate_proj = gate.data_ptr()
+            moe_config.up_proj = up.data_ptr()
+            moe_config.down_proj = down.data_ptr()
+            moe_config.gate_type = self._llamafile_weight_type
+            moe_config.up_type = self._llamafile_weight_type
+            moe_config.down_type = self._llamafile_weight_type
+            moe_config.hidden_type = 30
+            if hasattr(moe_config, "load"):
+                moe_config.load = False
+            if hasattr(moe_config, "save"):
+                moe_config.save = False
+            self.kt_selected_backend = normalized_backend
+            self.moe = self.runtime.kt_moe.MOE(moe_config)
+        else:
+            moe_config.gate_proj = 0
+            moe_config.up_proj = 0
+            moe_config.down_proj = 0
+            moe_config.gate_projs = gate_ptrs
+            moe_config.up_projs = up_ptrs
+            moe_config.down_projs = down_ptrs
+            moe_config.gate_scales = [
+                [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
+            ]
+            moe_config.up_scales = [
+                [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
+            ]
+            moe_config.down_scales = [
+                [0] * self.num_experts for _ in range(self.runtime.kt_threadpool_count)
+            ]
+            if hasattr(moe_config, "load"):
+                moe_config.load = False
+            if hasattr(moe_config, "save"):
+                moe_config.save = False
 
-        moe_cls, selected_backend = _select_kt_bf16_moe_class(
-            self.runtime.kt_moe,
-            kt_direct_backend,
-        )
-        self.kt_selected_backend = selected_backend
-        self.moe = moe_cls(moe_config)
+            moe_cls, selected_backend = _select_kt_bf16_moe_class(
+                self.runtime.kt_moe,
+                kt_direct_backend,
+            )
+            self.kt_selected_backend = selected_backend
+            self.moe = moe_cls(moe_config)
         if hasattr(self.runtime, "retain_moe"):
             self.runtime.retain_moe(self.moe)
 
@@ -536,11 +821,52 @@ class KtDirectCpuMoeBackend:
             dtype=torch.int64,
             device="cpu",
         ).contiguous()
-        self.runtime.cpu_infer.submit(
-            self.moe.load_weights_task(self.physical_to_logical.data_ptr())
-        )
+        if self._legacy_llamafile:
+            self.runtime.cpu_infer.submit(self.moe.load_weights())
+        else:
+            self.runtime.cpu_infer.submit(
+                self.moe.load_weights_task(self.physical_to_logical.data_ptr())
+            )
         self.runtime.cpu_infer.sync()
         self.load_count = 1
+        # Legacy load_weights() copies this layer into NUMA-local buffers.  Drop
+        # the temporary expert-major arrays immediately; the original per-expert
+        # tensors remain the source of truth for the GPU expert cache.
+        if temporary_llamafile_weights is not None:
+            del temporary_llamafile_weights, gate, up, down
+            _trim_cpu_allocator()
+
+    def _cpu_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        if not bool(getattr(self, "_legacy_llamafile", False)):
+            return topk_ids
+        mask = self._gpu_expert_mask_source
+        if mask.device != topk_ids.device:
+            mask = mask.to(device=topk_ids.device)
+        cached_routes = mask.index_select(0, topk_ids.reshape(-1)).view_as(topk_ids)
+        return topk_ids.masked_fill(cached_routes, -1)
+
+    def _make_forward_task(
+        self,
+        *,
+        batch_size_ptr: int,
+        top_k: int,
+        expert_ids_ptr: int,
+        routing_weights_ptr: int,
+        input_ptr: int,
+        output_ptr: int,
+    ):
+        args = (
+            batch_size_ptr,
+            top_k,
+            expert_ids_ptr,
+            routing_weights_ptr,
+            input_ptr,
+            output_ptr,
+            False,
+        )
+        if bool(getattr(self, "_legacy_llamafile", False)):
+            return self.moe.forward(*args)
+        return self.moe.forward_task(*args)
 
     def supports_batch_size(self, batch_size: int) -> bool:
         return int(batch_size) <= self.max_tokens
@@ -598,6 +924,7 @@ class KtDirectCpuMoeBackend:
             raise RuntimeError(f"kt_direct requires BF16 hidden states, got {flat_hidden.dtype}")
 
         topk_ids = selected_experts.reshape(-1, self.num_experts_per_tok).contiguous()
+        topk_ids = KtDirectCpuMoeBackend._cpu_topk_ids(self, topk_ids)
         topk_weights = routing_weights.reshape(-1, self.num_experts_per_tok).contiguous()
         if int(topk_ids.shape[0]) != int(flat_hidden.shape[0]):
             raise ValueError("kt_direct selected_experts batch size does not match hidden_states")
@@ -618,14 +945,14 @@ class KtDirectCpuMoeBackend:
         prep_ms = (perf_counter() - prep_t0) * 1000.0
 
         compute_t0 = perf_counter()
-        task = self.moe.forward_task(
-            batch_size_cpu[slot].data_ptr(),
-            self.num_experts_per_tok,
-            expert_ids_cpu[slot].data_ptr(),
-            routing_weights_cpu[slot].data_ptr(),
-            input_cpu[slot].data_ptr(),
-            output_cpu[slot].data_ptr(),
-            False,
+        task = KtDirectCpuMoeBackend._make_forward_task(
+            self,
+            batch_size_ptr=batch_size_cpu[slot].data_ptr(),
+            top_k=self.num_experts_per_tok,
+            expert_ids_ptr=expert_ids_cpu[slot].data_ptr(),
+            routing_weights_ptr=routing_weights_cpu[slot].data_ptr(),
+            input_ptr=input_cpu[slot].data_ptr(),
+            output_ptr=output_cpu[slot].data_ptr(),
         )
         if flat_hidden.is_cuda:
             stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
@@ -653,6 +980,8 @@ class KtDirectCpuMoeBackend:
         hidden_states: torch.Tensor,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
+        *,
+        include_gpu_cached_routes: bool = False,
     ) -> int:
         """Submit kt_direct CPU work for CUDA graph capture/replay.
 
@@ -660,6 +989,8 @@ class KtDirectCpuMoeBackend:
         """
         flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
         topk_ids = selected_experts.reshape(-1, self.num_experts_per_tok).contiguous()
+        if not include_gpu_cached_routes:
+            topk_ids = KtDirectCpuMoeBackend._cpu_topk_ids(self, topk_ids)
         topk_weights = routing_weights.reshape(-1, self.num_experts_per_tok).contiguous()
 
         (
@@ -679,14 +1010,14 @@ class KtDirectCpuMoeBackend:
             routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)
 
         with verify_op_event("kt.forward_task_create", self.layer_idx):
-            task = self.moe.forward_task(
-                batch_size_cpu[slot].data_ptr(),
-                self.num_experts_per_tok,
-                expert_ids_cpu[slot].data_ptr(),
-                routing_weights_cpu[slot].data_ptr(),
-                input_cpu[slot].data_ptr(),
-                output_cpu[slot].data_ptr(),
-                False,
+            task = KtDirectCpuMoeBackend._make_forward_task(
+                self,
+                batch_size_ptr=batch_size_cpu[slot].data_ptr(),
+                top_k=self.num_experts_per_tok,
+                expert_ids_ptr=expert_ids_cpu[slot].data_ptr(),
+                routing_weights_ptr=routing_weights_cpu[slot].data_ptr(),
+                input_ptr=input_cpu[slot].data_ptr(),
+                output_ptr=output_cpu[slot].data_ptr(),
             )
         stream = torch.cuda.current_stream(flat_hidden.device).cuda_stream
         with verify_op_event("kt.cpuinfer_submit", self.layer_idx):

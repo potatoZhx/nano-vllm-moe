@@ -282,11 +282,23 @@ class ModelRunner:
                 kt_threadpool_count=getattr(config, "kt_threadpool_count", 1),
                 kt_chunked_prefill_size=getattr(config, "kt_chunked_prefill_size", 4096),
                 kt_direct_backend=getattr(config, "kt_direct_backend", "auto"),
+                kt_llamafile_extension_path=getattr(
+                    config, "kt_llamafile_extension_path", ""
+                ),
                 kt_numa_nodes=getattr(config, "kt_numa_nodes", None) or None,
                 kt_capture_bs=getattr(config, "kt_capture_bs", None),
                 draft_reroute_policy=getattr(config, "draft_reroute_policy", "round_robin"),
                 draft_reroute_profile=draft_reroute_profile,
             )
+            exact_f16_q2_cpu_all_routes = (
+                str(getattr(config, "inference_mode", "")) == "heter"
+                and str(getattr(config, "kt_direct_backend", ""))
+                == "llamafile_f16"
+            )
+            if hasattr(self.model, "set_graph_kt_cpu_all_routes_batch_sizes"):
+                self.model.set_graph_kt_cpu_all_routes_batch_sizes(
+                    {2} if exact_f16_q2_cpu_all_routes else set()
+                )
             self.draft_scheduler = create_draft_scheduler(getattr(config, "draft_scheduler", "simple"))
             self.prefetch_effective_enabled = bool(config.spec_enable_prefetch) and config.inference_mode == "spec"
 
@@ -2260,8 +2272,32 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        available_bytes = int(
+            total * config.gpu_memory_utilization - used - peak + current
+        )
+        config.num_kvcache_blocks = available_bytes // block_bytes
+        # Keep the sizing inputs on the rank-0 Config object.  Workload drivers
+        # can then reject an impossible prompt/output pair before decode reaches
+        # an opaque block-table failure.
+        config.kvcache_block_bytes = int(block_bytes)
+        config.gpu_total_memory_bytes = int(total)
+        if config.num_kvcache_blocks <= 0:
+            raise RuntimeError(
+                "KV cache allocation has no usable blocks: "
+                f"available_bytes={available_bytes}, block_bytes={block_bytes}, "
+                f"gpu_memory_utilization={config.gpu_memory_utilization}. "
+                "Increase gpu_memory_utilization or reduce GPU expert/model memory."
+            )
+        if self.rank == 0:
+            print(
+                "[kv_cache] "
+                f"blocks={config.num_kvcache_blocks} "
+                f"block_size={self.block_size} "
+                f"capacity_tokens={config.num_kvcache_blocks * self.block_size} "
+                f"block_mib={block_bytes / (1024 ** 2):.2f} "
+                f"gpu_memory_utilization={config.gpu_memory_utilization:.4f}",
+                flush=True,
+            )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -4539,6 +4575,8 @@ class ModelRunner:
             for batch_size in [1, 2, 4, 8]
             if batch_size <= max_bs
         ] + list(range(16, max_bs + 1, 16))
+        if self.graph_bs and self.graph_bs[-1] < max_bs:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 
@@ -4628,9 +4666,37 @@ class ModelRunner:
         if max_bs >= 16:
             self.draft_graph_bs += list(range(16, max_bs + 1, 16))
         self.draft_graph_bs = sorted(set(self.draft_graph_bs))
+        if self.draft_graph_bs and self.draft_graph_bs[-1] < max_bs:
+            self.draft_graph_bs.append(max_bs)
 
         if not self.draft_graph_bs:
             return
+
+        # DraftReroutePolicy.forward is compiled once at the Python code-object
+        # level, while its lifted slot_to_expert_lut buffer is specialized for
+        # every distinct per-layer slot width and every captured batch shape.
+        # CUDA graph capture temporarily turns a Dynamo cache-limit fallback
+        # into a hard error.  Batch-one happens to fit under PyTorch's default
+        # limit of eight variants; true batches do not (for example, three
+        # graph shapes x six slot widths on the 7.5% placement).  These are
+        # intentional bounded specializations, so size the cache from the
+        # shapes that this runner is about to capture.
+        if getattr(self.config, "draft_reroute_policy", "round_robin") != "round_robin":
+            slot_widths = {
+                int(getattr(layer_cache, "num_slots", 0))
+                for layer_cache in getattr(self, "layer_caches", {}).values()
+                if int(getattr(layer_cache, "num_slots", 0)) > 0
+            }
+            expected_variants = len(self.draft_graph_bs) * max(1, len(slot_widths))
+            required_limit = max(64, expected_variants + 8)
+            torch._dynamo.config.recompile_limit = max(
+                int(torch._dynamo.config.recompile_limit),
+                required_limit,
+            )
+            torch._dynamo.config.accumulated_recompile_limit = max(
+                int(torch._dynamo.config.accumulated_recompile_limit),
+                required_limit * 4,
+            )
 
         if self._draft_segment_graph_enabled():
             self._capture_draft_segment_cudagraph(

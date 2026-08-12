@@ -98,6 +98,14 @@ class BlockManager:
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
             assert last_block.hash != -1
+            if not self.free_block_ids:
+                raise RuntimeError(
+                    "KV cache exhausted while appending a token: "
+                    f"allocated_blocks={len(self.blocks)}, "
+                    f"sequence_tokens={len(seq)}, block_size={self.block_size}. "
+                    "Increase gpu_memory_utilization, reduce GPU expert cache, "
+                    "or shorten the prompt/output length."
+                )
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)

@@ -342,6 +342,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         self.spec_verify_miss_policy = "cpu"
         self.cache_strategy = "lru"
         self._parallel_stream: torch.cuda.Stream | None = None
+        self.graph_kt_cpu_all_routes_batch_sizes: frozenset[int] = frozenset()
         self._last_profile: dict[str, float] = {}
         # Updated by the graph-capturable KT-direct hybrid path.  Keeping these
         # as fixed-shape device buffers lets the standard decode graph expose
@@ -385,6 +386,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
         kt_direct_backend: str = "auto",
+        kt_llamafile_extension_path: str = "",
         kt_numa_nodes: list[int] | None = None,
         kt_capture_bs: list[int] | None = None,
         draft_reroute_policy: str = ROUND_ROBIN,
@@ -452,6 +454,7 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 kt_threadpool_count=kt_threadpool_count,
                 kt_chunked_prefill_size=kt_chunked_prefill_size,
                 kt_direct_backend=kt_direct_backend,
+                kt_llamafile_extension_path=kt_llamafile_extension_path,
                 kt_numa_nodes=kt_numa_nodes,
                 kt_capture_bs=kt_capture_bs,
                 strict_dtype=cpu_expert_strict_dtype,
@@ -527,6 +530,23 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
                 else:
                     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
             routing_weights = routing_weights.to(hidden_states.dtype)
+
+        if int(hidden_states.shape[0]) in self.graph_kt_cpu_all_routes_batch_sizes:
+            # For the legacy F16 qlen=2 kernel, a mixed list containing masked
+            # (-1) GPU-cache routes defeats the grouped-MoE fast path and is
+            # less stable than computing the complete top-k on CPU.  CPUInfer
+            # owns every expert, so this is an exact execution alternative.
+            self._graph_kt_cpu_route_count.fill_(selected_experts.numel())
+            self._graph_kt_active_route_count.fill_(selected_experts.numel())
+            with verify_op_event("moe.cpu_submit", layer_idx):
+                self.cpu_backend.begin_forward_graph_verify(
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    include_gpu_cached_routes=True,
+                )
+            with verify_op_event("moe.cpu_sync_copy", layer_idx):
+                return self.cpu_backend.finish_forward_graph_verify(hidden_states)
         profile["route_ms"] = (perf_counter() - t_route0) * 1000.0
 
         if self.runtime_meta_recorder is not None:
@@ -1286,6 +1306,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         kt_threadpool_count: int = 1,
         kt_chunked_prefill_size: int = 4096,
         kt_direct_backend: str = "auto",
+        kt_llamafile_extension_path: str = "",
         kt_numa_nodes: list[int] | None = None,
         kt_capture_bs: list[int] | None = None,
         draft_reroute_policy: str = ROUND_ROBIN,
@@ -1327,6 +1348,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     kt_threadpool_count=kt_threadpool_count,
                     kt_chunked_prefill_size=kt_chunked_prefill_size,
                     kt_direct_backend=kt_direct_backend,
+                    kt_llamafile_extension_path=kt_llamafile_extension_path,
                     kt_numa_nodes=kt_numa_nodes,
                     kt_capture_bs=kt_capture_bs,
                     draft_reroute_policy=draft_reroute_policy,
@@ -1350,6 +1372,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
                 layer.mlp.set_speculative_execution(mode, draft_scheduler, draft_top_c)
+
+    def set_graph_kt_cpu_all_routes_batch_sizes(self, batch_sizes: set[int]) -> None:
+        resolved = frozenset(int(size) for size in batch_sizes if int(size) > 0)
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeHeterogeneousSparseMoeBlock):
+                layer.mlp.graph_kt_cpu_all_routes_batch_sizes = resolved
 
     def set_draft_cpu_graph_mode(self, enabled: bool) -> None:
         for layer in self.model.layers:
