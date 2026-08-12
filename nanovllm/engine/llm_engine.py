@@ -1,9 +1,11 @@
 import atexit
+import gc
 from dataclasses import fields
 from collections import defaultdict
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -179,11 +181,26 @@ class LLMEngine:
         if model_runner is None:
             return
 
-        model_runner.call("exit")
-        self.model_runner = None
-        for p in self.ps:
-            if p.is_alive():
-                p.join()
+        try:
+            atexit.unregister(self.exit)
+            model_runner.call("exit")
+            for p in self.ps:
+                if p.is_alive():
+                    p.join()
+        finally:
+            # The bound atexit callback and SpeculativeEngine both retain the
+            # rank-0 ModelRunner (and therefore every model/CUDA-graph tensor).
+            # Drop those references before constructing another engine in the
+            # same benchmark process, then return cached blocks to CUDA.
+            self.model_runner = None
+            self.spec_engine = None
+            self.scheduler = None
+            self.ps = []
+            self.events = []
+            del model_runner
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

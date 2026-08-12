@@ -1,6 +1,7 @@
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from nanovllm.engine.llm_engine import LLMEngine
 
@@ -56,6 +57,33 @@ class _DummySpec:
 
 
 class TestLLMEngineModeDispatch(unittest.TestCase):
+    def test_exit_releases_runner_and_engine_references(self):
+        calls = []
+        runner = SimpleNamespace(call=lambda name: calls.append(name))
+        eng = object.__new__(LLMEngine)
+        eng.model_runner = runner
+        eng.spec_engine = SimpleNamespace(model_runner=runner)
+        eng.scheduler = object()
+        eng.ps = []
+        eng.events = [object()]
+
+        with (
+            patch("nanovllm.engine.llm_engine.atexit.unregister"),
+            patch("nanovllm.engine.llm_engine.gc.collect"),
+            patch("nanovllm.engine.llm_engine.torch.cuda.is_available", return_value=True),
+            patch("nanovllm.engine.llm_engine.torch.cuda.empty_cache") as empty_cache,
+        ):
+            eng.exit()
+            eng.exit()
+
+        self.assertEqual(calls, ["exit"])
+        self.assertIsNone(eng.model_runner)
+        self.assertIsNone(eng.spec_engine)
+        self.assertIsNone(eng.scheduler)
+        self.assertEqual(eng.ps, [])
+        self.assertEqual(eng.events, [])
+        empty_cache.assert_called_once_with()
+
     def test_spec_mode_dispatches_to_spec_engine(self):
         seqs = [SimpleNamespace(seq_id=1, is_finished=False, completion_token_ids=[])]
         eng = object.__new__(LLMEngine)
