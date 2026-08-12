@@ -12,11 +12,13 @@
 
 - 当前单请求最终配置为 **single-weight + llamafile F16 + fixed K1 +
   verify prefetch budget 2**。三次独立 engine、每次 512 个固定输出 token 的完整
-  decode 墙钟 TPOT 为 `69.682 / 73.837 / 70.689 ms/token`，均值
-  **71.403 ms/token**、population std `1.770 ms`，输出长度和语义检查通过。相对
-  KTransformers 最可靠的 BF16 `122.35 ms/token` 快 **41.6%（1.71×）**；相对其
-  历史 F16 `81.90 ms/token` 快 **12.8%（1.15×）**；相对本页此前 single-weight
-  BF16 K3 的 `91.287 ms/token` 再快 **21.8%（1.28×）**。F16 KT 行的线程数、
+  decode 墙钟 TPOT 为 `72.631 / 70.026 / 67.620 ms/token`，均值
+  **70.092 ms/token**。这是 segment 16 相对 segment 12 三次配对均值
+  `71.403 ms/token` 的 **1.84%** 小幅改进，3 个 seed 中 2 个更快；输出长度验证
+  均通过。相对
+  KTransformers 最可靠的 BF16 `122.35 ms/token` 快 **42.7%（1.75×）**；相对其
+  历史 F16 `81.90 ms/token` 快 **14.4%（1.17×）**；相对本页此前 single-weight
+  BF16 K3 的 `91.287 ms/token` 再快 **23.2%（1.30×）**。F16 KT 行的线程数、
   prompt 和原始日志
   留存方式不同，因此同 dtype 百分比是当前最严格参考，不是逐 token 配对 A/B。
 - 单请求、BF16、K3、512 个固定输出 token：nano 完整请求墙钟 TPOT
@@ -105,6 +107,18 @@ preset。结果位于：
 - `results/single_weight_f16_k1_vpb{1,2,3}_256/`
 - `results/single_weight_f16_k1_vpb2_512/`
 - `results/single_weight_f16_k1_vpb2_512_repeats3/`
+- `results/single_weight_f16_k1_vpb2_segment16_512_repeats3{,_r2}/`
+
+### Segment boundary 筛选
+
+对 48 层 forward 的 segment 8/12/16 做筛选。segment 8 为 `76.669 ms/token`，
+增加 graph/prefetch boundary 且为负收益；segment 16 的 256-token TPOT 为
+`70.942 ms/token`，per-verify step 从 segment 12 的 `122.899 ms` 降到
+`118.189 ms`，prefetch submit 从 2284 降到 1892。三次 512-token 配对中，
+segment 16 为 `72.631 / 70.026 / 67.620 ms/token`，均值 **70.092 ms/token**；
+segment 12 为 `69.682 / 73.837 / 70.689 ms/token`，均值 **71.403 ms/token**。
+均值改善 1.84%，但 repeat 0 回退 2.949 ms，因此这里只认定为小幅正收益，而非稳定
+大幅提升。最终 preset 已改用 segment 16。
 
 ### Top-k/top-p 与当前 KT F16 复测
 
@@ -123,7 +137,7 @@ preset。结果位于：
 top-k 20、top-p 0.95、16 CPUInfer 线程；KT 的 chat/tokenizer 包装后 prompt 为
 79 token（nano raw tokenizer 为 67），生成 64 token。61-step stable graph replay
 为 **125.886 ms/token**，p50 `101.326 ms`、p95 `269.842 ms`；nano 最终
-`71.403 ms/token` 的三次均值相比快 **43.3%（1.76×）**。这个当前复测比历史 F16
+`70.092 ms/token` 的三次均值相比快 **44.3%（1.80×）**。这个当前复测比历史 F16
 `81.90 ms/token` 慢得多且尾延迟较大，因此正文仍同时报告历史 81.90 这一更保守
 参考；无论使用哪个 F16 KT 基线，nano 当前结果都更快。
 
@@ -360,7 +374,7 @@ nano 批测使用从同一模型 BF16 safetensors 转成 F16 后交给相同的 
 | nano fixed legacy K3，temp 0.8 | llamafile BF16 | 无外层绑核 | 3 | 512 | 116.695 ms |
 | **nano fixed legacy K3，temp 0.6** | llamafile BF16 | 无外层绑核 | 3 | 512 | **109.946 ms** |
 | nano single-weight K3，temp 0.6 | llamafile BF16 | 无外层绑核 | 3 | 512 | 91.287 ms |
-| **nano single-weight K1/vpb2，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **71.403 ms** |
+| **nano single-weight K1/vpb2/seg16，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **70.092 ms** |
 | KTransformers BF16 stable replay | fixed legacy BF16 | CPUInfer 自绑核 | 0 | 64 | 122.35 ms |
 | KTransformers 当日 F16 stable replay | fixed legacy F16 | CPUInfer 16 线程 | 0 | 64 | 125.886 ms |
 | KTransformers 历史 F16 stable replay | fixed legacy F16 | CPUInfer 20 线程 | 0 | 64 | 81.90 ms |
@@ -551,3 +565,5 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
 - `c07ed02`：top-k/top-p 精确 speculative sampling 对齐；
   `docs/optimization_commits/20260812_03_sampling_alignment.md`。该提交是比较正确性功能，
   其过滤配置实测为负收益，未纳入最终性能 preset。
+- 本提交：segment 16 boundary schedule；
+  `docs/optimization_commits/20260812_05_segment16.md`。

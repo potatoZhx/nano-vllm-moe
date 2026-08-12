@@ -65,7 +65,7 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
         "allocation_modes": "profile_weighted",
         "cache_ratios": "0.075",
         "max_draft_tokens_values": "1",
-        "segment_sizes": "12",
+        "segment_sizes": "16",
         "verify_prefetch_max_per_boundary": 2,
         "draft_stop_policy": "none",
         "acceptance_predictor_enabled": False,
