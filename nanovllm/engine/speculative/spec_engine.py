@@ -1025,6 +1025,8 @@ class SpeculativeEngine:
                 verify_result,
                 seq.temperature,
                 draft_logits,
+                getattr(seq, "top_k", 0),
+                getattr(seq, "top_p", 1.0),
             )
             num_accepted = int(accept_result["num_accepted"])
 

@@ -106,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
             llm,
             temperature=float(args.temperature),
             prompt=str(args.warmup_prompt),
+            top_k=int(args.top_k),
+            top_p=float(args.top_p),
         )
         samples = load_dataset_samples(str(case["dataset"]), args)
         if not samples:
@@ -162,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_tokens,
                 batch_size=batch_size,
                 temperature=float(args.temperature),
+                top_k=int(args.top_k),
+                top_p=float(args.top_p),
                 max_tokens=batch_warmup_output_tokens,
                 ignore_eos=True,
                 eos_token_id=getattr(llm.config, "eos", None),
@@ -174,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_tokens,
                 batch_size=batch_size,
                 temperature=float(args.temperature),
+                top_k=int(args.top_k),
+                top_p=float(args.top_p),
                 max_tokens=max_tokens,
                 ignore_eos=bool(case.get("ignore_eos", False)),
                 eos_token_id=getattr(llm.config, "eos", None),
@@ -197,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
                     "max_output_tokens": max_tokens,
                     "max_draft_tokens": int(case["max_draft_tokens"]),
                     "temperature": float(args.temperature),
+                    "top_k": int(args.top_k),
+                    "top_p": float(args.top_p),
                     "batch_warmup_output_tokens": batch_warmup_output_tokens,
                 }
             )
@@ -220,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             "max_draft_tokens": int(case["max_draft_tokens"]),
             "batch_sizes": batch_sizes,
             "temperature": float(args.temperature),
+            "top_k": int(args.top_k),
+            "top_p": float(args.top_p),
             "batch_warmup_output_tokens": min(32, max_tokens),
             "cache_ratio": float(case["cache_ratio"]),
             "verify_buckets": parse_csv(args.verify_cuda_graph_bucket_steps, int),

@@ -110,6 +110,8 @@ def run_case(
                 llm,
                 temperature=float(args.temperature),
                 prompt=str(args.warmup_prompt),
+                top_k=int(args.top_k),
+                top_p=float(args.top_p),
             )
         else:
             llm.config.max_draft_tokens = int(case["max_draft_tokens"])
@@ -200,6 +202,8 @@ def run_case(
                         prompt_tokens,
                         batch_size=int(args.batch_size),
                         temperature=float(args.temperature),
+                        top_k=int(args.top_k),
+                        top_p=float(args.top_p),
                         max_tokens=max_tokens,
                         ignore_eos=ignore_eos,
                         eos_token_id=getattr(llm.config, "eos", None),
@@ -215,6 +219,8 @@ def run_case(
                         llm,
                         prompt_tokens,
                         temperature=float(args.temperature),
+                        top_k=int(args.top_k),
+                        top_p=float(args.top_p),
                         max_tokens=max_tokens,
                         ignore_eos=ignore_eos,
                         eos_token_id=getattr(llm.config, "eos", None),
@@ -507,6 +513,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     llm,
                     temperature=float(args.temperature),
                     prompt=str(args.warmup_prompt),
+                    top_k=int(args.top_k),
+                    top_p=float(args.top_p),
                 )
                 reset_llm_profile(llm)
                 for case_index, case in group:
@@ -589,6 +597,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "max_draft_tokens_values": _parse_csv(args.max_draft_tokens_values, int),
             "segment_sizes": _parse_csv(args.segment_sizes, int),
             "temperature": float(args.temperature),
+            "top_k": int(args.top_k),
+            "top_p": float(args.top_p),
             "tpot_definition": TPOT_DEFINITION,
             "acceptance_strategy": str(args.acceptance_strategy),
             "acceptance_predictor_enabled": bool(

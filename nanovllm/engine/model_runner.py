@@ -2372,10 +2372,14 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
+        top_ks = []
+        top_ps = []
         for seq in seqs:
             temperatures.append(seq.temperature)
+            top_ks.append(seq.top_k)
+            top_ps.append(seq.top_p)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        return temperatures, top_ks, top_ps
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -2676,7 +2680,7 @@ class ModelRunner:
             self._profile["decode_count"] += int(not is_prefill)
 
         t0 = perf_counter()
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        sample_params = self.prepare_sample(seqs) if self.rank == 0 else None
         dt = perf_counter() - t0
         self._record_profile("prepare_sample_ms", dt)
         self._record_profile(f"prepare_sample_{phase}_ms", dt)
@@ -2699,7 +2703,7 @@ class ModelRunner:
             )
             else None
         )
-        sampled = self.sampler(logits, temperatures) if self.rank == 0 else None
+        sampled = self.sampler(logits, *sample_params) if self.rank == 0 else None
         self._finish_latency_cuda_timing("draft_sample", sample_timing)
         token_ids = sampled.tolist() if sampled is not None else None
         self._poll_latency_cuda_timings(block=False)

@@ -36,6 +36,22 @@ def test_parse_args_resolves_preset_and_manual_overrides(tmp_path):
     assert args._optimized_config_applied["manual_overrides"]["cache_ratios"] == "0.075"
 
 
+def test_parse_args_accepts_ktransformers_sampling_filters(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--top-k",
+            "20",
+            "--top-p",
+            "0.95",
+        ]
+    )
+
+    assert args.top_k == 20
+    assert args.top_p == 0.95
+
+
 def test_k3_3080_preset_encodes_measured_low_latency_topology(tmp_path):
     args = parse_args(
         [

@@ -249,10 +249,23 @@ def create_llm(args: argparse.Namespace, case: dict[str, Any], case_index: int) 
     return LLM(args.model_path, **kwargs)
 
 
-def warmup_llm(llm: Any, *, temperature: float, prompt: str) -> None:
+def warmup_llm(
+    llm: Any,
+    *,
+    temperature: float,
+    prompt: str,
+    top_k: int = 0,
+    top_p: float = 1.0,
+) -> None:
     from nanovllm import SamplingParams
 
-    sampling = SamplingParams(temperature=temperature, ignore_eos=True, max_tokens=4)
+    sampling = SamplingParams(
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        ignore_eos=True,
+        max_tokens=4,
+    )
     llm.generate([prompt], sampling, use_tqdm=False)
 
 

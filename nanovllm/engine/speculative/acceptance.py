@@ -6,6 +6,8 @@ import os
 
 import torch
 
+from nanovllm.layers.sampler import filtered_sampling_probs
+
 
 class AcceptanceStrategy(ABC):
     @abstractmethod
@@ -15,6 +17,8 @@ class AcceptanceStrategy(ABC):
         verify_data: torch.Tensor | Sequence[int],
         temperature: float,
         draft_data: torch.Tensor | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> dict:
         raise NotImplementedError
 
@@ -32,8 +36,10 @@ class GreedyAcceptance(AcceptanceStrategy):
         verify_data: torch.Tensor | Sequence[int],
         temperature: float,
         draft_data: torch.Tensor | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> dict:
-        _ = draft_data
+        _ = draft_data, top_k, top_p
         verify_argmax = _to_verify_trace(verify_data)
         num_accepted = 0
         for i, tok in enumerate(draft_tokens):
@@ -58,9 +64,15 @@ def _sample_from_probs(probs: torch.Tensor) -> int:
     return int(torch.multinomial(probs, num_samples=1).item())
 
 
-def _temperature_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    safe_temperature = max(float(temperature), 1e-10)
-    return torch.softmax(logits.float() / safe_temperature, dim=-1)
+def _temperature_probs(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: int = 0,
+    top_p: float = 1.0,
+) -> torch.Tensor:
+    return filtered_sampling_probs(
+        logits, temperature, top_k=top_k, top_p=top_p
+    )
 
 
 class StandardAcceptance(AcceptanceStrategy):
@@ -73,8 +85,10 @@ class StandardAcceptance(AcceptanceStrategy):
         verify_data: torch.Tensor | Sequence[int],
         temperature: float,
         draft_data: torch.Tensor | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> dict:
-        _ = draft_data
+        _ = draft_data, top_k, top_p
         if not isinstance(verify_data, torch.Tensor):
             trace = _to_verify_trace(verify_data)
             num_accepted = 0
@@ -117,15 +131,19 @@ class StandardSamplingAcceptance(AcceptanceStrategy):
         verify_data: torch.Tensor | Sequence[int],
         temperature: float,
         draft_data: torch.Tensor | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> dict:
         if float(temperature) <= 1e-10 or not isinstance(verify_data, torch.Tensor):
-            return GreedyAcceptance().accept(draft_tokens, verify_data, temperature, draft_data)
+            return GreedyAcceptance().accept(
+                draft_tokens, verify_data, temperature, draft_data, top_k, top_p
+            )
 
         if verify_data.dim() != 2:
             raise ValueError("verify_data must be a [positions, vocab] tensor")
         if verify_data.size(0) < 1:
             raise ValueError("verify_data must include at least the next-token position")
-        target_probs = _temperature_probs(verify_data, temperature)
+        target_probs = _temperature_probs(verify_data, temperature, top_k, top_p)
 
         if not draft_tokens:
             return {
@@ -143,7 +161,9 @@ class StandardSamplingAcceptance(AcceptanceStrategy):
         if draft_data.size(0) < len(draft_tokens):
             raise ValueError("draft_data must include one logits row per draft token")
 
-        draft_probs = _temperature_probs(draft_data[: len(draft_tokens)], temperature)
+        draft_probs = _temperature_probs(
+            draft_data[: len(draft_tokens)], temperature, top_k, top_p
+        )
         trace_probs = bool(os.getenv("NANOVLLM_ACCEPTANCE_TRACE_PROBS", "").strip())
         accept_probs_trace: list[float] | None = None
         if trace_probs:

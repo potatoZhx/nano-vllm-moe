@@ -119,6 +119,8 @@ def run_prompt(
     prompt_tokens: list[int],
     *,
     temperature: float,
+    top_k: int = 0,
+    top_p: float = 1.0,
     max_tokens: int,
     ignore_eos: bool,
     eos_token_id: int | None,
@@ -128,6 +130,8 @@ def run_prompt(
 
     sampling = SamplingParams(
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         ignore_eos=ignore_eos,
         max_tokens=max_tokens,
     )
@@ -182,6 +186,8 @@ def run_prompt_generate(
     prompt_tokens: list[int],
     *,
     temperature: float,
+    top_k: int = 0,
+    top_p: float = 1.0,
     max_tokens: int,
     ignore_eos: bool,
     eos_token_id: int | None,
@@ -191,6 +197,8 @@ def run_prompt_generate(
 
     sampling = SamplingParams(
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         ignore_eos=ignore_eos,
         max_tokens=max_tokens,
     )
@@ -349,6 +357,8 @@ def run_prompt_batch_generate(
     *,
     batch_size: int,
     temperature: float,
+    top_k: int = 0,
+    top_p: float = 1.0,
     max_tokens: int,
     ignore_eos: bool,
     eos_token_id: int | None,
@@ -362,6 +372,8 @@ def run_prompt_batch_generate(
         raise ValueError("batch_size must be positive")
     sampling = SamplingParams(
         temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         ignore_eos=ignore_eos,
         max_tokens=max_tokens,
     )

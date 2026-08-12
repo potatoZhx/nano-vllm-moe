@@ -91,6 +91,28 @@ class TestAcceptanceStrategies(unittest.TestCase):
         self.assertEqual(out["next_token"], 1)
         self.assertTrue(out["rejected"])
 
+    def test_standard_sampling_uses_same_top_k_distribution_for_p_and_q(self):
+        draft_tokens = [1]
+        draft_logits = torch.tensor([[0.0, 5.0, 4.0, 3.0]])
+        verify_logits = torch.tensor([
+            [0.0, 5.0, 4.0, 3.0],
+            [0.0, 1.0, 2.0, 6.0],
+        ])
+        strategy = StandardSamplingAcceptance()
+
+        out = strategy.accept(
+            draft_tokens,
+            verify_logits,
+            temperature=1.0,
+            draft_data=draft_logits,
+            top_k=1,
+            top_p=0.95,
+        )
+
+        self.assertEqual(out["num_accepted"], 1)
+        self.assertEqual(out["next_token"], 3)
+        self.assertFalse(out["rejected"])
+
 
 if __name__ == "__main__":
     unittest.main()

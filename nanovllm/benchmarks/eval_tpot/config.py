@@ -600,6 +600,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-strategy", default="lru")
     parser.add_argument("--draft-reroute-policy", default="entropy_cache_bias")
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Sampling vocabulary cap; 0 disables top-k filtering.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling probability in (0, 1].",
+    )
     parser.add_argument("--acceptance-strategy", default="standard_sampling")
     parser.add_argument("--acceptance-threshold", type=float, default=0.7)
     parser.add_argument(
@@ -912,6 +924,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.save_profile_json = True
     if args.num_samples < 0:
         raise ValueError("--num-samples must be >= 0 or all")
+    if int(args.top_k) < 0:
+        raise ValueError("--top-k must be non-negative")
+    if not 0.0 < float(args.top_p) <= 1.0:
+        raise ValueError("--top-p must be in (0, 1]")
     if args.repeats < 1:
         raise ValueError("--repeats must be at least 1")
     if args.batch_size < 1:
