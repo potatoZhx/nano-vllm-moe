@@ -2213,9 +2213,15 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        token_budget = int(getattr(self.config, "warmup_model_tokens", 0))
+        if token_budget <= 0:
+            token_budget = int(self.config.max_num_batched_tokens)
+        seq_len = min(token_budget, int(self.config.max_model_len))
+        num_seqs = max(
+            1,
+            min(token_budget // seq_len, int(self.config.max_num_seqs)),
+        )
+        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         self._warmup_verify_layer_timings()
         torch.cuda.empty_cache()

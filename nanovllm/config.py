@@ -10,6 +10,12 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
+    # Total synthetic prefill tokens used to profile transient CUDA memory
+    # before sizing the KV cache.  Zero preserves the legacy
+    # max_num_batched_tokens behavior.  Deployments may set this to their
+    # largest unchunked prefill workload while retaining a longer decode
+    # context in max_model_len.
+    warmup_model_tokens: int = 0
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     dist_port: int = 2333
@@ -421,3 +427,4 @@ class Config:
             )
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        assert self.warmup_model_tokens >= 0

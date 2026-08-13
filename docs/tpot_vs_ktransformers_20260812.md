@@ -141,6 +141,17 @@ projection shape 独立测得 decode tiling 并直调底层 JIT 后，active12/c
 更快，故只视为小幅 mean 优化；完整配置、正确性和不利数据见
 `docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。
 
+### Workload-sized CUDA memory warmup
+
+旧初始化按 `max_model_len=8192` 做一条 8192-token synthetic prefill，远大于本测试的
+67-token prompt，并把该瞬时峰值用于 KV cache sizing。新增独立
+`warmup_model_tokens` 后，最终 preset 用 1024-token 峰值测量但仍保留
+`max_model_len=8192`。active12 的 KV capacity 从 8 blocks / 2048 tokens 增到
+49 blocks / 12544 tokens；256-token 筛选从 67.881 降至 66.396 ms/token，生成长度
+与输出校验通过。单次 TPOT 不并入最终三次均值；该配置只适用于最大未分块 prefill
+不超过 1024 token 的工作负载。完整证据见
+`docs/optimization_commits/20260813_08_workload_sized_warmup.md`。
+
 ### Top-k/top-p 与当前 KT F16 复测
 
 为了缩小采样口径差异，nano 新增了 `SamplingParams.top_k/top_p` 及 benchmark
@@ -592,3 +603,5 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
   `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。
 - 本提交：decode-aware Qwen3 fixed grouped GEMM；
   `docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。
+- 本提交：workload-sized CUDA memory warmup；
+  `docs/optimization_commits/20260813_08_workload_sized_warmup.md`。

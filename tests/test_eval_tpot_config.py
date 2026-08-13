@@ -98,9 +98,26 @@ def test_k1_f16_3080_preset_encodes_measured_tpot_optimum(tmp_path):
     assert args.acceptance_predictor_enabled is False
     assert args.cpu_expert_pin_memory is False
     assert args.gpu_memory_utilization == 0.996
+    assert args.warmup_model_tokens == 1024
 
     env = configure_optimized_env(args)
     assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
+
+
+def test_manual_warmup_model_tokens_override_preset(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k1_f16_3080",
+            "--warmup-model-tokens",
+            "2048",
+        ]
+    )
+
+    assert args.warmup_model_tokens == 2048
+    assert args._optimized_config_applied["manual_overrides"]["warmup_model_tokens"] == 2048
 
 
 def test_parse_args_rejects_verify_buckets_that_force_eager_fallback(tmp_path):

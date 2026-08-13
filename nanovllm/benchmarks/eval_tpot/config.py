@@ -80,6 +80,7 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
         "verify_cuda_graph_bucket_steps": "2",
         "verify_prefetch_rank_multiplier": 1,
         "gpu_memory_utilization": 0.996,
+        "warmup_model_tokens": 1024,
         "decode_driver": "generate",
         "reset_seed_after_warmup": True,
     },
@@ -244,6 +245,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "verify_cuda_graph_bucket_steps": "--verify-cuda-graph-bucket-steps",
         "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
         "gpu_memory_utilization": "--gpu-memory-utilization",
+        "warmup_model_tokens": "--warmup-model-tokens",
         "decode_driver": "--decode-driver",
         "reset_seed_after_warmup": "--reset-seed-after-warmup",
     }
@@ -793,6 +795,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument(
+        "--warmup-model-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Total synthetic prefill tokens used for CUDA memory profiling. "
+            "0 preserves the legacy max-num-batched-tokens behavior. Set this "
+            "no lower than the largest unchunked prefill in the workload."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
@@ -939,6 +951,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         raise ValueError("--repeats must be at least 1")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.warmup_model_tokens < 0:
+        raise ValueError("--warmup-model-tokens must be at least 0")
     if args.repeat_index_offset < 0:
         raise ValueError("--repeat-index-offset must be >= 0")
     return args
