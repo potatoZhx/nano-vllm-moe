@@ -2,7 +2,7 @@
 
 日期：2026-08-12  
 硬件：RTX 3080 10 GiB，2 × Xeon Gold 5218R（2 NUMA，40 物理核）  
-模型：Qwen3-30B-A3B，GPU expert cache ratio `0.075`
+模型：Qwen3-30B-A3B，最终 GPU expert cache ratio `0.09375`
 
 ## 结论
 
@@ -11,14 +11,14 @@
 `K=6` 的影响。修正后：
 
 - 当前单请求最终配置为 **single-weight + llamafile F16 + fixed K1 +
-  verify prefetch budget 2**。三次独立 engine、每次 512 个固定输出 token 的完整
-  decode 墙钟 TPOT 为 `72.631 / 70.026 / 67.620 ms/token`，均值
-  **70.092 ms/token**。这是 segment 16 相对 segment 12 三次配对均值
-  `71.403 ms/token` 的 **1.84%** 小幅改进，3 个 seed 中 2 个更快；输出长度验证
-  均通过。相对
-  KTransformers 最可靠的 BF16 `122.35 ms/token` 快 **42.7%（1.75×）**；相对其
-  历史 F16 `81.90 ms/token` 快 **14.4%（1.17×）**；相对本页此前 single-weight
-  BF16 K3 的 `91.287 ms/token` 再快 **23.2%（1.30×）**。F16 KT 行的线程数、
+  verify prefetch budget 2 + segment16 + active12/staging0**。三次独立 engine、每次
+  512 个固定输出 token 的完整 decode 墙钟 TPOT 为
+  `69.914 / 64.984 / 64.623 ms/token`，均值 **66.507 ms/token**。相对上一版
+  active10/staging2 的配对均值 `70.092 ms/token` 降低 **5.11%**，三个 seed 全部
+  正收益；输出长度验证均通过。相对 KTransformers 最可靠的 BF16
+  `122.35 ms/token` 快 **45.6%（1.84×）**；相对其历史 F16 `81.90 ms/token` 快
+  **18.8%（1.23×）**；相对本页此前 single-weight BF16 K3 的 `91.287 ms/token`
+  再快 **27.1%（1.37×）**。F16 KT 行的线程数、
   prompt 和原始日志
   留存方式不同，因此同 dtype 百分比是当前最严格参考，不是逐 token 配对 A/B。
 - 单请求、BF16、K3、512 个固定输出 token：nano 完整请求墙钟 TPOT
@@ -108,6 +108,7 @@ preset。结果位于：
 - `results/single_weight_f16_k1_vpb2_512/`
 - `results/single_weight_f16_k1_vpb2_512_repeats3/`
 - `results/single_weight_f16_k1_vpb2_segment16_512_repeats3{,_r2}/`
+- `results/single_weight_f16_k1_vpb2_seg16_active12_staging0_512_repeats3{,_r2}/`
 
 ### Segment boundary 筛选
 
@@ -119,6 +120,17 @@ segment 16 为 `72.631 / 70.026 / 67.620 ms/token`，均值 **70.092 ms/token**�
 segment 12 为 `69.682 / 73.837 / 70.689 ms/token`，均值 **71.403 ms/token**。
 均值改善 1.84%，但 repeat 0 回退 2.949 ms，因此这里只认定为小幅正收益，而非稳定
 大幅提升。最终 preset 已改用 segment 16。
+
+### 回收未使用 staging 为 active cache
+
+`draft_segment_indexed` runtime 的热路径只做 direct-active prefetch，不使用通用默认的
+2 个 staging slots。最终布局因此从每层 `active10 + staging2` 改为
+`active12 + staging0`，profile-weighted active budget 从 480 增到 576；KV capacity
+还从 3 blocks 增至 8 blocks。三次 512-token 配对全部正收益：新布局
+`69.914 / 64.984 / 64.623 ms/token`，均值 **66.507 ms/token**；旧布局
+`72.631 / 70.026 / 67.620 ms/token`，均值 **70.092 ms/token**，降低 5.11%。
+active13/staging0 在 warmup 需要额外 224 MiB 时 OOM，因此 active12 是当前可用容量
+上限。完整证据见 `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。
 
 ### Top-k/top-p 与当前 KT F16 复测
 
@@ -137,7 +149,7 @@ segment 12 为 `69.682 / 73.837 / 70.689 ms/token`，均值 **71.403 ms/token**�
 top-k 20、top-p 0.95、16 CPUInfer 线程；KT 的 chat/tokenizer 包装后 prompt 为
 79 token（nano raw tokenizer 为 67），生成 64 token。61-step stable graph replay
 为 **125.886 ms/token**，p50 `101.326 ms`、p95 `269.842 ms`；nano 最终
-`70.092 ms/token` 的三次均值相比快 **44.3%（1.80×）**。这个当前复测比历史 F16
+`66.507 ms/token` 的三次均值相比快 **47.2%（1.89×）**。这个当前复测比历史 F16
 `81.90 ms/token` 慢得多且尾延迟较大，因此正文仍同时报告历史 81.90 这一更保守
 参考；无论使用哪个 F16 KT 基线，nano 当前结果都更快。
 
@@ -374,7 +386,7 @@ nano 批测使用从同一模型 BF16 safetensors 转成 F16 后交给相同的 
 | nano fixed legacy K3，temp 0.8 | llamafile BF16 | 无外层绑核 | 3 | 512 | 116.695 ms |
 | **nano fixed legacy K3，temp 0.6** | llamafile BF16 | 无外层绑核 | 3 | 512 | **109.946 ms** |
 | nano single-weight K3，temp 0.6 | llamafile BF16 | 无外层绑核 | 3 | 512 | 91.287 ms |
-| **nano single-weight K1/vpb2/seg16，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **70.092 ms** |
+| **nano single-weight K1/vpb2/seg16/active12，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **66.507 ms** |
 | KTransformers BF16 stable replay | fixed legacy BF16 | CPUInfer 自绑核 | 0 | 64 | 122.35 ms |
 | KTransformers 当日 F16 stable replay | fixed legacy F16 | CPUInfer 16 线程 | 0 | 64 | 125.886 ms |
 | KTransformers 历史 F16 stable replay | fixed legacy F16 | CPUInfer 20 线程 | 0 | 64 | 81.90 ms |
@@ -567,3 +579,5 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
   其过滤配置实测为负收益，未纳入最终性能 preset。
 - 本提交：segment 16 boundary schedule；
   `docs/optimization_commits/20260812_05_segment16.md`。
+- 本提交：回收未使用 staging slots 为 active cache；
+  `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。

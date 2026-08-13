@@ -60,13 +60,15 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
     # weights make the legacy llamafile CPU kernel substantially faster than
     # BF16 on Cascade Lake, while K=1 keeps verify at the qlen=2 grouped fast
     # path.  A budget of two prefetches per boundary was the best point in the
-    # measured 0/1/2/4 sweep.
+    # measured 0/1/2/4 sweep.  The segment-indexed direct-active runtime does
+    # not use staging buffers, so their two slots are reclaimed as active cache.
     "k1_f16_3080": {
         "allocation_modes": "profile_weighted",
-        "cache_ratios": "0.075",
+        "cache_ratios": "0.09375",
         "max_draft_tokens_values": "1",
         "segment_sizes": "16",
         "verify_prefetch_max_per_boundary": 2,
+        "prefetch_staging_slots_per_layer": 0,
         "draft_stop_policy": "none",
         "acceptance_predictor_enabled": False,
         "cpu_expert_pin_memory": False,
@@ -221,6 +223,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "max_draft_tokens_values": "--max-draft-tokens-values",
         "segment_sizes": "--segment-sizes",
         "verify_prefetch_max_per_boundary": "--verify-prefetch-max-per-boundary",
+        "prefetch_staging_slots_per_layer": "--prefetch-staging-slots-per-layer",
         "draft_stop_policy": "--draft-stop-policy",
         "draft_tpot_stop_rule": "--draft-tpot-stop-rule",
         "draft_tpot_min_steps": "--draft-tpot-min-steps",

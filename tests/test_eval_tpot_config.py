@@ -83,10 +83,11 @@ def test_k1_f16_3080_preset_encodes_measured_tpot_optimum(tmp_path):
         ]
     )
 
-    assert args.cache_ratios == "0.075"
+    assert args.cache_ratios == "0.09375"
     assert args.max_draft_tokens_values == "1"
     assert args.segment_sizes == "16"
     assert args.verify_prefetch_max_per_boundary == 2
+    assert args.prefetch_staging_slots_per_layer == 0
     assert args.verify_cuda_graph_bucket_steps == "2"
     assert args.kt_direct_backend == "llamafile_f16"
     assert args.kt_capture_bs == "1,2,4,8,16,32"
