@@ -1,7 +1,7 @@
 from dataclasses import fields
 
 from nanovllm.benchmarks.eval_tpot.cases import build_cases
-from nanovllm.benchmarks.eval_tpot.config import parse_args
+from nanovllm.benchmarks.eval_tpot.config import configure_optimized_env, parse_args
 from nanovllm.benchmarks.eval_tpot.runtime import build_llm_kwargs
 from nanovllm.config import Config
 
@@ -98,6 +98,9 @@ def test_k1_f16_3080_preset_encodes_measured_tpot_optimum(tmp_path):
     assert args.acceptance_predictor_enabled is False
     assert args.cpu_expert_pin_memory is False
     assert args.gpu_memory_utilization == 0.996
+
+    env = configure_optimized_env(args)
+    assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
 
 
 def test_parse_args_rejects_verify_buckets_that_force_eager_fallback(tmp_path):

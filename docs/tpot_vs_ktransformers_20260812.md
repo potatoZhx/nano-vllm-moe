@@ -13,12 +13,12 @@
 - 当前单请求最终配置为 **single-weight + llamafile F16 + fixed K1 +
   verify prefetch budget 2 + segment16 + active12/staging0**。三次独立 engine、每次
   512 个固定输出 token 的完整 decode 墙钟 TPOT 为
-  `69.914 / 64.984 / 64.623 ms/token`，均值 **66.507 ms/token**。相对上一版
-  active10/staging2 的配对均值 `70.092 ms/token` 降低 **5.11%**，三个 seed 全部
-  正收益；输出长度验证均通过。相对 KTransformers 最可靠的 BF16
-  `122.35 ms/token` 快 **45.6%（1.84×）**；相对其历史 F16 `81.90 ms/token` 快
-  **18.8%（1.23×）**；相对本页此前 single-weight BF16 K3 的 `91.287 ms/token`
-  再快 **27.1%（1.37×）**。F16 KT 行的线程数、
+  fixed grouped GEMM 后为 `63.432 / 66.085 / 66.811 ms/token`，均值
+  **65.443 ms/token**；相对同布局 autotune 均值 `66.507 ms/token` 降低 1.60%。
+  相对 KTransformers 最可靠的 BF16 `122.35 ms/token` 快 **46.5%（1.87×）**；
+  相对其历史 F16 `81.90 ms/token` 快 **20.1%（1.25×）**；相对本页此前
+  single-weight BF16 K3 的 `91.287 ms/token` 再快 **28.3%（1.39×）**。F16 KT
+  行的线程数、
   prompt 和原始日志
   留存方式不同，因此同 dtype 百分比是当前最严格参考，不是逐 token 配对 A/B。
 - 单请求、BF16、K3、512 个固定输出 token：nano 完整请求墙钟 TPOT
@@ -132,6 +132,15 @@ segment 12 为 `69.682 / 73.837 / 70.689 ms/token`，均值 **71.403 ms/token**�
 active13/staging0 在 warmup 需要额外 224 MiB 时 OOM，因此 active12 是当前可用容量
 上限。完整证据见 `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。
 
+### Decode-aware fixed grouped GEMM
+
+原 Triton autotune key 不含 route 数 `M`，会把大 prefill 选出的 config 复用于
+`M<=16` decode；autotune 本身还临时申请 256 MiB cache-flush tensor。对 Qwen3 两个
+projection shape 独立测得 decode tiling 并直调底层 JIT 后，active12/ctx8192 三次均值
+从 66.507 降到 **65.443 ms/token**（1.60%），并消除 256 MiB 峰值。逐 seed 只有一个
+更快，故只视为小幅 mean 优化；完整配置、正确性和不利数据见
+`docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。
+
 ### Top-k/top-p 与当前 KT F16 复测
 
 为了缩小采样口径差异，nano 新增了 `SamplingParams.top_k/top_p` 及 benchmark
@@ -149,7 +158,7 @@ active13/staging0 在 warmup 需要额外 224 MiB 时 OOM，因此 active12 是�
 top-k 20、top-p 0.95、16 CPUInfer 线程；KT 的 chat/tokenizer 包装后 prompt 为
 79 token（nano raw tokenizer 为 67），生成 64 token。61-step stable graph replay
 为 **125.886 ms/token**，p50 `101.326 ms`、p95 `269.842 ms`；nano 最终
-`66.507 ms/token` 的三次均值相比快 **47.2%（1.89×）**。这个当前复测比历史 F16
+`65.443 ms/token` 的三次均值相比快 **48.0%（1.92×）**。这个当前复测比历史 F16
 `81.90 ms/token` 慢得多且尾延迟较大，因此正文仍同时报告历史 81.90 这一更保守
 参考；无论使用哪个 F16 KT 基线，nano 当前结果都更快。
 
@@ -386,7 +395,7 @@ nano 批测使用从同一模型 BF16 safetensors 转成 F16 后交给相同的 
 | nano fixed legacy K3，temp 0.8 | llamafile BF16 | 无外层绑核 | 3 | 512 | 116.695 ms |
 | **nano fixed legacy K3，temp 0.6** | llamafile BF16 | 无外层绑核 | 3 | 512 | **109.946 ms** |
 | nano single-weight K3，temp 0.6 | llamafile BF16 | 无外层绑核 | 3 | 512 | 91.287 ms |
-| **nano single-weight K1/vpb2/seg16/active12，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **66.507 ms** |
+| **nano fixed-GEMM K1/vpb2/seg16/active12，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **65.443 ms** |
 | KTransformers BF16 stable replay | fixed legacy BF16 | CPUInfer 自绑核 | 0 | 64 | 122.35 ms |
 | KTransformers 当日 F16 stable replay | fixed legacy F16 | CPUInfer 16 线程 | 0 | 64 | 125.886 ms |
 | KTransformers 历史 F16 stable replay | fixed legacy F16 | CPUInfer 20 线程 | 0 | 64 | 81.90 ms |
@@ -581,3 +590,5 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
   `docs/optimization_commits/20260812_05_segment16.md`。
 - 本提交：回收未使用 staging slots 为 active cache；
   `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。
+- 本提交：decode-aware Qwen3 fixed grouped GEMM；
+  `docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。

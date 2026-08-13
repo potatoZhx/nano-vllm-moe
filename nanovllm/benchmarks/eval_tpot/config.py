@@ -414,6 +414,10 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             env_overrides["NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING"] = "1"
         else:
             os.environ.pop("NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING", None)
+        if optimized_config == "k1_f16_3080":
+            env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
+        else:
+            os.environ.pop("NANOVLLM_GROUPED_GEMM_FIXED_QWEN3", None)
 
     if verify_cost_profile:
         env_overrides["NANOVLLM_VERIFY_COST_MODEL_PROFILE"] = "1"

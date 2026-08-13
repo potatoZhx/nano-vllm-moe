@@ -1,3 +1,5 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -109,6 +111,53 @@ def is_int_tensor(x: torch.Tensor) -> bool:
     }
 
 
+def fixed_qwen3_moe_config(M: int, N: int, K: int) -> dict[str, int]:
+    """Return measured RTX-3080 configs for Qwen3-30B-A3B expert GEMMs.
+
+    The generic autotuner intentionally excludes M from its cache key.  A
+    large synthetic prefill therefore used to select the config later replayed
+    for M<=16 decode GEMMs.  These two Qwen expert projections have stable
+    shapes, so dispatch the independently measured large/decode optima without
+    running Triton's 256-MiB cache-flush benchmark inside a full model.
+    """
+    if (int(N), int(K)) == (1536, 2048):
+        if int(M) <= 32:
+            return {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 4,
+                "num_stages": 4,
+            }
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "num_warps": 4,
+            "num_stages": 5,
+        }
+    if (int(N), int(K)) == (2048, 768):
+        if int(M) <= 32:
+            return {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
+        return {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "num_warps": 8,
+            "num_stages": 4,
+        }
+    raise ValueError(
+        "fixed Qwen3 MoE grouped GEMM only supports "
+        f"(N,K)=(1536,2048)/(2048,768), got ({int(N)},{int(K)})"
+    )
+
+
 def grouped_gemm_forward(
     x: torch.Tensor, w: torch.Tensor, m_sizes: torch.Tensor, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
@@ -132,7 +181,15 @@ def grouped_gemm_forward(
     y = torch.empty((M, N), device=x.device, dtype=dtype)
     NUM_SMS = get_num_sms()
     grid = lambda META: (NUM_SMS,)
-    _grouped_gemm_forward_kernel[grid](
+    fixed_config = None
+    if os.getenv("NANOVLLM_GROUPED_GEMM_FIXED_QWEN3", "0") == "1":
+        fixed_config = fixed_qwen3_moe_config(M, N, K)
+    kernel = (
+        _grouped_gemm_forward_kernel
+        if fixed_config is None
+        else _grouped_gemm_forward_kernel.fn
+    )
+    kernel[grid](
         # Pointers
         x,
         w,
@@ -152,5 +209,6 @@ def grouped_gemm_forward(
         w.stride(2),
         y.stride(0),
         y.stride(1),
+        **({} if fixed_config is None else fixed_config),
     )
     return y
