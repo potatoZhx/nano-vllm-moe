@@ -609,6 +609,8 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
 - 单请求最终三次复测：`results/single_weight_f16_k1_vpb2_512_repeats3/`
 - 动态 K1/K2 最优三次复测：
   `results/dynamic_tpot_k2_threshold097_gmu097_512_r{0,1,2}/`
+- workload-sized active14 动态最优三次复测：
+  `results/dynamic_k2_active14_threshold097_gmu098_512_r{0,1,2}/`
 - 动态参数筛选：`results/dynamic_tpot_k2_threshold{090,095,097}_gmu097_256/`
 - 单请求首次 512-token profile：`results/single_weight_f16_k1_vpb2_512/`
 - 单请求历史 K3/BF16：`results/llamafile_k3_r075_bucket4_t06_512/`
@@ -632,13 +634,18 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
 - `c07ed02`：top-k/top-p 精确 speculative sampling 对齐；
   `docs/optimization_commits/20260812_03_sampling_alignment.md`。该提交是比较正确性功能，
   其过滤配置实测为负收益，未纳入最终性能 preset。
-- 本提交：segment 16 boundary schedule；
+- `3475ea7`：segment 16 boundary schedule；
   `docs/optimization_commits/20260812_05_segment16.md`。
-- 本提交：回收未使用 staging slots 为 active cache；
+- `2868f7e`：回收未使用 staging slots 为 active cache；
   `docs/optimization_commits/20260813_06_reclaim_staging_cache.md`。
-- 本提交：decode-aware Qwen3 fixed grouped GEMM；
+- `cc37b2f`：decode-aware Qwen3 fixed grouped GEMM；
   `docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。
-- 本提交：workload-sized CUDA memory warmup；
+- `714cec5`：workload-sized CUDA memory warmup；
   `docs/optimization_commits/20260813_08_workload_sized_warmup.md`。
-- 本提交：保留的 predictor+TPOT 动态 K1/K2 最优配置；
+- `74a6521`：保留的 full-context-safe predictor+TPOT 动态 K1/K2 配置；
   `docs/optimization_commits/20260813_09_dynamic_k1_k2_tpot.md`。
+- `8b82ce3`：workload-sized active14 动态 K1/K2 最优配置；
+  `docs/optimization_commits/20260813_10_dynamic_active14.md`。
+
+完整 profile 索引、提交账本、负收益路线和后续优化优先级见
+`docs/tpot_optimization_final_review_20260813.md`。
