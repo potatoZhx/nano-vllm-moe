@@ -161,6 +161,30 @@ def test_dynamic_preset_costs_can_be_overridden_explicitly(tmp_path):
     assert args._optimized_config_applied["manual_overrides"]["draft_tpot_td_ms"] == 95.0
 
 
+def test_active14_dynamic_preset_retains_workload_sized_tpot_optimum(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k2_dynamic_f16_3080_active14",
+        ]
+    )
+
+    assert args.cache_ratios == "0.109375"
+    assert args.max_draft_tokens_values == "2"
+    assert args.draft_stop_policy == "tpot"
+    assert args.draft_tpot_td_ms == 97.0
+    assert args.draft_tpot_tv_ms == 100.0
+    assert args.acceptance_predictor_enabled is True
+    assert args.verify_cuda_graph_bucket_steps == "2,3"
+    assert args.gpu_memory_utilization == 0.98
+    assert args.warmup_model_tokens == 1024
+
+    env = configure_optimized_env(args)
+    assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
+
+
 def test_parse_args_rejects_verify_buckets_that_force_eager_fallback(tmp_path):
     try:
         parse_args(

@@ -21,11 +21,12 @@
   行的线程数、
   prompt 和原始日志
   留存方式不同，因此同 dtype 百分比是当前最严格参考，不是逐 token 配对 A/B。
-- 现有 predictor+TPOT 动态框架的最佳保留配置为 **Kmax2 / first_increase /
-  `td=97,tv=100`**。三次 512-token TPOT 为
-  `66.031 / 68.461 / 65.199 ms/token`，均值 **66.564 ms/token**，仅比 fixed K1
-  最优均值慢 1.71%，并比旧动态 83.627 降低 20.4%。它以
-  `--optimized-config k2_dynamic_f16_3080` 单独保留，不覆盖总体最优 preset。
+- 现有 predictor+TPOT 动态框架的 workload-sized 最优仍为 **Kmax2 /
+  first_increase / `td=97,tv=100`**，并把常驻专家扩至 active14。三次 512-token
+  TPOT 为 `63.930 / 61.600 / 65.609 ms/token`，均值 **63.713 ms/token**，比此前
+  fixed K1 总体最优均值快 2.64%，比旧动态 83.627 快 23.8%。它以
+  `--optimized-config k2_dynamic_f16_3080_active14` 保留；物理 KV 容量为 1536 token。
+  原 `k2_dynamic_f16_3080` 不变，继续保留为 8192-context-safe 动态版本。
 - 单请求、BF16、K3、512 个固定输出 token：nano 完整请求墙钟 TPOT
   **109.946 ms/token**；KTransformers BF16 的 61-step stable replay 为
   **122.35 ms/token**。这是较早的同 dtype 结果；nano 的更严格口径仍快
@@ -83,9 +84,19 @@ K1 只能退化成 fixed K1，不能构成额外优化。
 **66.564 ms/token**、population std `1.384 ms`。实际 K2 次数分别为 1/4/4，说明
 策略仍真正动态；9 轮 K2 中 7 轮 full accept、2 轮 partial accept、无零接受。
 所有输出长度与校验通过。它比旧动态 `83.627` 快 20.4%，相对总体 fixed K1 最优
-`65.443` 只慢 1.71%。因此 `k2_dynamic_f16_3080` 是保留的动态方法最优，而
-`k1_f16_3080` 仍是总体默认最优。完整参数、负面筛选和结果路径见
-`docs/optimization_commits/20260813_09_dynamic_k1_k2_tpot.md`。
+`65.443` 只慢 1.71%。因此 `k2_dynamic_f16_3080` 保留为 full-context-safe 动态版本。
+
+进一步利用短 warmup 释放的显存，把常驻专家从 active12 增至 active14，并把 GPU
+memory utilization 调至 0.98 后，三次 512-token TPOT 为
+`63.930 / 61.600 / 65.609 ms/token`，均值 **63.713 ms/token**、population std
+`1.644 ms`。12 次 K2 中 9 次 full accept、3 次 partial accept、无 zero accept，
+所有输出校验通过。相对 active12 动态改善 4.28%，相对 fixed K1 均值改善 2.64%。
+
+active14 只保留 6 个 256-token KV block（1536 tokens），所以它是明确的
+workload-sized 最优，以 `k2_dynamic_f16_3080_active14` 单独保留；不能据此宣称完整
+8192 上下文也达到同一结果。参数筛选分别见
+`docs/optimization_commits/20260813_09_dynamic_k1_k2_tpot.md` 和
+`docs/optimization_commits/20260813_10_dynamic_active14.md`。
 
 ### Verify prefetch budget 筛选
 
