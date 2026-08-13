@@ -39,6 +39,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "none",
     "k4_verify",
     "k1_f16_3080",
+    "k2_dynamic_f16_3080",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -80,6 +81,39 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
         "verify_cuda_graph_bucket_steps": "2",
         "verify_prefetch_rank_multiplier": 1,
         "gpu_memory_utilization": 0.996,
+        "warmup_model_tokens": 1024,
+        "decode_driver": "generate",
+        "reset_seed_after_warmup": True,
+    },
+    # Best retained predictor-driven dynamic draft-length configuration on the
+    # same RTX 3080 F16 path.  With first_increase and static costs, td/tv=.97
+    # makes K2 reachable only when the predicted first-step alpha is >= .97.
+    # Reserve 2.6% of memory for the additional qlen=3 verify CUDA graph; KV
+    # capacity remains above the full 8192-token model context.
+    "k2_dynamic_f16_3080": {
+        "allocation_modes": "profile_weighted",
+        "cache_ratios": "0.09375",
+        "max_draft_tokens_values": "2",
+        "segment_sizes": "16",
+        "verify_prefetch_max_per_boundary": 2,
+        "prefetch_staging_slots_per_layer": 0,
+        "draft_stop_policy": "tpot",
+        "draft_tpot_td_ms": 97.0,
+        "draft_tpot_tv_ms": 100.0,
+        "draft_tpot_cost_model": "static",
+        "draft_tpot_min_steps": 1,
+        "draft_tpot_stop_margin": 0.0,
+        "draft_tpot_stop_rule": "first_increase",
+        "acceptance_predictor_enabled": True,
+        "cpu_expert_pin_memory": False,
+        "kt_num_threads": 16,
+        "kt_threadpool_count": 2,
+        "kt_numa_nodes": "0,1",
+        "kt_direct_backend": "llamafile_f16",
+        "kt_capture_bs": "1,2,4,8,16,32",
+        "verify_cuda_graph_bucket_steps": "2,3",
+        "verify_prefetch_rank_multiplier": 1,
+        "gpu_memory_utilization": 0.97,
         "warmup_model_tokens": 1024,
         "decode_driver": "generate",
         "reset_seed_after_warmup": True,
@@ -227,6 +261,8 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "prefetch_staging_slots_per_layer": "--prefetch-staging-slots-per-layer",
         "draft_stop_policy": "--draft-stop-policy",
         "draft_tpot_stop_rule": "--draft-tpot-stop-rule",
+        "draft_tpot_td_ms": "--draft-tpot-td-ms",
+        "draft_tpot_tv_ms": "--draft-tpot-tv-ms",
         "draft_tpot_min_steps": "--draft-tpot-min-steps",
         "draft_tpot_stop_margin": "--draft-tpot-stop-margin",
         "draft_tpot_cost_model": "--draft-tpot-cost-model",
@@ -416,7 +452,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             env_overrides["NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING"] = "1"
         else:
             os.environ.pop("NANOVLLM_VERIFY_SEGMENT_CUDA_EVENT_TIMING", None)
-        if optimized_config == "k1_f16_3080":
+        if optimized_config in {"k1_f16_3080", "k2_dynamic_f16_3080"}:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
             os.environ.pop("NANOVLLM_GROUPED_GEMM_FIXED_QWEN3", None)
@@ -476,7 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help=(
             "Apply an optimized inference preset. k4_verify uses the verified "
-            "K=4 low-latency settings; k3_3080 is the validated dual-NUMA "
+            "K=4 low-latency settings; k2_dynamic_f16_3080 retains the best "
+            "measured predictor-driven dynamic K1/K2 policy; k3_3080 is the validated dual-NUMA "
             "llamafile path for this RTX 3080 host; k6_decode uses the legacy "
             "fixed-K6 decode settings; k12_decode retains K=12. "
             "Explicit CLI options override preset values."

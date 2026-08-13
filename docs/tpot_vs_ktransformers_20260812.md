@@ -21,6 +21,11 @@
   行的线程数、
   prompt 和原始日志
   留存方式不同，因此同 dtype 百分比是当前最严格参考，不是逐 token 配对 A/B。
+- 现有 predictor+TPOT 动态框架的最佳保留配置为 **Kmax2 / first_increase /
+  `td=97,tv=100`**。三次 512-token TPOT 为
+  `66.031 / 68.461 / 65.199 ms/token`，均值 **66.564 ms/token**，仅比 fixed K1
+  最优均值慢 1.71%，并比旧动态 83.627 降低 20.4%。它以
+  `--optimized-config k2_dynamic_f16_3080` 单独保留，不覆盖总体最优 preset。
 - 单请求、BF16、K3、512 个固定输出 token：nano 完整请求墙钟 TPOT
   **109.946 ms/token**；KTransformers BF16 的 61-step stable replay 为
   **122.35 ms/token**。这是较早的同 dtype 结果；nano 的更严格口径仍快
@@ -66,6 +71,21 @@ K1 的 `94.79 ms/call` 增至 `121.34 ms/call`，acceptance 又从 `0.705` 降�
 `0.522`。旧动态 history 模型在 K12 实验中也因增加 verify 次数而未超过 fixed K；
 当前新后端上的直接复测进一步说明，生产配置应使用 fixed K1。把动态策略调到总是
 K1 只能退化成 fixed K1，不能构成额外优化。
+
+### 当前硬件上的动态长度最优保留配置
+
+在 active12/segment16/fixed grouped GEMM 后重新优化现有 predictor+TPOT 框架。
+`first_increase` 在 K1 的继续条件等价于 `predicted_alpha >= td/tv`；旧 `19/80`
+阈值只有 0.2375，正是平均 K 被推到 2.45 的原因。新配置限制 `Kmax=2`，使用
+`td/tv=97/100`、`min_steps=1`，只在 predictor 给出 alpha>=0.97 时进入 K2。
+
+三次独立 512-token 结果为 `66.031 / 68.461 / 65.199 ms/token`，均值
+**66.564 ms/token**、population std `1.384 ms`。实际 K2 次数分别为 1/4/4，说明
+策略仍真正动态；9 轮 K2 中 7 轮 full accept、2 轮 partial accept、无零接受。
+所有输出长度与校验通过。它比旧动态 `83.627` 快 20.4%，相对总体 fixed K1 最优
+`65.443` 只慢 1.71%。因此 `k2_dynamic_f16_3080` 是保留的动态方法最优，而
+`k1_f16_3080` 仍是总体默认最优。完整参数、负面筛选和结果路径见
+`docs/optimization_commits/20260813_09_dynamic_k1_k2_tpot.md`。
 
 ### Verify prefetch budget 筛选
 
@@ -407,6 +427,7 @@ nano 批测使用从同一模型 BF16 safetensors 转成 F16 后交给相同的 
 | **nano fixed legacy K3，temp 0.6** | llamafile BF16 | 无外层绑核 | 3 | 512 | **109.946 ms** |
 | nano single-weight K3，temp 0.6 | llamafile BF16 | 无外层绑核 | 3 | 512 | 91.287 ms |
 | **nano fixed-GEMM K1/vpb2/seg16/active12，temp 0.6，3-run mean** | **llamafile F16** | 无外层绑核 | **1** | **512** | **65.443 ms** |
+| nano dynamic TPOT K1/K2，alpha>=0.97 才进 K2，3-run mean | llamafile F16 | 无外层绑核 | dynamic | 512 | **66.564 ms** |
 | KTransformers BF16 stable replay | fixed legacy BF16 | CPUInfer 自绑核 | 0 | 64 | 122.35 ms |
 | KTransformers 当日 F16 stable replay | fixed legacy F16 | CPUInfer 16 线程 | 0 | 64 | 125.886 ms |
 | KTransformers 历史 F16 stable replay | fixed legacy F16 | CPUInfer 20 线程 | 0 | 64 | 81.90 ms |
@@ -575,6 +596,9 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
 ## 结果位置
 
 - 单请求最终三次复测：`results/single_weight_f16_k1_vpb2_512_repeats3/`
+- 动态 K1/K2 最优三次复测：
+  `results/dynamic_tpot_k2_threshold097_gmu097_512_r{0,1,2}/`
+- 动态参数筛选：`results/dynamic_tpot_k2_threshold{090,095,097}_gmu097_256/`
 - 单请求首次 512-token profile：`results/single_weight_f16_k1_vpb2_512/`
 - 单请求历史 K3/BF16：`results/llamafile_k3_r075_bucket4_t06_512/`
 - B2 带完整 step trace：`results/llamafile_f16_group1_cpuall_q2_trace16/`
@@ -605,3 +629,5 @@ PYTHONPATH=. /home/edge/.conda/envs/nano_moe/bin/python \
   `docs/optimization_commits/20260813_07_fixed_decode_grouped_gemm.md`。
 - 本提交：workload-sized CUDA memory warmup；
   `docs/optimization_commits/20260813_08_workload_sized_warmup.md`。
+- 本提交：保留的 predictor+TPOT 动态 K1/K2 最优配置；
+  `docs/optimization_commits/20260813_09_dynamic_k1_k2_tpot.md`。
