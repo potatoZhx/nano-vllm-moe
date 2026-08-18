@@ -500,6 +500,30 @@ class TestKtDirectBackend(unittest.TestCase):
         self.assertEqual(backend.load_count, 1)
         self.assertEqual(backend.moe.load_calls, 1)
 
+    def test_legacy_backend_skips_unused_host_mask_refresh(self) -> None:
+        backend = object.__new__(KtDirectCpuMoeBackend)
+        backend._legacy_llamafile = True
+        refresh_calls = []
+        backend._refresh_gpu_expert_mask = lambda **kwargs: refresh_calls.append(
+            kwargs
+        )
+
+        backend._refresh_gpu_expert_mask_for_cpu_backend(non_blocking=True)
+
+        self.assertEqual(refresh_calls, [])
+
+    def test_native_backend_refreshes_host_mask(self) -> None:
+        backend = object.__new__(KtDirectCpuMoeBackend)
+        backend._legacy_llamafile = False
+        refresh_calls = []
+        backend._refresh_gpu_expert_mask = lambda **kwargs: refresh_calls.append(
+            kwargs
+        )
+
+        backend._refresh_gpu_expert_mask_for_cpu_backend(non_blocking=True)
+
+        self.assertEqual(refresh_calls, [{"non_blocking": True}])
+
     def test_backend_rejects_batch_larger_than_configured_max_len(self) -> None:
         runtime = _FakeRuntime()
         backend = KtDirectCpuMoeBackend(

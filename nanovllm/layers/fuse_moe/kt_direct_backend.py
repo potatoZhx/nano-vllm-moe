@@ -983,6 +983,23 @@ class KtDirectCpuMoeBackend:
         else:
             self.gpu_expert_mask_cpu.copy_(source, non_blocking=non_blocking)
 
+    def _refresh_gpu_expert_mask_for_cpu_backend(
+        self,
+        *,
+        non_blocking: bool,
+    ) -> None:
+        """Refresh the host mask only when the native CPU backend consumes it.
+
+        The legacy llamafile binding does not receive ``gpu_expert_mask_cpu`` in
+        its ``MOEConfig``.  Cached routes are already replaced with ``-1`` by
+        :meth:`_cpu_topk_ids`, so copying the same mask to host memory on every
+        layer/forward is both redundant and, under CUDA graph replay, an extra
+        D2H memcpy node.
+        """
+        if bool(getattr(self, "_legacy_llamafile", False)):
+            return
+        self._refresh_gpu_expert_mask(non_blocking=non_blocking)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1043,7 +1060,10 @@ class KtDirectCpuMoeBackend:
             output_device,
         ) = KtDirectCPUBuffer.get_buffer(flat_hidden, self.num_experts_per_tok)
         slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
-        self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
+        KtDirectCpuMoeBackend._refresh_gpu_expert_mask_for_cpu_backend(
+            self,
+            non_blocking=flat_hidden.is_cuda,
+        )
         input_cpu[slot].copy_(flat_hidden, non_blocking=flat_hidden.is_cuda)
         expert_ids_cpu[slot].copy_(topk_ids, non_blocking=topk_ids.is_cuda)
         routing_weights_cpu[slot].copy_(topk_weights, non_blocking=topk_weights.is_cuda)
@@ -1109,7 +1129,10 @@ class KtDirectCpuMoeBackend:
         slot = self.layer_idx % KtDirectCPUBuffer.buffer_depth
 
         with verify_op_event("kt.cpu_prepare_copies", self.layer_idx):
-            self._refresh_gpu_expert_mask(non_blocking=flat_hidden.is_cuda)
+            KtDirectCpuMoeBackend._refresh_gpu_expert_mask_for_cpu_backend(
+                self,
+                non_blocking=flat_hidden.is_cuda,
+            )
             input_cpu[slot].copy_(flat_hidden, non_blocking=True)
             expert_ids_cpu[slot].copy_(topk_ids, non_blocking=True)
             routing_weights_cpu[slot].copy_(topk_weights, non_blocking=True)
