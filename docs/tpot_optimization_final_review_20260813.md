@@ -5,6 +5,24 @@
 模型：Qwen3-30B-A3B  
 主要指标：单请求、固定输出长度的 mean TPOT/TBT
 
+## 2026-08-18 最新完成状态
+
+最新 KTransformers 三数据集 suite 把此前不稳定的 `122.35 ms` 单请求参考更新为
+`66.028--66.161 ms/token` 的 graph-replay model-forward-only 均值。重新对齐后，原
+active14 动态 preset 在 MMLU-Pro validation 第 0 条的完整 `llm.step()` TPOT 为
+`65.517 ms`，只略快于 KT suite 的最低 forward-only mean，尚不能形成稳健优势。
+
+提交 `296cf59` 删除了 legacy llamafile F16 backend 每层未被 CPUInfer 消费的 host-mask
+D2H graph node。同请求、同 seed 的一次验收降至 **59.701 ms/token**，相对优化前改善
+**8.88%**；即使拿 KT 三个 suite mean 中最低的 `66.028 ms` forward-only 数字作更严格
+对照，Nano 的完整解码仍领先 **9.58%**。同源 KT 第 0 条为 `71.553 ms` forward-only，
+Nano 领先 16.56%。512 固定输出、validation 和相关单元测试全部通过。
+
+该优化不改变下面保留的两个动态 preset、预测器、draft-length 决策、prefetch/cache
+算法或 sampling 定义。详细证据、命令、计时口径和输出轨迹说明见
+`optimization_commits/20260818_11_skip_legacy_mask_d2h.md`。本文后面的 active14 profile
+预算均为该提交之前的 profile，仍用于定位剩余热点，不应覆盖本节的新端到端结果。
+
 ## 1. 最终状态
 
 当前保留两个动态长度 preset：
@@ -75,6 +93,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `714cec5` | `optimization_commits/20260813_08_workload_sized_warmup.md` | synthetic warmup 从 max context 解耦，降低峰值并把 active12 KV 从 8 增至 49 blocks。 |
 | `74a6521` | `optimization_commits/20260813_09_dynamic_k1_k2_tpot.md` | 保留 full-context-safe K1/K2、0.97 门限动态配置，较旧动态改善 20.4%。 |
 | `8b82ce3` | `optimization_commits/20260813_10_dynamic_active14.md` | 新增 active14/0.98 workload-sized 动态最优，三轮均值达到 63.713 ms。 |
+| `296cf59` | `optimization_commits/20260818_11_skip_legacy_mask_d2h.md` | 删除 legacy F16 未使用的每层 mask D2H graph node，代表性数据集请求改善 8.88% 并超过最新 KT。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -103,6 +122,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimize_ops/verify_optimization_summary.md` | verify 优化总史、复现和历史 K6/K12 结果 | 历史最优依赖不同 GPU/cache/backend，不能覆盖本机 F16 K1 结论。 |
 | `optimize_ops/ktransformers_integration_strategy.md` | 全替换与迁移两条架构路线 | 短期继续 Nano `kt_direct` 局部优化；长期迁移应分阶段实现 heterogeneous MoE。 |
 | `tpot_vs_ktransformers_20260812.md` | 本机最终对照、所有主要筛选、batch 与口径 | 是当前总体结果的主入口。 |
+| `optimization_commits/20260818_11_skip_legacy_mask_d2h.md` | 最新 KT 重测后的单请求对照、legacy mask 不变量与正收益验收 | 是 59.701 ms 最新结果和跨过 KT 的直接证据。 |
 
 ## 5. 热点的统一解释
 
@@ -589,12 +609,12 @@ CPU expert 仍是结构性主线。需要的不是又一个总 `cpu_compute_ms`�
 - 两个 NUMA pool 各自的本地/远端读和负载不均；
 - 从 submit 到 GPU 真正 wait 的 exposed tail。
 
-在此基础上再决定 task 合并、权重 packing、m-block、线程池和 affinity。当前 legacy
-llamafile 构造的 `MOEConfig` 不接收 `gpu_expert_mask_cpu` 指针，但
-`begin_forward_graph_verify()` 每层仍 `_refresh_gpu_expert_mask()`，产生 48 次 128-bool
-D2H，并在 GPU 上先把 cached route 改为 -1。应在后端不变量测试后为 legacy 分支跳过
-冗余 mask D2H；历史整个 `kt.cpu_prepare_copies` 约 0.966 ms/verify，所以它是低风险小
-收益，不应取代 native CPU kernel 主线。
+在此基础上再决定 task 合并、权重 packing、m-block、线程池和 affinity。此前 legacy
+llamafile 构造的 `MOEConfig` 不接收 `gpu_expert_mask_cpu` 指针，但每层仍刷新 host mask。
+`296cf59` 已在保留 native backend 刷新不变量的前提下跳过 legacy 冗余 D2H；实测收益
+明显高于历史 `kt.cpu_prepare_copies=0.966 ms/verify` 给出的粗上限，说明大量微小 graph
+memcpy node 的调度/依赖代价不能只用一次旧 profile 的嵌套 event 估算。CPUInfer exposed
+tail 仍是剩余主线，但这项冗余 copy 已从后续候选中划除。
 
 ### 14.3 Verify/draft GPU graph 与 MoE
 
@@ -719,7 +739,8 @@ predictor，而不是沿用旧成本下的阈值。再往后依次是：
 
 ## 16. 收尾判断
 
-当前路线已经达到“明显超过留存 KTransformers 参考”的工程目标，并保留了 full-context
+当前路线已经以 Nano 完整解码 `59.701 ms` 对 KT 最新最低 forward-only suite mean
+`66.028 ms` 的严格口径达到“明显超过 KTransformers”的工程目标，并保留了 full-context
 safe 与 workload-sized 两个动态最优；但没有足够证据宣称硬件全局最优。下一轮最可能
 产生真实大收益的顺序，已由本次全局审计修正为：
 
