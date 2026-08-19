@@ -70,6 +70,11 @@ b2 多 6 个 decode rounds，mean round wall 仍从 110.555 降到 105.187 ms。
 最终边界点 budget0 为 55.248 ms/token，比 b1 回退 2.83%，所以不新增 b0 preset；
 phase1 不是应被完全删除，而是只保留一个最高排名 recent candidate。
 
+b1 的 lifecycle profile 进一步量到 phase1/verify/draft 首次消费率为
+81.54%/89.29%/95.78%。基于该证据测试全局 verify budget2→1 和按 segment 2/2/1，
+分别得到 56.203（+4.61%）与 54.449 ms/token（+1.35%），均回退；per-segment 临时代码
+已全部撤销，当前继续保留 b1 + 全局 vpb2。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -233,6 +238,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_23_rejected_cpuinfer_groupmin2.md` | exact-Nano qlen1/2/3 微基准与一条 TPOT 负结果 | group_min=2 回退 1.37%，运行时代码撤销并保留 group_min=1。 |
 | `optimization_commits/20260819_24_phase1_budget2.md` | budget2 正收益、0.98 门限负结果与 m_block 扫描 | phase1 budget2 达到 55.169 ms/token，并保留所有父 preset。 |
 | `optimization_commits/20260819_25_phase1_budget1.md` | budget1 正收益、budget0 负边界与输出/round 对照 | phase1 budget1 达到 53.726 ms/token，b0 被否决且 b2/b4 fallback 均保留。 |
+| `optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md` | b1 source/segment lifecycle、vpb1 与 2/2/1 两个负结果 | verify 第二候选仍有净价值，per-segment 代码已撤销。 |
 
 ## 5. 热点的统一解释
 
