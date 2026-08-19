@@ -1,5 +1,10 @@
 # TPOT 优化收尾审计与后续路线图
 
+> **状态提示（2026-08-19）：** recent phase1 budget1 已把正式单请求最优刷新到
+> 53.726 ms/token。权威最终状态、`296cf59` 后续收益判读、完整提交账本和下一阶段优先级
+> 见 [`tpot_optimization_closeout_20260819.md`](tpot_optimization_closeout_20260819.md)。
+> 本文保留历史分析；下文后半部分的“当前”仅表示对应分析时点。
+
 日期：2026-08-13（2026-08-19 最终更新）
 硬件：RTX 3080 10 GiB，2 x Xeon Gold 5218R  
 模型：Qwen3-30B-A3B  
