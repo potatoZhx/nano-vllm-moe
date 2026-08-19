@@ -49,6 +49,19 @@ class PrefetchTicket:
     transfer_stream_idx: int = 0
 
 
+@dataclass
+class PrefetchResidency:
+    sequence: int
+    source: str
+    publish_step: int
+    num_bytes: int
+    first_consume_step: int = -1
+    last_consume_step: int = -1
+    consume_count: int = 0
+    evict_step: int = -1
+    replacement_source: str = ""
+
+
 def compute_priority(
     source: str,
     score_sum: float,
@@ -797,6 +810,10 @@ class PrefetchRuntime:
             or getattr(config, "spec_profile", False)
             or getattr(config, "transfer_aware_profile", False)
         )
+        # Source lifecycle attribution is analysis-only.  It deliberately
+        # shares the profile gate so production does not retain per-publish
+        # residency objects or scan them on verify metadata consumption.
+        self._source_lifecycle_profile_enabled = self._diagnostic_profile_enabled
 
         self.global_queue = GlobalWarmStartQueue(config)
         self.long_term_segment_index = SegmentCandidateIndex(config)
@@ -814,6 +831,13 @@ class PrefetchRuntime:
         self._profile = defaultdict(float)
         self._recent_published: dict[tuple[int, int], int] = {}
         self._recent_published_source: dict[tuple[int, int], str] = {}
+        self._prefetch_active_residencies: dict[
+            tuple[int, int], PrefetchResidency
+        ] = {}
+        self._prefetch_closed_residencies_by_key: dict[
+            tuple[int, int], list[PrefetchResidency]
+        ] = defaultdict(list)
+        self._prefetch_residency_sequence = 0
         self._draft_direct_active_budget = self._initial_draft_direct_active_budget()
         self._draft_segment_indexed_budget = self._initial_draft_direct_active_budget()
         self._draft_iteration_open = False
@@ -912,6 +936,18 @@ class PrefetchRuntime:
             float(self._profile.get("prefetch_max_inflight_observed", 0.0)),
             float(len(self.inflight)),
         )
+        if (
+            ticket.direct_active
+            and ticket.source in _NON_DEFERRED_SOURCES
+            and int(ticket.active_slot_prev_expert) >= 0
+        ):
+            # Non-deferred reservations unmap the victim before the H2D starts.
+            self._record_prefetch_residency_evicted(
+                layer_idx=int(ticket.layer_idx),
+                expert_idx=int(ticket.active_slot_prev_expert),
+                step_id=int(ticket.step_id),
+                replacement_source=str(ticket.source),
+            )
         self._record_transfer_lifecycle("submit", ticket)
 
     def _record_prefetch_completed(self, ticket: PrefetchTicket) -> None:
@@ -975,6 +1011,245 @@ class PrefetchRuntime:
                 "transfer_stream_idx": int(ticket.transfer_stream_idx),
             }
         )
+
+    def _record_prefetch_residency_published(
+        self,
+        ticket: PrefetchTicket,
+        *,
+        step_id: int,
+    ) -> None:
+        key = (int(ticket.layer_idx), int(ticket.expert_idx))
+        self._recent_published[key] = int(step_id)
+        self._recent_published_source[key] = str(ticket.source)
+        if not bool(getattr(self, "_source_lifecycle_profile_enabled", False)):
+            return
+
+        # A duplicate publication should normally be filtered before submit.
+        # Closing it here keeps telemetry bounded and makes the anomaly visible
+        # without changing cache or admission behavior.
+        if key in self._prefetch_active_residencies:
+            self._record_prefetch_residency_evicted(
+                layer_idx=key[0],
+                expert_idx=key[1],
+                step_id=int(step_id),
+                replacement_source="republish",
+            )
+            self._profile["prefetch_source_republish_count"] += 1
+
+        self._prefetch_residency_sequence += 1
+        self._prefetch_active_residencies[key] = PrefetchResidency(
+            sequence=int(self._prefetch_residency_sequence),
+            source=str(ticket.source),
+            publish_step=int(step_id),
+            num_bytes=int(ticket.num_bytes),
+        )
+
+    def _record_prefetch_residency_evicted(
+        self,
+        *,
+        layer_idx: int,
+        expert_idx: int,
+        step_id: int,
+        replacement_source: str,
+    ) -> None:
+        if not bool(getattr(self, "_source_lifecycle_profile_enabled", False)):
+            return
+        key = (int(layer_idx), int(expert_idx))
+        residency = self._prefetch_active_residencies.pop(key, None)
+        if residency is None:
+            return
+        residency.evict_step = int(step_id)
+        residency.replacement_source = str(replacement_source)
+        self._prefetch_closed_residencies_by_key[key].append(residency)
+        if bool(getattr(self.config, "transfer_aware_profile", False)):
+            self._transfer_lifecycle_events.append(
+                {
+                    "event": "evict",
+                    "step_id": int(step_id),
+                    "layer_idx": key[0],
+                    "expert_idx": key[1],
+                    "source": residency.source,
+                    "replacement_source": str(replacement_source),
+                    "publish_step": int(residency.publish_step),
+                    "residence_steps": max(
+                        0, int(step_id) - int(residency.publish_step)
+                    ),
+                    "consumed": bool(residency.consume_count > 0),
+                    "num_bytes": int(residency.num_bytes),
+                }
+            )
+
+    def _find_prefetch_residency(
+        self,
+        *,
+        layer_idx: int,
+        expert_idx: int,
+        step_id: int,
+    ) -> PrefetchResidency | None:
+        key = (int(layer_idx), int(expert_idx))
+        candidates: list[PrefetchResidency] = []
+        # Prefer a residency closed in the same step: segment metadata can be
+        # consumed asynchronously after a later segment has replaced its hit.
+        for residency in reversed(
+            self._prefetch_closed_residencies_by_key.get(key, ())
+        ):
+            if (
+                int(residency.publish_step) <= int(step_id)
+                and int(residency.evict_step) >= int(step_id)
+            ):
+                candidates.append(residency)
+                break
+            if int(residency.evict_step) < int(step_id):
+                break
+        active = self._prefetch_active_residencies.get(key)
+        if active is not None and int(active.publish_step) <= int(step_id):
+            candidates.append(active)
+        if len(candidates) > 1:
+            self._profile["prefetch_source_ambiguous_consume_count"] += 1
+        return candidates[0] if candidates else None
+
+    def _record_source_prefetch_consumed(
+        self,
+        *,
+        layer_idx: int,
+        expert_idx: int,
+        step_id: int,
+        was_cached_at_execution: bool,
+    ) -> None:
+        if (
+            not bool(getattr(self, "_source_lifecycle_profile_enabled", False))
+            or not was_cached_at_execution
+        ):
+            return
+        residency = self._find_prefetch_residency(
+            layer_idx=int(layer_idx),
+            expert_idx=int(expert_idx),
+            step_id=int(step_id),
+        )
+        if residency is None:
+            key = (int(layer_idx), int(expert_idx))
+            if key in self._recent_published:
+                self._profile["prefetch_source_unattributed_consumed_count"] += 1
+            return
+        if int(residency.last_consume_step) == int(step_id):
+            return
+        residency.last_consume_step = int(step_id)
+        residency.consume_count += 1
+        if residency.first_consume_step < 0:
+            residency.first_consume_step = int(step_id)
+            if bool(getattr(self.config, "transfer_aware_profile", False)):
+                self._transfer_lifecycle_events.append(
+                    {
+                        "event": "first_consume",
+                        "step_id": int(step_id),
+                        "layer_idx": int(layer_idx),
+                        "expert_idx": int(expert_idx),
+                        "source": residency.source,
+                        "publish_step": int(residency.publish_step),
+                        "latency_steps": max(
+                            0, int(step_id) - int(residency.publish_step)
+                        ),
+                        "num_bytes": int(residency.num_bytes),
+                    }
+                )
+
+    def _prune_unmapped_prefetch_residencies(self, *, step_id: int) -> None:
+        if not bool(getattr(self, "_source_lifecycle_profile_enabled", False)):
+            return
+        for layer_idx, expert_idx in list(self._prefetch_active_residencies):
+            cache = self.layer_caches.get(int(layer_idx))
+            if cache is not None and cache.is_cached_cpu(int(expert_idx)):
+                continue
+            self._record_prefetch_residency_evicted(
+                layer_idx=int(layer_idx),
+                expert_idx=int(expert_idx),
+                step_id=int(step_id),
+                replacement_source="external",
+            )
+
+    def _source_lifecycle_profile(self) -> dict[str, object]:
+        metric_names = (
+            "consumed_count",
+            "first_consumed_count",
+            "first_consumed_bytes",
+            "first_consume_latency_steps",
+            "first_consume_latency_steps_max",
+            "evicted_count",
+            "evicted_bytes",
+            "evicted_after_consume_count",
+            "evicted_without_consume_count",
+            "evicted_without_consume_bytes",
+            "residence_steps",
+            "resident_count",
+            "resident_consumed_count",
+        )
+        metrics: dict[str, defaultdict[str, int]] = {
+            name: defaultdict(int) for name in metric_names
+        }
+        replacement_pairs: defaultdict[str, int] = defaultdict(int)
+
+        closed = [
+            residency
+            for rows in self._prefetch_closed_residencies_by_key.values()
+            for residency in rows
+        ]
+        active = list(self._prefetch_active_residencies.values())
+        for residency in closed + active:
+            source = str(residency.source)
+            metrics["consumed_count"][source] += int(residency.consume_count)
+            if residency.first_consume_step >= 0:
+                metrics["first_consumed_count"][source] += 1
+                metrics["first_consumed_bytes"][source] += int(residency.num_bytes)
+                latency = max(
+                    0,
+                    int(residency.first_consume_step)
+                    - int(residency.publish_step),
+                )
+                metrics["first_consume_latency_steps"][source] += latency
+                metrics["first_consume_latency_steps_max"][source] = max(
+                    metrics["first_consume_latency_steps_max"][source],
+                    latency,
+                )
+        for residency in closed:
+            source = str(residency.source)
+            metrics["evicted_count"][source] += 1
+            metrics["evicted_bytes"][source] += int(residency.num_bytes)
+            metrics["residence_steps"][source] += max(
+                0, int(residency.evict_step) - int(residency.publish_step)
+            )
+            pair = f"{source}->{residency.replacement_source or 'unknown'}"
+            replacement_pairs[pair] += 1
+            if residency.consume_count > 0:
+                metrics["evicted_after_consume_count"][source] += 1
+            else:
+                metrics["evicted_without_consume_count"][source] += 1
+                metrics["evicted_without_consume_bytes"][source] += int(
+                    residency.num_bytes
+                )
+        for residency in active:
+            source = str(residency.source)
+            metrics["resident_count"][source] += 1
+            if residency.consume_count > 0:
+                metrics["resident_consumed_count"][source] += 1
+
+        out: dict[str, object] = {
+            f"prefetch_{name}_by_source": dict(values)
+            for name, values in metrics.items()
+        }
+        out["prefetch_eviction_count_by_source_pair"] = dict(replacement_pairs)
+        out["prefetch_source_tracked_residency_count"] = len(closed) + len(active)
+        out["prefetch_source_closed_residency_count"] = len(closed)
+        out["prefetch_source_active_residency_count"] = len(active)
+        out["prefetch_source_ambiguous_consume_count"] = int(
+            self._profile.get("prefetch_source_ambiguous_consume_count", 0.0)
+        )
+        out["prefetch_source_unattributed_consumed_count"] = int(
+            self._profile.get("prefetch_source_unattributed_consumed_count", 0.0)
+        )
+        out["prefetch_source_republish_count"] = int(
+            self._profile.get("prefetch_source_republish_count", 0.0)
+        )
+        return out
 
     def _initial_draft_direct_active_budget(self) -> int:
         return max(
@@ -2181,10 +2456,16 @@ class PrefetchRuntime:
                 self._record_prefetch_late(ticket)
                 continue
 
+            prev_expert = int(cache.slot_to_expert[published_item.active_slot_idx])
             self._finalize_publish(cache, published_item)
+            self._record_prefetch_residency_evicted(
+                layer_idx=int(ticket.layer_idx),
+                expert_idx=prev_expert,
+                step_id=int(step_id),
+                replacement_source=str(ticket.source),
+            )
             self.inflight.pop((ticket.layer_idx, ticket.expert_idx), None)
-            self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
-            self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
+            self._record_prefetch_residency_published(ticket, step_id=int(step_id))
             published += 1
             self._profile["publish_count"] += 1
             self._profile["staging_prefetch_publish_count"] += 1
@@ -2250,8 +2531,14 @@ class PrefetchRuntime:
                 self._profile["prefetch_late_count"] += 1
                 self._record_prefetch_late(ticket)
                 continue
-            self._recent_published[(ticket.layer_idx, ticket.expert_idx)] = int(step_id)
-            self._recent_published_source[(ticket.layer_idx, ticket.expert_idx)] = str(ticket.source)
+            if not _non_deferred:
+                self._record_prefetch_residency_evicted(
+                    layer_idx=int(ticket.layer_idx),
+                    expert_idx=int(ticket.active_slot_prev_expert),
+                    step_id=int(step_id),
+                    replacement_source=str(ticket.source),
+                )
+            self._record_prefetch_residency_published(ticket, step_id=int(step_id))
             published += 1
             self._profile["publish_count"] += 1
             self._profile["direct_active_prefetch_publish_count"] += 1
@@ -2374,6 +2661,19 @@ class PrefetchRuntime:
                 continue
             for expert_idx in unique_ids:
                 key = (int(layer_idx), int(expert_idx))
+                was_cached_at_execution = cache.is_cached_cpu(expert_idx)
+                if meta.expert_status is not None:
+                    status_idx = int(expert_idx)
+                    if 0 <= status_idx < int(meta.expert_status.numel()):
+                        was_cached_at_execution = bool(
+                            int(meta.expert_status[status_idx].item()) == 1
+                        )
+                self._record_source_prefetch_consumed(
+                    layer_idx=int(layer_idx),
+                    expert_idx=int(expert_idx),
+                    step_id=int(step_id),
+                    was_cached_at_execution=was_cached_at_execution,
+                )
                 if key not in self._recent_published:
                     continue
                 if cache.is_cached_cpu(expert_idx):
@@ -2393,6 +2693,7 @@ class PrefetchRuntime:
                     elif source == "dual_queue_ground_truth":
                         self._profile["dual_queue_ground_truth_consumed_count"] += 1
         self._profile["prefetch_consumed_count"] += consumed
+        self._prune_unmapped_prefetch_residencies(step_id=int(step_id))
 
         stale = []
         ttl = int(self.config.prefetch_history_ttl_steps)
@@ -2729,6 +3030,8 @@ class PrefetchRuntime:
                 else 0.0
             ),
         }
+        if bool(getattr(self, "_source_lifecycle_profile_enabled", False)):
+            out.update(self._source_lifecycle_profile())
         if reset:
             self._profile.clear()
             self._draft_direct_active_budget = self._initial_draft_direct_active_budget()
@@ -2752,6 +3055,12 @@ class PrefetchRuntime:
             self._prefetch_transfer_enqueue_ms_by_stream.clear()
             self._prefetch_completion_latency_ms_by_stream.clear()
             self._transfer_lifecycle_events.clear()
+            if hasattr(self, "_prefetch_active_residencies"):
+                self._prefetch_active_residencies.clear()
+            if hasattr(self, "_prefetch_closed_residencies_by_key"):
+                self._prefetch_closed_residencies_by_key.clear()
+            if hasattr(self, "_prefetch_residency_sequence"):
+                self._prefetch_residency_sequence = 0
             self._draft_m3_layers_by_step.clear()
             self._draft_m3_step0_steps.clear()
             self._draft_m3_next_is_step0 = True

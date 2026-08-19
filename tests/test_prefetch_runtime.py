@@ -40,11 +40,13 @@ class TestPrefetchRuntime(unittest.TestCase):
             draft_prefetch_max_per_boundary=4,
         )
 
-    def _build_runtime(self):
+    def _build_runtime(self, *, engine_profile=False):
         cfg = self._config()
+        cfg.engine_profile = bool(engine_profile)
         cpu_pool = {
             0: {
                 0: {"gate_up": torch.zeros(2, 2), "down": torch.zeros(2, 2)},
+                1: {"gate_up": torch.full((2, 2), 0.5), "down": torch.full((2, 2), 0.5)},
                 2: {"gate_up": torch.ones(2, 2), "down": torch.ones(2, 2)},
             }
         }
@@ -70,6 +72,116 @@ class TestPrefetchRuntime(unittest.TestCase):
             runtime_meta_recorder=SimpleNamespace(),
         )
         return runtime, cache
+
+    def test_profile_attributes_source_consumption_and_unused_eviction(self):
+        runtime, cache = self._build_runtime(engine_profile=True)
+
+        runtime.observe_prefill(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=1,
+                    mode="prefill",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                )
+            },
+            step_id=1,
+        )
+        self.assertEqual(runtime.submit_from_global_queue(step_id=1, phase="before_draft"), 1)
+        self.assertEqual(runtime.publish_ready(step_id=1), 1)
+        runtime.record_verify_consumed(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=2,
+                    mode="verify_kt_hybrid",
+                    layer_idx=0,
+                    token_count=1,
+                    aggregated_expert_ids=torch.tensor([2], dtype=torch.int64),
+                    aggregated_score_sum=torch.tensor([1.0], dtype=torch.float32),
+                    aggregated_activation_count=torch.tensor([1], dtype=torch.int64),
+                    expert_status=torch.tensor([0, 0, 1], dtype=torch.int8),
+                )
+            },
+            step_id=2,
+        )
+
+        runtime.observe_prefill(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=3,
+                    mode="prefill",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[1]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                )
+            },
+            step_id=3,
+        )
+        self.assertEqual(runtime.submit_from_global_queue(step_id=3, phase="before_draft"), 1)
+        self.assertEqual(runtime.publish_ready(step_id=3), 1)
+
+        profile = runtime.get_profile(reset=False)
+        self.assertEqual(profile["prefetch_consumed_count_by_source"], {"prefill_history": 1})
+        self.assertEqual(profile["prefetch_first_consumed_count_by_source"], {"prefill_history": 1})
+        self.assertEqual(profile["prefetch_evicted_count_by_source"], {"prefill_history": 1})
+        self.assertEqual(profile["prefetch_evicted_after_consume_count_by_source"], {"prefill_history": 1})
+        self.assertEqual(profile["prefetch_evicted_without_consume_count_by_source"], {})
+        self.assertEqual(
+            profile["prefetch_eviction_count_by_source_pair"],
+            {"prefill_history->prefill_history": 1},
+        )
+        self.assertEqual(profile["prefetch_resident_count_by_source"], {"prefill_history": 1})
+
+        cache.put_to_slot(
+            0,
+            0,
+            runtime.cpu_expert_pool[0][0]["gate_up"],
+            runtime.cpu_expert_pool[0][0]["down"],
+        )
+        runtime.record_verify_consumed(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=4,
+                    mode="verify_kt_hybrid",
+                    layer_idx=0,
+                    token_count=1,
+                    aggregated_expert_ids=torch.tensor([0], dtype=torch.int64),
+                    aggregated_score_sum=torch.tensor([1.0], dtype=torch.float32),
+                    aggregated_activation_count=torch.tensor([1], dtype=torch.int64),
+                    expert_status=torch.tensor([1, 0, 0], dtype=torch.int8),
+                )
+            },
+            step_id=4,
+        )
+        profile = runtime.get_profile(reset=False)
+        self.assertEqual(profile["prefetch_evicted_count_by_source"], {"prefill_history": 2})
+        self.assertEqual(profile["prefetch_evicted_without_consume_count_by_source"], {"prefill_history": 1})
+        self.assertEqual(profile["prefetch_source_active_residency_count"], 0)
+
+    def test_source_lifecycle_is_disabled_outside_profile_mode(self):
+        runtime, _cache = self._build_runtime(engine_profile=False)
+        runtime.observe_prefill(
+            {
+                0: LayerRuntimeMetaCPU(
+                    step_id=1,
+                    mode="prefill",
+                    layer_idx=0,
+                    token_count=1,
+                    selected_experts=torch.tensor([[2]], dtype=torch.int64),
+                    routing_weights=torch.tensor([[1.0]], dtype=torch.float32),
+                )
+            },
+            step_id=1,
+        )
+        self.assertEqual(runtime.submit_from_global_queue(step_id=1, phase="before_draft"), 1)
+        self.assertEqual(runtime.publish_ready(step_id=1), 1)
+
+        self.assertEqual(runtime._prefetch_active_residencies, {})
+        profile = runtime.get_profile(reset=False)
+        self.assertNotIn("prefetch_consumed_count_by_source", profile)
 
     def test_submit_and_publish(self):
         runtime, cache = self._build_runtime()

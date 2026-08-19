@@ -5710,7 +5710,15 @@ class ModelRunner:
             host_buffer_slot=host_buffer_slot,
             submit_after_phase=None,
             frontier_layer_idx=int(layer_end_idx) - 1,
-            record_verify_consumed=bool(is_last_segment),
+            record_verify_consumed=bool(
+                is_last_segment
+                or getattr(
+                    prefetch_runtime,
+                    "_source_lifecycle_profile_enabled",
+                    False,
+                )
+                is True
+            ),
         )
         if self.profile_enabled and self.rank == 0:
             with self._prefetch_profile_lock:
