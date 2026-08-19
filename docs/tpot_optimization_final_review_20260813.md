@@ -48,6 +48,7 @@ commit 都不覆盖。
 µs/route 比 t16 低 7.83%；`b8be0aa` 新增独立 t32 preset，单请求从 recent-t16 的
 60.420 降至 **59.673 ms/token（-1.24%）**。它是当前分支的推荐配置，但平均 round wall
 未改善且随机轨迹不同，因此仍不覆盖 `296cf59` 同日 56.846 的全局最佳 commit。
+后续 t28 单请求为 60.595 ms/token，比 t32 回退 1.55%，因此不新增 t28 preset。
 
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
