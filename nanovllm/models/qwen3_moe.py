@@ -815,7 +815,10 @@ class Qwen3MoeHeterogeneousSparseMoeBlock(nn.Module):
 
         with verify_op_event("moe.cpu_submit", layer_idx):
             self.cpu_backend.begin_forward_graph_verify(
-                hidden_states, selected_experts, routing_weights,
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                cpu_route_mask=plan.cpu_route_mask,
             )
 
         top_k = routing_weights.size(1)

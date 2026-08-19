@@ -378,6 +378,23 @@ class TestKtDirectBackend(unittest.TestCase):
                 torch.tensor([[-1, 1], [2, -1]], dtype=torch.int64),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                backend._cpu_topk_ids(
+                    selected,
+                    cpu_route_mask=torch.tensor(
+                        [[False, True], [True, False]],
+                        dtype=torch.bool,
+                    ),
+                ),
+                torch.tensor([[-1, 1], [2, -1]], dtype=torch.int64),
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "cpu_route_mask shape"):
+            backend._cpu_topk_ids(
+                selected,
+                cpu_route_mask=torch.tensor([True, False], dtype=torch.bool),
+            )
 
         routing_weights = torch.full((2, 2), 0.5, dtype=torch.float32)
         result = backend.forward(

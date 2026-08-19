@@ -941,9 +941,20 @@ class KtDirectCpuMoeBackend:
             params["gate_up"] = gate_up_source
             params["down"] = down_source
 
-    def _cpu_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+    def _cpu_topk_ids(
+        self,
+        topk_ids: torch.Tensor,
+        cpu_route_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if not bool(getattr(self, "_legacy_llamafile", False)):
             return topk_ids
+        if cpu_route_mask is not None:
+            if cpu_route_mask.numel() != topk_ids.numel():
+                raise ValueError("cpu_route_mask shape does not match top-k routes")
+            route_mask = cpu_route_mask.reshape_as(topk_ids)
+            if route_mask.device != topk_ids.device:
+                route_mask = route_mask.to(device=topk_ids.device)
+            return torch.where(route_mask, topk_ids, -1)
         mask = self._gpu_expert_mask_source
         if mask.device != topk_ids.device:
             mask = mask.to(device=topk_ids.device)
@@ -1107,6 +1118,7 @@ class KtDirectCpuMoeBackend:
         routing_weights: torch.Tensor,
         *,
         include_gpu_cached_routes: bool = False,
+        cpu_route_mask: torch.Tensor | None = None,
     ) -> int:
         """Submit kt_direct CPU work for CUDA graph capture/replay.
 
@@ -1115,7 +1127,11 @@ class KtDirectCpuMoeBackend:
         flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
         topk_ids = selected_experts.reshape(-1, self.num_experts_per_tok).contiguous()
         if not include_gpu_cached_routes:
-            topk_ids = KtDirectCpuMoeBackend._cpu_topk_ids(self, topk_ids)
+            topk_ids = KtDirectCpuMoeBackend._cpu_topk_ids(
+                self,
+                topk_ids,
+                cpu_route_mask=cpu_route_mask,
+            )
         topk_weights = routing_weights.reshape(-1, self.num_experts_per_tok).contiguous()
 
         (
