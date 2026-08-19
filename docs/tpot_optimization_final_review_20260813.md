@@ -17,6 +17,7 @@ single-weight F16、2 x 8 CPUInfer 且全部 profiling 关闭，补测结果为�
 | `28ca880`（本轮两项前） | 70.663 ms | 284 | +24.31% | 未刷新最佳 |
 | `cd2cb06` route-mask 复用 | 62.637 ms | 271 | **-11.36%** | 相对直接前序为正，保留 |
 | `2654eb4` verify NumPy collect | 68.960 ms | 267 | **+10.10%** | 负收益，回退 |
+| recent-t32 phase1 budget2 | **55.169 ms** | 255 | **-7.55% vs budget4** | 新单请求最佳，独立 preset 保留 |
 
 同一旧提交 `296cf59` 在 2026-08-18 的一次结果为 59.701 ms，本日复跑为 56.846 ms，
 说明随机 sampling 路径与系统状态足以造成显著单请求漂移。四条输出都通过 validation，
@@ -54,6 +55,12 @@ commit 都不覆盖。
 但一条真实请求从 t32 的 59.673 回退到 **60.487 ms/token（+1.37%）**。候选虽然平均
 round wall 从 116.830 降到 114.056 ms，却因随机轨迹分叉多出 10 个 rounds；按门禁
 撤销全部配置/运行时代码，保留 `group_min_len=1`。
+
+随后在 t32/recent 路径把 phase1 budget 从 4 收紧为 2。一条真实请求从 59.673 降至
+**55.169 ms/token（-7.55%）**，decode rounds 261→255，mean round wall 116.830→
+110.555 ms；该点还比 `296cf59` 同日锚点 56.846 快 **2.95%**，因此成为当前单请求
+全局最佳。新增独立 `...phase1_recent_t32_b2` preset，budget4 与所有动态 fallback 不变。
+同轮 0.98 动态门限为 61.020 ms/token（+2.26%）而被否决，0.97 继续保留。
 
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
@@ -214,6 +221,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` | profile 聚合删除微基准、TPOT 负结果与时序解释 | 候选回退 15.48% 并已撤销；异步 pacing 需先显式建模。 |
 | `optimization_commits/20260819_22_cpuinfer_t32.md` | t12--t40 同源 CPUInfer 扫描与单请求 TPOT | 当前分支推荐 2 x 16；t16/t28/active14 fallback 全保留。 |
 | `optimization_commits/20260819_23_rejected_cpuinfer_groupmin2.md` | exact-Nano qlen1/2/3 微基准与一条 TPOT 负结果 | group_min=2 回退 1.37%，运行时代码撤销并保留 group_min=1。 |
+| `optimization_commits/20260819_24_phase1_budget2.md` | budget2 正收益、0.98 门限负结果与 m_block 扫描 | phase1 budget2 达到 55.169 ms/token，并保留所有父 preset。 |
 
 ## 5. 热点的统一解释
 

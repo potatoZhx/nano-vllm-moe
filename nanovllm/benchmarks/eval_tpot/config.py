@@ -43,6 +43,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080_active14",
     "k2_dynamic_f16_3080_active14_phase1_recent",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32",
+    "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -255,6 +256,14 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
     "kt_num_threads": 32,
 }
 
+# Preserve the measured t32/budget4 point as a fallback.  Limiting phase-1 to
+# its two highest-ranked recent verify candidates reduces transfer/cache churn
+# without changing the verify prefetch budget or dynamic K1/K2 controller.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"],
+    "predictive_phase1_budget": 2,
+}
+
 def str2bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -330,6 +339,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "kt_capture_bs": "--kt-capture-bs",
         "verify_cuda_graph_bucket_steps": "--verify-cuda-graph-bucket-steps",
         "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
+        "predictive_phase1_budget": "--predictive-phase1-budget",
         "predictive_phase1_recent_verify": "--predictive-phase1-recent-verify",
         "gpu_memory_utilization": "--gpu-memory-utilization",
         "warmup_model_tokens": "--warmup-model-tokens",
@@ -509,6 +519,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14",
             "k2_dynamic_f16_3080_active14_phase1_recent",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
