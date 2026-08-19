@@ -21,6 +21,7 @@ QWEN3_TOPK = 8
 QWEN3_LAYERS = 48
 
 GGML_TYPE_BF16 = 30
+GGML_TYPE_F16 = 1
 
 
 def _add_ktransformers_paths(root: str) -> None:
@@ -50,17 +51,57 @@ def _system_info() -> dict[str, object]:
     return info
 
 
-def _make_cpuinfer(cpuinfer_ext, threads: int):
-    return cpuinfer_ext.CPUInfer(int(threads))
+def _split_threads(total: int, pools: int) -> list[int]:
+    base, remainder = divmod(int(total), int(pools))
+    return [base + (1 if pool_idx < remainder else 0) for pool_idx in range(pools)]
 
 
-def _random_expert_ids(pool_size: int, qlen: int, topk: int, expert_num: int) -> torch.Tensor:
-    return (
-        torch.rand(pool_size * qlen, expert_num)
+def _parse_numa_nodes(value: str, pools: int) -> list[int]:
+    if value:
+        nodes = [int(item) for item in value.split(",") if item.strip()]
+    else:
+        nodes = list(range(int(pools)))
+    if len(nodes) != int(pools):
+        raise ValueError("--numa-nodes length must equal --threadpool-count")
+    return nodes
+
+
+def _make_cpuinfer(cpuinfer_ext, threads: int, threadpool_count: int, numa_nodes: str):
+    pools = int(threadpool_count)
+    if pools == 1 and not numa_nodes:
+        return cpuinfer_ext.CPUInfer(int(threads))
+    worker_config = cpuinfer_ext.WorkerPoolConfig()
+    worker_config.subpool_count = pools
+    worker_config.subpool_numa_map = _parse_numa_nodes(numa_nodes, pools)
+    worker_config.subpool_thread_count = _split_threads(int(threads), pools)
+    return cpuinfer_ext.CPUInfer(worker_config)
+
+
+def _random_expert_ids(
+    pool_size: int,
+    qlen: int,
+    topk: int,
+    expert_num: int,
+    cpu_route_fraction: float,
+    seed: int,
+) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(int(seed))
+    expert_ids = (
+        torch.rand(pool_size * qlen, expert_num, generator=generator)
         .argsort(dim=-1)[:, :topk]
         .reshape(pool_size, qlen, topk)
         .contiguous()
     )
+    keep_count = round(int(qlen) * int(topk) * float(cpu_route_fraction))
+    if keep_count >= int(qlen) * int(topk):
+        return expert_ids
+    for pool_idx in range(int(pool_size)):
+        flat_ids = expert_ids[pool_idx].view(-1)
+        keep = torch.randperm(flat_ids.numel(), generator=generator)[:keep_count]
+        mask = torch.ones(flat_ids.numel(), dtype=torch.bool)
+        mask[keep] = False
+        flat_ids[mask] = -1
+    return expert_ids
 
 
 def _make_forward_task(moe, qlen_tensor, topk, expert_ids, weights, input_tensor, output_tensor):
@@ -92,7 +133,10 @@ def _load_moes(
     group_min_len: int,
     group_max_len: int,
     m_block: int,
+    weight_dtype: str,
 ):
+    torch_weight_dtype = torch.float16 if weight_dtype == "f16" else torch.bfloat16
+    ggml_weight_type = GGML_TYPE_F16 if weight_dtype == "f16" else GGML_TYPE_BF16
     moes = []
     weights_keepalive = []
     for layer_idx in range(layer_num):
@@ -100,19 +144,19 @@ def _load_moes(
             QWEN3_EXPERT_NUM,
             QWEN3_INTERMEDIATE_SIZE,
             QWEN3_HIDDEN_SIZE,
-            dtype=torch.bfloat16,
+            dtype=torch_weight_dtype,
         ).contiguous()
         up_w = torch.randn(
             QWEN3_EXPERT_NUM,
             QWEN3_INTERMEDIATE_SIZE,
             QWEN3_HIDDEN_SIZE,
-            dtype=torch.bfloat16,
+            dtype=torch_weight_dtype,
         ).contiguous()
         down_w = torch.randn(
             QWEN3_EXPERT_NUM,
             QWEN3_HIDDEN_SIZE,
             QWEN3_INTERMEDIATE_SIZE,
-            dtype=torch.bfloat16,
+            dtype=torch_weight_dtype,
         ).contiguous()
 
         config = cpuinfer_ext.moe.MOEConfig(
@@ -129,9 +173,9 @@ def _load_moes(
         config.gate_proj = gate_w.data_ptr()
         config.up_proj = up_w.data_ptr()
         config.down_proj = down_w.data_ptr()
-        config.gate_type = GGML_TYPE_BF16
-        config.up_type = GGML_TYPE_BF16
-        config.down_type = GGML_TYPE_BF16
+        config.gate_type = ggml_weight_type
+        config.up_type = ggml_weight_type
+        config.down_type = ggml_weight_type
         config.hidden_type = GGML_TYPE_BF16
 
         moe = cpuinfer_ext.moe.MOE(config)
@@ -143,7 +187,12 @@ def _load_moes(
 
 
 def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
-    cpuinfer = _make_cpuinfer(cpuinfer_ext, args.threads)
+    cpuinfer = _make_cpuinfer(
+        cpuinfer_ext,
+        args.threads,
+        args.threadpool_count,
+        args.numa_nodes,
+    )
     moes, weights_keepalive = _load_moes(
         cpuinfer_ext,
         cpuinfer,
@@ -151,11 +200,19 @@ def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
         args.group_min_len,
         args.group_max_len,
         args.m_block,
+        args.weight_dtype,
     )
     _ = weights_keepalive
 
     pool_size = max(args.warmup, args.iters, 256)
-    expert_ids = _random_expert_ids(pool_size, qlen, QWEN3_TOPK, QWEN3_EXPERT_NUM)
+    expert_ids = _random_expert_ids(
+        pool_size,
+        qlen,
+        QWEN3_TOPK,
+        QWEN3_EXPERT_NUM,
+        args.cpu_route_fraction,
+        args.seed,
+    )
     routing_weights = torch.rand(pool_size, qlen, QWEN3_TOPK, dtype=torch.float32).contiguous()
     input_tensor = torch.randn(
         args.layer_num,
@@ -202,15 +259,19 @@ def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
     total_s = time.perf_counter() - t_total_start
 
     lat_sorted = sorted(lat_us)
-    routes_per_call = qlen * QWEN3_TOPK
+    routes_per_call = round(qlen * QWEN3_TOPK * args.cpu_route_fraction)
     avg_us = sum(lat_us) / len(lat_us)
-    flops_per_call = 3 * 2 * qlen * QWEN3_TOPK * QWEN3_HIDDEN_SIZE * QWEN3_INTERMEDIATE_SIZE
+    flops_per_call = 3 * 2 * routes_per_call * QWEN3_HIDDEN_SIZE * QWEN3_INTERMEDIATE_SIZE
     return {
         "system": "ktransformers_cpuinfer_ext_moe",
         "backend": "llamafile",
-        "dtype": "bf16",
+        "dtype": args.weight_dtype,
+        "weight_dtype": args.weight_dtype,
+        "hidden_dtype": "bf16",
         "qlen": qlen,
         "threads": args.threads,
+        "threadpool_count": args.threadpool_count,
+        "numa_nodes": _parse_numa_nodes(args.numa_nodes, args.threadpool_count),
         "layer_num": args.layer_num,
         "warmup_iters": args.warmup,
         "iters": args.iters,
@@ -219,11 +280,12 @@ def bench_one(cpuinfer_ext, args, qlen: int) -> dict[str, object]:
         "hidden_size": QWEN3_HIDDEN_SIZE,
         "intermediate_size": QWEN3_INTERMEDIATE_SIZE,
         "routes_per_call": routes_per_call,
+        "cpu_route_fraction": args.cpu_route_fraction,
         "avg_latency_us": avg_us,
         "p50_latency_us": lat_sorted[len(lat_sorted) // 2],
         "p95_latency_us": lat_sorted[int(len(lat_sorted) * 0.95)],
         "min_latency_us": min(lat_us),
-        "avg_us_per_route": avg_us / routes_per_call,
+        "avg_us_per_route": avg_us / routes_per_call if routes_per_call else None,
         "avg_ms_per_48_layers": avg_us * QWEN3_LAYERS / 1000.0,
         "tokens_per_s_one_layer": qlen * args.iters / total_s,
         "tflops": flops_per_call * args.iters / total_s / 1e12,
@@ -239,6 +301,11 @@ def parse_args():
     parser.add_argument("--ktransformers-root", default="/home/linke/ktransformers")
     parser.add_argument("--qlen", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--threadpool-count", type=int, default=1)
+    parser.add_argument("--numa-nodes", default="")
+    parser.add_argument("--weight-dtype", choices=("bf16", "f16"), default="bf16")
+    parser.add_argument("--cpu-route-fraction", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument("--layer-num", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=500)
@@ -251,6 +318,11 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    if args.threads < args.threadpool_count:
+        raise ValueError("--threads must be >= --threadpool-count")
+    if not 0.0 <= args.cpu_route_fraction <= 1.0:
+        raise ValueError("--cpu-route-fraction must be in [0, 1]")
+    _parse_numa_nodes(args.numa_nodes, args.threadpool_count)
     _add_ktransformers_paths(args.ktransformers_root)
     import cpuinfer_ext
 
