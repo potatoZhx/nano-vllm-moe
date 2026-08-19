@@ -27,6 +27,11 @@ single-weight F16、2 x 8 CPUInfer 且全部 profiling 关闭，补测结果为�
 65.072 -> 60.156 -> 65.567 ms/token，独立地支持“保留 route-mask、回退 verify NumPy
 collect”的决定。正式最佳仍属于 `296cf59 + active14`，后续改动截至这里没有刷新它。
 
+随后提交 `ac254df` 在 profile 关闭时彻底跳过只供诊断的 verify consumption map 与逐
+expert 扫描，active14 单请求从 62.637 降至 **60.526 ms/token（-3.37%）**；平均 round
+wall 也从 118.108 降至 117.154 ms。该提交相对当前分支直接前序为正而保留，但仍没有
+超过 `296cf59` 同日 56.846 ms/token 的全局锚点。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -145,6 +150,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `cd2cb06` | `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | 复用 verify plan 的 CPU route mask；两套单请求均优于直接前序，但未刷新全局最佳。 |
 | `2654eb4` | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准虽快，两套单请求均回退，作为被否决候选保留记录。 |
 | `f844475` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
+| `ac254df` | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | production-off 跳过只供诊断的 verify consumption 状态，单请求 TPOT 改善 3.37%。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -180,6 +186,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | route-mask 复用、CUDA graph 微基准与两套单请求 TPOT | 相对直接前序为正，未刷新 `296cf59` 全局锚点。 |
 | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准和端到端负结果 | 被否决候选；不能用孤立 collect 微基准代替 TPOT。 |
 | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 回退范围、正式 TPOT 门禁与保留项 | 当前 runtime 恢复 PyTorch verify collect，动态 preset 不变。 |
+| `optimization_commits/20260819_20_skip_production_verify_consumption.md` | consumption 诊断 gate、微基准与单请求 TPOT | production-off 不再维护/扫描诊断 map，profile-on 能力保留。 |
 
 ## 5. 热点的统一解释
 
