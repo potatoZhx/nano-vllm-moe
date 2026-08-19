@@ -32,6 +32,12 @@ expert 扫描，active14 单请求从 62.637 降至 **60.526 ms/token（-3.37%�
 wall 也从 118.108 降至 117.154 ms。该提交相对当前分支直接前序为正而保留，但仍没有
 超过 `296cf59` 同日 56.846 ms/token 的全局锚点。
 
+紧接着测试了 production-off 跳过 verify metadata profile 聚合。孤立函数从 5.805192
+降至 0.000200 ms/call，但单请求从 60.526 回退到 69.893 ms/token（+15.48%），平均
+round wall 也增加 13.193 ms。该聚合位于 async worker 的 observe 之前，存在隐含 pacing
+作用；候选已完全撤销，仅在
+`optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` 保留负结果。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -187,6 +193,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准和端到端负结果 | 被否决候选；不能用孤立 collect 微基准代替 TPOT。 |
 | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 回退范围、正式 TPOT 门禁与保留项 | 当前 runtime 恢复 PyTorch verify collect，动态 preset 不变。 |
 | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | consumption 诊断 gate、微基准与单请求 TPOT | production-off 不再维护/扫描诊断 map，profile-on 能力保留。 |
+| `optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` | profile 聚合删除微基准、TPOT 负结果与时序解释 | 候选回退 15.48% 并已撤销；异步 pacing 需先显式建模。 |
 
 ## 5. 热点的统一解释
 
