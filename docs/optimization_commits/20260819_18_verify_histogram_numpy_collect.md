@@ -61,7 +61,7 @@ single-weight F16、2 x 8 CPUInfer，各版本运行一次；engine/transfer/pro
 没有兑现为端到端收益。
 
 结论：`2654eb4` 仅保留为被否决候选的历史证据；当前分支通过后续
-`REVERT_COMMIT` 恢复原 PyTorch verify hybrid collect。dynamic preset、draft NumPy
+`f844475` 恢复原 PyTorch verify hybrid collect。dynamic preset、draft NumPy
 collect 与 route-mask 优化均不回退。结果目录为
 `results/tpot_ab_route_metadata_20260819/` 和
 `results/tpot_ab_active14_formal_20260819/`。

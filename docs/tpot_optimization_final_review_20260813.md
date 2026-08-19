@@ -144,7 +144,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `28ca880` | `optimization_commits/20260819_16_cpuinfer_precision_numa_analysis.md` | 同 route 微基准证明 BF16/F16 基本持平、2 x 8 NUMA 明显优于单 NUMA，继续保留当前 CPUInfer 布局。 |
 | `cd2cb06` | `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | 复用 verify plan 的 CPU route mask；两套单请求均优于直接前序，但未刷新全局最佳。 |
 | `2654eb4` | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准虽快，两套单请求均回退，作为被否决候选保留记录。 |
-| `REVERT_COMMIT` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
+| `f844475` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
