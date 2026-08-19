@@ -44,6 +44,11 @@ rounds，平均 round wall 仍下降 7.280 ms。按单请求正收益规则将 r
 分支推荐候选；因收益很小且随机轨迹分叉，原 active14 fallback 与 `296cf59` 全局最佳
 commit 都不覆盖。
 
+同源 CPUInfer 线程扫描随后确认 32 total threads（2 x 16）的 qlen2/3/5 平均
+µs/route 比 t16 低 7.83%；`b8be0aa` 新增独立 t32 preset，单请求从 recent-t16 的
+60.420 降至 **59.673 ms/token（-1.24%）**。它是当前分支的推荐配置，但平均 round wall
+未改善且随机轨迹不同，因此仍不覆盖 `296cf59` 同日 56.846 的全局最佳 commit。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -163,6 +168,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `2654eb4` | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准虽快，两套单请求均回退，作为被否决候选保留记录。 |
 | `f844475` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
 | `ac254df` | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | production-off 跳过只供诊断的 verify consumption 状态，单请求 TPOT 改善 3.37%。 |
+| `b8be0aa` | `optimization_commits/20260819_22_cpuinfer_t32.md` | 保留双 NUMA 2 x 16 CPUInfer preset，微基准改善 7.83%、单请求 TPOT 改善 1.24%。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -200,6 +206,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 回退范围、正式 TPOT 门禁与保留项 | 当前 runtime 恢复 PyTorch verify collect，动态 preset 不变。 |
 | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | consumption 诊断 gate、微基准与单请求 TPOT | production-off 不再维护/扫描诊断 map，profile-on 能力保留。 |
 | `optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` | profile 聚合删除微基准、TPOT 负结果与时序解释 | 候选回退 15.48% 并已撤销；异步 pacing 需先显式建模。 |
+| `optimization_commits/20260819_22_cpuinfer_t32.md` | t12--t40 同源 CPUInfer 扫描与单请求 TPOT | 当前分支推荐 2 x 16；t16/t28/active14 fallback 全保留。 |
 
 ## 5. 热点的统一解释
 
