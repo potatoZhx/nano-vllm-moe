@@ -110,6 +110,14 @@ class TestPrefetchRuntimeMeta(unittest.TestCase):
         self.assertEqual(meta.execution_activation_count.tolist(), [2, 2, 1, 3])
         self.assertEqual(meta.expert_status.tolist(), [2, 1, 1, 2])
 
+        # Collected metadata must remain stable after the pooled host buffer is
+        # reused by a later offload.
+        host = recorder.host_buffer_pools[("verify_kt_hybrid", 4)][0]
+        host["expert_status"][0].zero_()
+        host["execution_activation_count"][0].zero_()
+        self.assertEqual(meta.execution_activation_count.tolist(), [2, 2, 1, 3])
+        self.assertEqual(meta.expert_status.tolist(), [2, 1, 1, 2])
+
     def test_transfer_profile_keeps_logical_and_execution_route_rows(self):
         recorder = ModelRuntimeMetaRecorder(
             config=SimpleNamespace(transfer_aware_profile=True),
