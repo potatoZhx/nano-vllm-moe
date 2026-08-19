@@ -42,6 +42,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080",
     "k2_dynamic_f16_3080_active14",
     "k2_dynamic_f16_3080_active14_phase1_recent",
+    "k2_dynamic_f16_3080_active14_phase1_recent_t32",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -244,6 +245,14 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
 OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"] = {
     **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14"],
     "predictive_phase1_recent_verify": True,
+}
+
+# Preserve the 16-thread recent-route preset as a fallback.  The dual-NUMA
+# 32-thread variant is independently selectable after paired kernel and
+# one-request TPOT validation on the 2 x 20-core target host.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"],
+    "kt_num_threads": 32,
 }
 
 def str2bool(value: str | bool) -> bool:
@@ -499,6 +508,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080",
             "k2_dynamic_f16_3080_active14",
             "k2_dynamic_f16_3080_active14_phase1_recent",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
