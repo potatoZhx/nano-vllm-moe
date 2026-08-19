@@ -789,6 +789,14 @@ class PrefetchRuntime:
         self.cache_strategy = cache_strategy
         self.prefetch_strategy = prefetch_strategy
         self.runtime_meta_recorder = runtime_meta_recorder
+        # Draft-M3 cache-hit accounting is diagnostic-only: it never feeds a
+        # candidate index, victim choice, or prefetch budget.  Keep its fairly
+        # expensive per-layer torch.unique/list walk out of production runs.
+        self._diagnostic_profile_enabled = bool(
+            getattr(config, "engine_profile", False)
+            or getattr(config, "spec_profile", False)
+            or getattr(config, "transfer_aware_profile", False)
+        )
 
         self.global_queue = GlobalWarmStartQueue(config)
         self.long_term_segment_index = SegmentCandidateIndex(config)
@@ -992,6 +1000,8 @@ class PrefetchRuntime:
         return None
 
     def _mark_draft_m3_step_start(self, step_id: int) -> None:
+        if not self._diagnostic_profile_enabled:
+            return
         sid = int(step_id)
         if self._draft_m3_next_is_step0:
             self._draft_m3_step0_steps.add(sid)
@@ -1002,7 +1012,11 @@ class PrefetchRuntime:
         runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
         step_id: int,
     ) -> None:
-        if not runtime_meta or not self.layer_caches:
+        if (
+            not self._diagnostic_profile_enabled
+            or not runtime_meta
+            or not self.layer_caches
+        ):
             return
         sid = int(step_id)
         layer_hits = self._draft_m3_layers_by_step.setdefault(sid, {})

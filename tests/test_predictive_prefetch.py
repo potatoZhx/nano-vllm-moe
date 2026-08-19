@@ -126,7 +126,12 @@ class TestPredictiveDataSeparation(unittest.TestCase):
         self.assertEqual(self._queue_size(rt), 1)
 
     def test_observe_draft_records_m3_cache_hit_group(self):
-        rt, _cache = self._single_layer()
+        pool = {0: {2: _weights()}}
+        cache = _make_cache(cpu_pool=pool[0])
+        cache.put_to_slot(0, 0, _weights()["gate_up"], _weights()["down"])
+        rt = _build_runtime(
+            {0: cache}, pool, cfg=_config(engine_profile=True)
+        )
         rt.begin_draft_iteration(step_id=3)
         rt.observe_draft(_meta(0, [0], step_id=3), step_id=3)
 
@@ -135,6 +140,20 @@ class TestPredictiveDataSeparation(unittest.TestCase):
         self.assertEqual(prof["draft_m3_perfect_count"], 1)
         self.assertEqual(prof["draft_m3_step0_group_count"], 1)
         self.assertEqual(prof["draft_m3_step0_perfect_count"], 1)
+
+    def test_observe_draft_skips_m3_diagnostic_without_profile(self):
+        rt, _cache = self._single_layer()
+        rt.begin_draft_iteration(step_id=3)
+        with patch("nanovllm.expert.prefetcher.torch.unique") as unique:
+            rt._record_draft_m3_cache_hits(
+                _meta(0, [0], step_id=3), step_id=3
+            )
+
+        unique.assert_not_called()
+        self.assertEqual(rt._draft_m3_layers_by_step, {})
+        self.assertEqual(rt._draft_m3_step0_steps, set())
+        prof = rt.get_profile(reset=False)
+        self.assertEqual(prof["draft_m3_group_count"], 0)
 
     def test_observe_draft_stale_step_dropped(self):
         rt, _cache = self._single_layer()
