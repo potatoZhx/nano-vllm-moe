@@ -1,9 +1,29 @@
 # TPOT 优化收尾审计与后续路线图
 
-日期：2026-08-13  
+日期：2026-08-13（2026-08-19 最终更新）
 硬件：RTX 3080 10 GiB，2 x Xeon Gold 5218R  
 模型：Qwen3-30B-A3B  
 主要指标：单请求、固定输出长度的 mean TPOT/TBT
+
+## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
+
+首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
+BF16 hidden**；Nano 当前 `llamafile_f16` 路径使用的是 **FP16 expert 权重 + BF16
+hidden**。Nano 加载的 `cpuinfer_ext` 确实由同一 KTransformers 源码树构建，因此两边
+属于同一个 CPUInfer/llamafile 算子家族，但权重 type 分别是 BF16 与 F16，不能称为
+同一个精度特化实例，也不能据此把性能差异全部归因于外围调度。
+
+此外，KT suite 的 step timer 在 `pick_next_token(logits)` 之前结束，记录的是
+graph-replay model-forward-only；Nano 的 TPOT 包含完整 `llm.step()`，包括 sampling 与
+控制面。最新 KT MMLU-Pro suite mean 为 `66.028 ms`，同源第 0 条为 `71.553 ms`；Nano
+提交 `296cf59` 的同数据集第 0 条完整 step 为 `59.701 ms`。这个结果说明 Nano 候选在
+更宽的计时边界下仍更快，但仍只是既有单请求结果，不是同 dtype、同 token 轨迹的严格
+配对实验。本次收尾未再运行端到端优化验证。
+
+在不改变 dynamic K、route、transfer admission 或 cache 语义的前提下，本日又完成两项
+production metadata 快路径：关闭 profile 时跳过纯诊断 draft M3 统计；用零拷贝 NumPy
+view 加速 draft histogram 收集。二者均通过相关单元测试与等价性/微基准分析，并分别
+提交、分别补文档；按要求未把分析实验的 CPU 毛时间直接写成 TPOT 正收益。
 
 ## 2026-08-18 最新完成状态
 
@@ -94,6 +114,8 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `74a6521` | `optimization_commits/20260813_09_dynamic_k1_k2_tpot.md` | 保留 full-context-safe K1/K2、0.97 门限动态配置，较旧动态改善 20.4%。 |
 | `8b82ce3` | `optimization_commits/20260813_10_dynamic_active14.md` | 新增 active14/0.98 workload-sized 动态最优，三轮均值达到 63.713 ms。 |
 | `296cf59` | `optimization_commits/20260818_11_skip_legacy_mask_d2h.md` | 删除 legacy F16 未使用的每层 mask D2H graph node，代表性数据集请求改善 8.88% 并超过最新 KT。 |
+| `9eea588` | `optimization_commits/20260819_12_skip_unprofiled_draft_m3.md` | profile 关闭时跳过纯诊断 draft M3 unique/cache 统计，不改变候选、预取或动态长度决策。 |
+| `461165c` | `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | 用零拷贝 NumPy view 和稀疏切片加速 production draft histogram 收集，保持 tensor dtype、顺序和值完全一致。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -123,6 +145,8 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimize_ops/ktransformers_integration_strategy.md` | 全替换与迁移两条架构路线 | 短期继续 Nano `kt_direct` 局部优化；长期迁移应分阶段实现 heterogeneous MoE。 |
 | `tpot_vs_ktransformers_20260812.md` | 本机最终对照、所有主要筛选、batch 与口径 | 是当前总体结果的主入口。 |
 | `optimization_commits/20260818_11_skip_legacy_mask_d2h.md` | 最新 KT 重测后的单请求对照、legacy mask 不变量与正收益验收 | 是 59.701 ms 最新结果和跨过 KT 的直接证据。 |
+| `optimization_commits/20260819_12_skip_unprofiled_draft_m3.md` | profile-off 的 draft M3 快路径、等价边界与分析微基准 | 纯诊断统计不再进入 production draft metadata 热路径。 |
+| `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | draft histogram NumPy 稀疏收集、dtype/顺序等价性与分析微基准 | production metadata collect 的 Python/torch 小张量调度明显下降。 |
 
 ## 5. 热点的统一解释
 
@@ -753,3 +777,148 @@ safe 与 workload-sized 两个动态最优；但没有足够证据宣称硬件�
 其中第 1 项是第二次审计新增的最高价值结论：显式 wait 很小不代表 prefetch 免费，当前
 真正昂贵的是主机提交、pageable/sharded copy 和逐 expert publish；后续优化应围绕“每
 次换入的可兑现 CPU route 尾部收益”，而不是围绕“提交数越多越好”。
+
+## 17. 2026-08-19 第三次全局审计与最终路线图
+
+### 17.1 KT 同源算子的准确结论
+
+Nano 已经在使用 KTransformers 构建的
+`cpuinfer_ext.cpython-312-x86_64-linux-gnu.so`，所以“直接换成 KT 同源 CPU 算子”本身
+不是一个尚未实现的优化。真正仍可比较和优化的是：
+
+| 维度 | 最新 KT suite | Nano 当前路径 | 结论 |
+|:---|:---|:---|:---|
+| expert 权重 | BF16 | FP16 (`llamafile_f16`) | 同源但不同权重 type/kernel 特化。 |
+| hidden / output | BF16 | BF16 | 激活侧精度一致。 |
+| CPU 算子 | KExpertsCPU/CPUInfer llamafile | `kt_direct`/CPUInfer llamafile | 底层家族相同，wrapper、route mask 与调度不同。 |
+| step 计时 | model forward 结束即停 | 完整 `llm.step()` | KT 数字不含随后 sampler，Nano 包含。 |
+| heterogeneous route | KT suite 为 CPU experts 主路径 | GPU cache + CPU miss + overlap | Nano 的目标不是复刻 KT 全 CPU 调用边界。 |
+
+因此后续 CPU 主线应是原生 BF16/F16 在**相同 route pattern、qlen、NUMA 和计时边界**下
+分解 wrapper 与 kernel 时间，再决定精度 specialization、任务合并和 GEMM 参数；不能
+用 KT BF16 suite 的总 forward 数字直接断言 BF16 kernel 一定快于 Nano F16 kernel。
+
+### 17.2 本次 metadata 快路径的证据边界
+
+两项实现都没有运行新的端到端候选验证，只做了单元、静态等价性和分析微基准：
+
+| commit | 分析结果 | 外推到既有 profile | 可声称的结论 |
+|:---|:---|:---|:---|
+| `9eea588` | 16 层/item 的诊断路径 `0.235227 -> 0.000222 ms/item`；候选 key 完全一致 | 约 900 个 draft metadata item，对应约 211.5 ms/request CPU 毛工作 | profile-off 不再为不可见诊断结果执行 unique/list/cache 检查；不能等同于 211.5 ms 墙钟收益。 |
+| `461165c` | 48 层、segment16 的 collect `0.393815 -> 0.131757 ms/item`，下降 66.5%；tensor 完全相等 | 约 900 item，对应约 235.9 ms/request CPU 毛工作 | histogram Python/torch 调度显著减少；不能等同于 235.9 ms 墙钟收益。 |
+
+相关 metadata/prefetch 测试共 101 项通过。两个 CPU 毛工作外推合计约 447.4 ms/request
+或 0.874 ms/output token，但它们可能与 GPU、CPUInfer 和 transfer 重叠；只有未来恢复的
+端到端验证才能确认可兑现 TPOT。两项均不改变 dynamic draft length 的 predictor、
+`first_increase`、K2 门限、cache admission 或预取内容。
+
+### 17.3 当前 prefetch/cache 的完整定量画像
+
+active14 既有三轮 profile 的每请求量级为：约 3591--3645 次 expert transfer、约
+33.9--34.4 GB，约 7.0 次 transfer/output token；CPU route ratio 约 89.5%，显式
+prefetch wait 约 120 ms/request。代表性 r0 的 source 为 `predictive_phase1=1172`、
+`verify_segment=1758`、`draft_segment_indexed=661`，对应字节约 11.06、16.59、6.24 GB。
+这说明 transfer/publish 很活跃，但不能证明每个换入都在被驱逐前挽救了 CPU 尾部。
+
+现有 telemetry 只为 `draft_segment` 较完整地记录消费；`predictive_phase1` 与
+`verify_segment` 没有同等级的 source-specific consume/evict/lifetime 归因。总提交、
+总完成和总消费无法回答哪个 source 值得保留，因此在补齐下面字段之前，不应直接修改
+source budget 或 admission gate：
+
+- ticket/source、submit/publish/first-consume/evict step；
+- publish 后实际命中次数、被挽救的 CPU route 和 exposed tail；
+- 每字节收益、未消费即淘汰、重复在途/重复换入；
+- 被换出的 expert 后续 reuse distance 与 displacement cost。
+
+这套低开销 telemetry 是下一项 cache/prefetch 算法优化的必要前置，而不是性能收益提交。
+
+### 17.4 Slot allocation 的离线反例与机会边界
+
+对现有 `offline_profile_20260531_203257.safetensors` 的 `act_freq` 做静态重算，在总预算
+672 slots 下得到：
+
+| 分配 | 静态 top-s coverage | 静态 miss | 相对当前 miss 改善 |
+|:---|---:|---:|---:|
+| uniform 14/layer | 0.602788 | 0.397212 | 0.82% |
+| 当前 `profile_weighted` | 0.599508 | 0.400492 | 基线 |
+| 同一组 slot 值的最优层分配 | 0.605515 | 0.394485 | 1.50% |
+| 无 bucket 限制的 marginal greedy 上界 | 0.605921 | 0.394079 | 1.60% |
+
+当前 weighted allocation 甚至略差于 uniform 的自身静态目标，说明“按 95% coverage 的
+effective expert count 比例分槽”并不等价于最大化固定预算下的边际 hit gain。不过真实
+运行 CPU route ratio 约 89.5%，远高于该旧 artifact 预测的约 40% miss，暴露出 profile
+过旧、reroute、请求分布和动态 cache churn 的巨大失配。结论不是立刻替换 allocation，
+而是先采当前 workload 的 route/consume profile，再在相同 4 bucket/总显存约束下做
+marginal-gain allocator；单独重排旧静态 profile 的理论上界只有约 1.6% 相对 miss 改善。
+
+### 17.5 已明确暂缓或否决的近邻候选
+
+- **把 speculative qlen2 无条件改为 all-CPU**：已有 exact qlen2 CPU-all 的 p50 约
+  `106.938 ms`，而 active14 speculative verify 平均约 `78 ms/call`；扩大分支很可能
+  丢失 GPU cache/overlap，当前不实施。
+- **完全移除 histogram score_sum**：单 token draft 的 activation count 大量并列，
+  score 是跨 segment 排序的重要信号；省一半 metadata 字节不能覆盖 admission 退化风险。
+- **仅依据提交/完成数收紧 prefetch**：缺失 phase1/verify source 消费归因，无法判断
+  冷换入，当前不实施。
+- **直接切 BF16 并宣称复现 KT 加速**：不同 route、wrapper、precision 和计时边界使该
+  推论不成立；应先做原生分项分析。
+- **继续微调动态 0.97 门限**：停止点缺少 alpha2 反事实，且用户要求保留现有最优；
+  当前配置冻结为 fallback。
+
+### 17.6 后续所有可见优化方向（按证据依赖排序）
+
+**P0：先让 prefetch/cache 决策可归因。** 增加 source-tagged consume/evict/lifetime 与
+saved-tail/byte telemetry；据此分别学习 predictive、verify、draft 的 admission/budget；
+合并 ready 查询和 publish 事务，尝试 2--8 expert 的 NUMA-local pinned packing ring、
+批量 H2D 与批量 LUT/mask 更新。`SegmentCandidateIndex` 可进一步做增量排名缓存和 batch
+update，避免 per-layer/per-item Python 排序。
+
+**P1：分解并优化同源 CPUInfer。** 在完全相同的 route pattern 下分析 BF16/F16、
+qlen1/2/3、masked density 和两个 NUMA node，分别记录 queue、grouping、gate/up GEMM、
+SiLU/mul、down GEMM、merge、wrapper 和 exposed sync；再选择 m-block、线程数、task 合并、
+持久 multi-layer task、first-touch、hugepage、core/NUMA affinity。qlen2 all-CPU 只有在
+当前 speculative graph 的针对性分析证明更快后才进入候选。
+
+**P1：压缩和重做 cache placement。** 用新 workload profile 做边际收益 allocator，
+约束为固定总 slots 和少数 bucket shape；加入 churn-aware eviction、protection TTL、未来
+reuse distance、draft/verify 分区或共享策略。并分析 F16、INT8/weight-only expert cache：
+压缩可同时增加 active slots 和 KV 容量，但需要 qlen1/2/3 的小 M 解量化 GEMM 与质量
+验证。score_sum 可先做 FP16、top-N 或 delta 编码的 shadow ranking agreement，而不是
+直接删除。
+
+**P1：继续缩短 metadata/control 热路径。** 将 histogram 的计数、score 聚合、稀疏
+compact 融合到 C++/NumPy/native worker；复用 buffer，避免 GIL 与小 tensor 分配；profile
+关闭时继续排查 step trace、逐层 mode 切换、route counter 和 profile reset。所有
+production fast path 必须保留 profile-on 的完整诊断入口。
+
+**P1/P2：GPU graph 与小 M MoE。** 对 qlen1/2/3 分别固定 grouped GEMM；融合 route plan、
+down-weight/scatter/reduce/CPU add，复用持久 workspace；再按可测上限处理 QKV split、
+q/k norm、RoPE、KV store、acceptance、LM head 和 sampler。acceptance 当前绝对硬上限仅
+约 1.07%，不应排在 CPU/prefetch 之前。
+
+**P2：在当前动态长度框架内升级决策。** 现有 0.97 实质比较 K1 与 K0，下一版应收集
+停止点 alpha2 与 qlen2/3 边际成本，直接预测 `E[TPOT(K2)] < E[TPOT(K1)]`；feature 可含
+first-step confidence、route/cache、transfer backlog、KV length 和条件 acceptance。
+低置信度/分布外一律退回现有 K1/K2 preset，永久保留
+`k2_dynamic_f16_3080` 与 `k2_dynamic_f16_3080_active14`。
+
+**P2/P3：容量、workload 与架构。** 分析 KV/cache 量化、prefix cache、连续 batching、
+跨请求 route 合批和 cache 隔离；覆盖 prompt/output 长度、sampling、并发、p95/p99、TTFT、
+吞吐和能耗。更大改动包括 early-exit/self-spec、Medusa/EAGLE/tree speculative、CPU
+expert INT8/稀疏化，以及把 heterogeneous MoE/spec/prefetch/graph 分阶段迁入 KT runtime。
+这些都应使用独立 preset 和正确性/质量门禁，不覆盖当前 exact 基线。
+
+### 17.7 最终执行顺序与冻结项
+
+本路线至此停止新增优化验证。恢复实验后，最合理顺序是：
+
+1. source-specific telemetry 与 current-workload route/profile；
+2. pinned packing/batched publish 和 CPUInfer BF16/F16 原生分项；
+3. 新 profile 上的 marginal cache allocation 与 cache 压缩；
+4. metadata/control/native batch 快路径和 GPU MoE/graph 融合；
+5. shadow alpha2 后的 K2-vs-K1 动态控制器；
+6. workload/concurrency 与新 speculative 架构。
+
+冻结不变的资产包括：两个动态最优 preset、single-weight、现有 exact sampling/correctness
+语义、每项正收益单独提交并同提交补文档的规则。`9eea588` 与 `461165c` 是最后两项实现
+提交；本节作为 docs-only 全局收尾，不把任何分析微基准包装成端到端收益。
