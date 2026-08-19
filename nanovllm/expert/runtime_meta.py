@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from nanovllm.config import Config
@@ -668,14 +669,59 @@ class ModelRuntimeMetaRecorder:
         layer_end = self.num_layers if layer_end_value is None else min(self.num_layers, int(layer_end_value))
         layer_start = min(layer_start, self.num_layers)
         layer_end = max(layer_start, layer_end)
+        fmt = getattr(handle, "metadata_format", "raw")
+        histogram_token_counts = (
+            token_counts.numpy() if fmt == "histogram" else None
+        )
+        histogram_counts = (
+            host["activation_count"].numpy() if fmt == "histogram" else None
+        )
+        histogram_scores = (
+            host["score_sum"].numpy()
+            if fmt == "histogram" and "score_sum" in host
+            else None
+        )
 
         for layer_idx in range(layer_start, layer_end):
-            token_count = int(token_counts[layer_idx].item())
+            token_count = int(
+                histogram_token_counts[layer_idx]
+                if histogram_token_counts is not None
+                else token_counts[layer_idx].item()
+            )
             token_count = min(token_count, int(handle.logical_token_count))
             if token_count <= 0:
                 continue
-            fmt = getattr(handle, "metadata_format", "raw")
-            if fmt in ("histogram", "histogram_kt_hybrid"):
+            if fmt == "histogram":
+                # This is the production draft-segment format.  The buffers
+                # are already on CPU, and NumPy extracts these tiny sparse
+                # rows with substantially less dispatcher overhead than a
+                # per-layer chain of torch.nonzero/index_select/to calls.
+                counts_array = histogram_counts[layer_idx]
+                nonzero_array = np.flatnonzero(counts_array)
+                if nonzero_array.size <= 0:
+                    continue
+                nonzero = torch.from_numpy(nonzero_array)
+                counts = torch.from_numpy(
+                    counts_array[nonzero_array].astype(np.int64, copy=False)
+                )
+                if histogram_scores is not None:
+                    score_array = histogram_scores[layer_idx]
+                    score_sum = torch.from_numpy(
+                        score_array[nonzero_array].astype(np.float32, copy=False)
+                    )
+                else:
+                    score_sum = counts.to(dtype=torch.float32)
+                out[layer_idx] = LayerRuntimeMetaCPU(
+                    step_id=handle.step_id,
+                    mode=handle.mode,
+                    layer_idx=layer_idx,
+                    token_count=token_count,
+                    aggregated_expert_ids=nonzero,
+                    aggregated_score_sum=score_sum,
+                    aggregated_activation_count=counts,
+                )
+                continue
+            if fmt == "histogram_kt_hybrid":
                 counts_row = host["activation_count"][layer_idx]
                 nonzero = torch.nonzero(counts_row, as_tuple=False).reshape(-1)
                 if nonzero.numel() <= 0:
@@ -697,7 +743,7 @@ class ModelRuntimeMetaRecorder:
                     aggregated_score_sum=score_sum,
                     aggregated_activation_count=counts,
                 )
-                if fmt == "histogram_kt_hybrid" and "expert_status" in host:
+                if "expert_status" in host:
                     status_row = host["expert_status"][layer_idx]
                     act_row = host["activation_count"][layer_idx]
                     is_real_active = act_row > 0
