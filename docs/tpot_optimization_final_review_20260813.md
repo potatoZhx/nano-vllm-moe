@@ -117,7 +117,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `9eea588` | `optimization_commits/20260819_12_skip_unprofiled_draft_m3.md` | profile 关闭时跳过纯诊断 draft M3 unique/cache 统计，不改变候选、预取或动态长度决策。 |
 | `461165c` | `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | 用零拷贝 NumPy view 和稀疏切片加速 production draft histogram 收集，保持 tensor dtype、顺序和值完全一致。 |
 | `0a40f64` | `optimization_commits/20260819_14_prefetch_source_lifecycle_telemetry.md` | 补齐按 source 的首次消费、未消费换出、驻留时间和替换矩阵，且 production-off 不承担生命周期统计。 |
-| 本提交 | `optimization_commits/20260819_15_recent_verify_phase1.md` | 独立 preset 让 phase1 复用近期 verify route，analysis-only 首次消费率提高 6.25x、未消费换出字节下降 70.15%。 |
+| `41008d4` | `optimization_commits/20260819_15_recent_verify_phase1.md` | 独立 preset 让 phase1 复用近期 verify route，analysis-only 首次消费率提高 6.25x、未消费换出字节下降 70.15%。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
