@@ -407,6 +407,7 @@ class TestEnqueueVerifySegmentMetadata(unittest.TestCase):
 
         mr.prefetch_runtime = MagicMock()
         mr.prefetch_runtime.metadata_stream = None
+        mr.prefetch_runtime._diagnostic_profile_enabled = False
         mr.prefetch_runtime._source_lifecycle_profile_enabled = False
         mr.runtime_meta_recorder = MagicMock()
 
@@ -444,9 +445,20 @@ class TestEnqueueVerifySegmentMetadata(unittest.TestCase):
         call_kwargs = mr._enqueue_prefetch_metadata.call_args
         self.assertIsNone(call_kwargs.kwargs["submit_after_phase"])
 
-    def test_last_segment_records_verify_consumed(self):
+    def test_production_last_segment_skips_verify_consumed(self):
         from nanovllm.engine.model_runner import ModelRunner
         mr = self._make_runner_with_prefetch()
+        ModelRunner._enqueue_verify_segment_metadata(
+            mr, step_id=1, token_capacity=16,
+            layer_start_idx=36, layer_end_idx=48, is_last_segment=True,
+        )
+        call_kwargs = mr._enqueue_prefetch_metadata.call_args
+        self.assertFalse(call_kwargs.kwargs["record_verify_consumed"])
+
+    def test_diagnostic_last_segment_records_verify_consumed(self):
+        from nanovllm.engine.model_runner import ModelRunner
+        mr = self._make_runner_with_prefetch()
+        mr.prefetch_runtime._diagnostic_profile_enabled = True
         ModelRunner._enqueue_verify_segment_metadata(
             mr, step_id=1, token_capacity=16,
             layer_start_idx=36, layer_end_idx=48, is_last_segment=True,

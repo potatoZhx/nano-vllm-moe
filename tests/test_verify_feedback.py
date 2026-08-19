@@ -13,6 +13,7 @@ from nanovllm.scheduling.prefetch_strategy import create_prefetch_strategy
 class TestVerifyFeedback(unittest.TestCase):
     def test_verify_consumed_count(self):
         cfg = SimpleNamespace(
+            engine_profile=True,
             prefetch_step_budget=1,
             prefetch_max_inflight=1,
             cache_eviction_budget_per_step=1,

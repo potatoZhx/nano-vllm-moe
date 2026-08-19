@@ -1018,6 +1018,12 @@ class PrefetchRuntime:
         *,
         step_id: int,
     ) -> None:
+        # Recent-publication consumption counters and source residency are
+        # diagnostic-only.  None of these maps feed admission, ranking,
+        # eviction, or draft-length decisions, so production runs must not
+        # maintain and later scan them.
+        if not bool(getattr(self, "_diagnostic_profile_enabled", False)):
+            return
         key = (int(ticket.layer_idx), int(ticket.expert_idx))
         self._recent_published[key] = int(step_id)
         self._recent_published_source[key] = str(ticket.source)
@@ -2640,7 +2646,10 @@ class PrefetchRuntime:
         runtime_meta: dict[int, LayerRuntimeMetaCPU] | None,
         step_id: int,
     ) -> None:
-        if not runtime_meta:
+        if (
+            not bool(getattr(self, "_diagnostic_profile_enabled", False))
+            or not runtime_meta
+        ):
             return
         consumed = 0
         for layer_idx, meta in runtime_meta.items():

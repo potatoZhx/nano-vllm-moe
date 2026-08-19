@@ -5711,13 +5711,21 @@ class ModelRunner:
             submit_after_phase=None,
             frontier_layer_idx=int(layer_end_idx) - 1,
             record_verify_consumed=bool(
-                is_last_segment
-                or getattr(
+                getattr(
                     prefetch_runtime,
                     "_source_lifecycle_profile_enabled",
                     False,
                 )
                 is True
+                or (
+                    is_last_segment
+                    and getattr(
+                        prefetch_runtime,
+                        "_diagnostic_profile_enabled",
+                        False,
+                    )
+                    is True
+                )
             ),
         )
         if self.profile_enabled and self.rank == 0:

@@ -180,6 +180,8 @@ class TestPrefetchRuntime(unittest.TestCase):
         self.assertEqual(runtime.publish_ready(step_id=1), 1)
 
         self.assertEqual(runtime._prefetch_active_residencies, {})
+        self.assertEqual(runtime._recent_published, {})
+        self.assertEqual(runtime._recent_published_source, {})
         profile = runtime.get_profile(reset=False)
         self.assertNotIn("prefetch_consumed_count_by_source", profile)
 
@@ -349,6 +351,7 @@ class TestPrefetchRuntime(unittest.TestCase):
 
     def test_draft_segment_indexed_prefetch_uses_segment_index_and_deferred_mapping(self):
         cfg = self._config()
+        cfg.engine_profile = True
         cfg.prefetch_runtime_mode = "draft_segment_indexed"
         cfg.prefetch_staging_slots_per_layer = 0
         cfg.draft_prefetch_segment_size = 1
