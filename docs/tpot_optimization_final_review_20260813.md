@@ -50,6 +50,11 @@ commit 都不覆盖。
 未改善且随机轨迹不同，因此仍不覆盖 `296cf59` 同日 56.846 的全局最佳 commit。
 后续 t28 单请求为 60.595 ms/token，比 t32 回退 1.55%，因此不新增 t28 preset。
 
+继续按 exact-Nano 参数测试 `group_min_len=2`：qlen1 的 CPUInfer 微基准改善 6.13%，
+但一条真实请求从 t32 的 59.673 回退到 **60.487 ms/token（+1.37%）**。候选虽然平均
+round wall 从 116.830 降到 114.056 ms，却因随机轨迹分叉多出 10 个 rounds；按门禁
+撤销全部配置/运行时代码，保留 `group_min_len=1`。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -208,6 +213,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | consumption 诊断 gate、微基准与单请求 TPOT | production-off 不再维护/扫描诊断 map，profile-on 能力保留。 |
 | `optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` | profile 聚合删除微基准、TPOT 负结果与时序解释 | 候选回退 15.48% 并已撤销；异步 pacing 需先显式建模。 |
 | `optimization_commits/20260819_22_cpuinfer_t32.md` | t12--t40 同源 CPUInfer 扫描与单请求 TPOT | 当前分支推荐 2 x 16；t16/t28/active14 fallback 全保留。 |
+| `optimization_commits/20260819_23_rejected_cpuinfer_groupmin2.md` | exact-Nano qlen1/2/3 微基准与一条 TPOT 负结果 | group_min=2 回退 1.37%，运行时代码撤销并保留 group_min=1。 |
 
 ## 5. 热点的统一解释
 
@@ -937,7 +943,9 @@ update，避免 per-layer/per-item Python 排序。
 **P1：分解并优化同源 CPUInfer。** 在完全相同的 route pattern 下分析 BF16/F16、
 qlen1/2/3、masked density 和两个 NUMA node，分别记录 queue、grouping、gate/up GEMM、
 SiLU/mul、down GEMM、merge、wrapper 和 exposed sync；再选择 m-block、线程数、task 合并、
-持久 multi-layer task、first-touch、hugepage、core/NUMA affinity。qlen2 all-CPU 只有在
+持久 multi-layer task、first-touch、hugepage、core/NUMA affinity。`group_min_len=2` 已
+出现“qlen1 微基准快 6.13%、单请求 TPOT 慢 1.37%”的反例，后续不得用孤立 kernel
+结果直接保留运行时改动。qlen2 all-CPU 只有在
 当前 speculative graph 的针对性分析证明更快后才进入候选。
 
 **P1：压缩和重做 cache placement。** 用新 workload profile 做边际收益 allocator，
