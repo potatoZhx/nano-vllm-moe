@@ -83,6 +83,27 @@ source lifecycle 统计支持。
 候选 profile TPOT 为 61.505 ms，baseline 为 66.608 ms；二者都开启重 instrumentation，
 按用户要求不作为端到端优化验收，也不更新 59.701 ms 正式最佳点。
 
+## 后补的 production-off 单请求验收
+
+用户恢复逐优化 TPOT 门禁后，在 `ac254df` 当前 runtime 上关闭所有 profiling，使用同一
+MMLU-Pro validation 第 0 条、seed 20260719、512 固定输出、temperature 0.6、
+single-weight F16 和 2 x 8 CPUInfer：
+
+| preset | TPOT | decode rounds | mean round wall | validation |
+|:---|---:|---:|---:|:---|
+| 原 `k2_dynamic_f16_3080_active14` | 60.526 ms | 264 | 117.154 ms | 512 token，valid |
+| `...active14_phase1_recent` | **60.420 ms** | 281 | **109.874 ms** | 512 token，valid |
+| 变化 | **-0.106 ms / -0.175%** | +17 | **-7.280 ms** | 无错误 |
+
+输出从第 60 token 起分叉。recent 候选多执行 17 个 speculative round，仍以更低的平均
+round wall 得到小幅总 TPOT 正收益，方向与 analysis-only 的消费率和 CPU route 证据一致；
+但 0.175% 低于单请求常见漂移，不能宣称稳健显著收益。按用户的一条请求正收益规则，
+将该独立 preset 作为当前分支推荐候选，同时永久保留原 active14 fallback。
+
+该结果仍慢于同日复跑全局锚点 `296cf59 + active14` 的 56.846 ms/token，不更新全局最佳
+commit。结果目录：`results/tpot_phase1_recent_current_20260819/`；基线为
+`results/tpot_active14_skip_consumed_diag_20260819/`。
+
 ## 启动 OOM 与修复
 
 新增 preset 第一次运行时遗漏在 `NANOVLLM_GROUPED_GEMM_FIXED_QWEN3=1` 的 preset

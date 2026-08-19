@@ -38,6 +38,12 @@ round wall 也增加 13.193 ms。该聚合位于 async worker 的 observe 之前
 作用；候选已完全撤销，仅在
 `optimization_commits/20260819_21_rejected_skip_verify_meta_profile.md` 保留负结果。
 
+最后对已独立保留的 `active14_phase1_recent` 做 production-off 正式验收：当前 runtime
+上从 active14 的 60.526 小幅降至 **60.420 ms/token（-0.175%）**，候选虽多 17 个
+rounds，平均 round wall 仍下降 7.280 ms。按单请求正收益规则将 recent preset 作为当前
+分支推荐候选；因收益很小且随机轨迹分叉，原 active14 fallback 与 `296cf59` 全局最佳
+commit 都不覆盖。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -151,7 +157,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `9eea588` | `optimization_commits/20260819_12_skip_unprofiled_draft_m3.md` | profile 关闭时跳过纯诊断 draft M3 unique/cache 统计，不改变候选、预取或动态长度决策。 |
 | `461165c` | `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | 用零拷贝 NumPy view 和稀疏切片加速 production draft histogram 收集，保持 tensor dtype、顺序和值完全一致。 |
 | `0a40f64` | `optimization_commits/20260819_14_prefetch_source_lifecycle_telemetry.md` | 补齐按 source 的首次消费、未消费换出、驻留时间和替换矩阵，且 production-off 不承担生命周期统计。 |
-| `41008d4` | `optimization_commits/20260819_15_recent_verify_phase1.md` | 独立 preset 让 phase1 复用近期 verify route，analysis-only 首次消费率提高 6.25x、未消费换出字节下降 70.15%。 |
+| `41008d4` | `optimization_commits/20260819_15_recent_verify_phase1.md` | phase1 复用近期 verify route；消费率提高 6.25x，后补单请求 TPOT 小幅改善 0.175%。 |
 | `28ca880` | `optimization_commits/20260819_16_cpuinfer_precision_numa_analysis.md` | 同 route 微基准证明 BF16/F16 基本持平、2 x 8 NUMA 明显优于单 NUMA，继续保留当前 CPUInfer 布局。 |
 | `cd2cb06` | `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | 复用 verify plan 的 CPU route mask；两套单请求均优于直接前序，但未刷新全局最佳。 |
 | `2654eb4` | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准虽快，两套单请求均回退，作为被否决候选保留记录。 |
