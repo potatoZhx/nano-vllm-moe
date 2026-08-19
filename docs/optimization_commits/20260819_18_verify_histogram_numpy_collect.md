@@ -1,4 +1,4 @@
-# Verify histogram NumPy collect 快路径
+# Verify histogram NumPy collect 快路径（端到端未通过，已回退）
 
 ## 问题
 
@@ -43,8 +43,28 @@ expert、score/status 均开启。每轮连续 collect 200 次，15 轮取中位
 分析开启了 `transfer_aware_profile`，会强制使用 raw route metadata，因此那次 profile 的
 13.70 ms/verify collect 不在本优化覆盖范围，不能拿来外推收益。
 
-按用户要求没有运行新的端到端优化验证；正式最优仍为既有 `59.701 ms/token`，动态最优
-preset 保持不变。
+微基准只测孤立 CPU readback；恢复端到端验收后，该实现没有通过正收益门禁，见下节。
+
+## 单请求 TPOT 与回退决定
+
+同一 MMLU-Pro validation 第 0 条、seed 20260719、512 固定输出、temperature 0.6、
+single-weight F16、2 x 8 CPUInfer，各版本运行一次；engine/transfer/profile timing 全关。
+
+| preset | route-mask 前序 `cd2cb06` | 加入本改动 `2654eb4` | 变化 | decode rounds |
+|:---|---:|---:|---:|---:|
+| `...active14_phase1_recent` | 60.156 ms | 65.567 ms | **+8.99%** | 260 -> 266 |
+| `...active14` | 62.637 ms | 68.960 ms | **+10.10%** | 271 -> 267 |
+
+两条输出都通过 512-token validation，但 stochastic token 轨迹分别在第 60/64 个 token
+起分叉。active14 候选虽然还少执行 4 个 decode round，总 decode 仍多 3.231 秒，因而
+不能用“候选多跑了”解释回退。两套真实请求都为负收益，孤立 collect 的 78.7% 微基准
+没有兑现为端到端收益。
+
+结论：`2654eb4` 仅保留为被否决候选的历史证据；当前分支通过后续
+`REVERT_COMMIT` 恢复原 PyTorch verify hybrid collect。dynamic preset、draft NumPy
+collect 与 route-mask 优化均不回退。结果目录为
+`results/tpot_ab_route_metadata_20260819/` 和
+`results/tpot_ab_active14_formal_20260819/`。
 
 ## 正确性与测试
 
@@ -67,5 +87,5 @@ conda run -n nano_moe pytest -q \
 
 ## 一句话总结
 
-让 verify histogram 复用 draft 已验证的 NumPy 稀疏提取方式，把 48 层 metadata collect
-CPU 开销降低 78.7%，并保持 pooled buffer 的独立复制语义。
+verify NumPy collect 虽把孤立 CPU 微基准降低 78.7%，但两套单请求 TPOT 分别回退
+8.99%/10.10%，因此按端到端正收益门禁撤销。

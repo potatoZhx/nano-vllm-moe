@@ -670,25 +670,15 @@ class ModelRuntimeMetaRecorder:
         layer_start = min(layer_start, self.num_layers)
         layer_end = max(layer_start, layer_end)
         fmt = getattr(handle, "metadata_format", "raw")
-        is_histogram = fmt in {"histogram", "histogram_kt_hybrid"}
-        histogram_token_counts = token_counts.numpy() if is_histogram else None
+        histogram_token_counts = (
+            token_counts.numpy() if fmt == "histogram" else None
+        )
         histogram_counts = (
-            host["activation_count"].numpy() if is_histogram else None
+            host["activation_count"].numpy() if fmt == "histogram" else None
         )
         histogram_scores = (
             host["score_sum"].numpy()
-            if is_histogram and "score_sum" in host
-            else None
-        )
-        histogram_status = (
-            host["expert_status"].numpy()
-            if fmt == "histogram_kt_hybrid" and "expert_status" in host
-            else None
-        )
-        histogram_execution_counts = (
-            host["execution_activation_count"].numpy()
-            if fmt == "histogram_kt_hybrid"
-            and "execution_activation_count" in host
+            if fmt == "histogram" and "score_sum" in host
             else None
         )
 
@@ -701,10 +691,11 @@ class ModelRuntimeMetaRecorder:
             token_count = min(token_count, int(handle.logical_token_count))
             if token_count <= 0:
                 continue
-            if is_histogram:
-                # Histogram buffers are already on CPU.  NumPy extracts these
-                # tiny sparse rows with substantially less dispatcher overhead
-                # than a per-layer chain of torch.nonzero/index_select/to calls.
+            if fmt == "histogram":
+                # This is the production draft-segment format.  The buffers
+                # are already on CPU, and NumPy extracts these tiny sparse
+                # rows with substantially less dispatcher overhead than a
+                # per-layer chain of torch.nonzero/index_select/to calls.
                 counts_array = histogram_counts[layer_idx]
                 nonzero_array = np.flatnonzero(counts_array)
                 if nonzero_array.size <= 0:
@@ -720,7 +711,7 @@ class ModelRuntimeMetaRecorder:
                     )
                 else:
                     score_sum = counts.to(dtype=torch.float32)
-                meta = LayerRuntimeMetaCPU(
+                out[layer_idx] = LayerRuntimeMetaCPU(
                     step_id=handle.step_id,
                     mode=handle.mode,
                     layer_idx=layer_idx,
@@ -729,17 +720,40 @@ class ModelRuntimeMetaRecorder:
                     aggregated_score_sum=score_sum,
                     aggregated_activation_count=counts,
                 )
-                if histogram_status is not None:
-                    status_array = histogram_status[layer_idx]
-                    meta.expert_status = torch.from_numpy(status_array.copy())
-                    meta.active_count = float(nonzero_array.size)
-                    meta.miss_count = float(
-                        np.count_nonzero(status_array[nonzero_array] == 2)
+                continue
+            if fmt == "histogram_kt_hybrid":
+                counts_row = host["activation_count"][layer_idx]
+                nonzero = torch.nonzero(counts_row, as_tuple=False).reshape(-1)
+                if nonzero.numel() <= 0:
+                    continue
+                counts = counts_row.index_select(0, nonzero).to(dtype=torch.int64, device=torch.device("cpu"))
+                if "score_sum" in host:
+                    score_sum = host["score_sum"][layer_idx].index_select(0, nonzero).to(
+                        dtype=torch.float32,
+                        device=torch.device("cpu"),
                     )
-                    if histogram_execution_counts is not None:
-                        meta.execution_activation_count = torch.from_numpy(
-                            histogram_execution_counts[layer_idx].copy()
-                        )
+                else:
+                    score_sum = counts.to(dtype=torch.float32, device=torch.device("cpu"))
+                meta = LayerRuntimeMetaCPU(
+                    step_id=handle.step_id,
+                    mode=handle.mode,
+                    layer_idx=layer_idx,
+                    token_count=token_count,
+                    aggregated_expert_ids=nonzero.to(dtype=torch.int64, device=torch.device("cpu")),
+                    aggregated_score_sum=score_sum,
+                    aggregated_activation_count=counts,
+                )
+                if "expert_status" in host:
+                    status_row = host["expert_status"][layer_idx]
+                    act_row = host["activation_count"][layer_idx]
+                    is_real_active = act_row > 0
+                    meta.expert_status = status_row.clone()
+                    meta.active_count = float(is_real_active.sum().item())
+                    meta.miss_count = float(((status_row == 2) & is_real_active).sum().item())
+                    if "execution_activation_count" in host:
+                        meta.execution_activation_count = host[
+                            "execution_activation_count"
+                        ][layer_idx].clone()
                 out[layer_idx] = meta
                 continue
             if fmt == "score_sum":

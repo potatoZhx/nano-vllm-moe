@@ -5,6 +5,28 @@
 模型：Qwen3-30B-A3B  
 主要指标：单请求、固定输出长度的 mean TPOT/TBT
 
+## 2026-08-19 恢复逐改动端到端验收
+
+用户澄清后，运行时优化恢复为“每轮改动至少跑一条真实请求 TPOT”的门禁。用同一个
+MMLU-Pro validation 第 0 条、seed 20260719、512 固定输出、temperature 0.6、active14、
+single-weight F16、2 x 8 CPUInfer 且全部 profiling 关闭，补测结果为：
+
+| 节点 | TPOT | decode rounds | 相对直接前序 | 决定 |
+|:---|---:|---:|---:|:---|
+| `296cf59` 同日锚点复跑 | **56.846 ms** | 264 | - | 继续作为全局最佳 commit |
+| `28ca880`（本轮两项前） | 70.663 ms | 284 | +24.31% | 未刷新最佳 |
+| `cd2cb06` route-mask 复用 | 62.637 ms | 271 | **-11.36%** | 相对直接前序为正，保留 |
+| `2654eb4` verify NumPy collect | 68.960 ms | 267 | **+10.10%** | 负收益，回退 |
+
+同一旧提交 `296cf59` 在 2026-08-18 的一次结果为 59.701 ms，本日复跑为 56.846 ms，
+说明随机 sampling 路径与系统状态足以造成显著单请求漂移。四条输出都通过 validation，
+但 token 轨迹从约第 64 token 起分叉；因此单请求用于可用版本门禁，微小实现收益仍需结合
+同轨迹/微基准分析，不能把全部差值都做因果归因。
+
+另用 `active14_phase1_recent` 补测时，`28ca880 -> cd2cb06 -> 2654eb4` 分别为
+65.072 -> 60.156 -> 65.567 ms/token，独立地支持“保留 route-mask、回退 verify NumPy
+collect”的决定。正式最佳仍属于 `296cf59 + active14`，后续改动截至这里没有刷新它。
+
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
 首先纠正一个容易混淆的表述：最新 KTransformers suite 使用的是 **BF16 expert 权重 +
@@ -18,7 +40,8 @@ graph-replay model-forward-only；Nano 的 TPOT 包含完整 `llm.step()`，包�
 控制面。最新 KT MMLU-Pro suite mean 为 `66.028 ms`，同源第 0 条为 `71.553 ms`；Nano
 提交 `296cf59` 的同数据集第 0 条完整 step 为 `59.701 ms`。这个结果说明 Nano 候选在
 更宽的计时边界下仍更快，但仍只是既有单请求结果，不是同 dtype、同 token 轨迹的严格
-配对实验。本次收尾未再运行端到端优化验证。
+配对实验。当时的收尾阶段未再运行端到端优化验证；按上节用户澄清，现已补跑逐提交
+端到端验证。
 
 在不改变 dynamic K、route、transfer admission 或 cache 语义的前提下，本日又完成两项
 production metadata 快路径：关闭 profile 时跳过纯诊断 draft M3 统计；用零拷贝 NumPy
@@ -118,6 +141,10 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `461165c` | `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | 用零拷贝 NumPy view 和稀疏切片加速 production draft histogram 收集，保持 tensor dtype、顺序和值完全一致。 |
 | `0a40f64` | `optimization_commits/20260819_14_prefetch_source_lifecycle_telemetry.md` | 补齐按 source 的首次消费、未消费换出、驻留时间和替换矩阵，且 production-off 不承担生命周期统计。 |
 | `41008d4` | `optimization_commits/20260819_15_recent_verify_phase1.md` | 独立 preset 让 phase1 复用近期 verify route，analysis-only 首次消费率提高 6.25x、未消费换出字节下降 70.15%。 |
+| `28ca880` | `optimization_commits/20260819_16_cpuinfer_precision_numa_analysis.md` | 同 route 微基准证明 BF16/F16 基本持平、2 x 8 NUMA 明显优于单 NUMA，继续保留当前 CPUInfer 布局。 |
+| `cd2cb06` | `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | 复用 verify plan 的 CPU route mask；两套单请求均优于直接前序，但未刷新全局最佳。 |
+| `2654eb4` | `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准虽快，两套单请求均回退，作为被否决候选保留记录。 |
+| `REVERT_COMMIT` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -149,6 +176,10 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260818_11_skip_legacy_mask_d2h.md` | 最新 KT 重测后的单请求对照、legacy mask 不变量与正收益验收 | 是 59.701 ms 最新结果和跨过 KT 的直接证据。 |
 | `optimization_commits/20260819_12_skip_unprofiled_draft_m3.md` | profile-off 的 draft M3 快路径、等价边界与分析微基准 | 纯诊断统计不再进入 production draft metadata 热路径。 |
 | `optimization_commits/20260819_13_numpy_draft_histogram_collect.md` | draft histogram NumPy 稀疏收集、dtype/顺序等价性与分析微基准 | production metadata collect 的 Python/torch 小张量调度明显下降。 |
+| `optimization_commits/20260819_16_cpuinfer_precision_numa_analysis.md` | KT/Nano 精度、route density 与 NUMA 配对微基准 | BF16 不是 KT 更快的充分解释；Nano 继续使用 F16 与 2 x 8 NUMA。 |
+| `optimization_commits/20260819_17_reuse_verify_cpu_route_mask.md` | route-mask 复用、CUDA graph 微基准与两套单请求 TPOT | 相对直接前序为正，未刷新 `296cf59` 全局锚点。 |
+| `optimization_commits/20260819_18_verify_histogram_numpy_collect.md` | verify NumPy collect 微基准和端到端负结果 | 被否决候选；不能用孤立 collect 微基准代替 TPOT。 |
+| `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 回退范围、正式 TPOT 门禁与保留项 | 当前 runtime 恢复 PyTorch verify collect，动态 preset 不变。 |
 
 ## 5. 热点的统一解释
 
