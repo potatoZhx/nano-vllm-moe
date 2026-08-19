@@ -44,6 +44,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080_active14_phase1_recent",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
+    "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -262,6 +263,13 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
 OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"] = {
     **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"],
     "predictive_phase1_budget": 2,
+}
+
+# The single highest-ranked recent candidate is the retained one-request best;
+# keep budget2 and budget4 as independent fallbacks for broader workloads.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"],
+    "predictive_phase1_budget": 1,
 }
 
 def str2bool(value: str | bool) -> bool:
@@ -520,6 +528,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14_phase1_recent",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:

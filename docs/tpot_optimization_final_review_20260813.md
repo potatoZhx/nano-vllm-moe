@@ -18,6 +18,7 @@ single-weight F16、2 x 8 CPUInfer 且全部 profiling 关闭，补测结果为�
 | `cd2cb06` route-mask 复用 | 62.637 ms | 271 | **-11.36%** | 相对直接前序为正，保留 |
 | `2654eb4` verify NumPy collect | 68.960 ms | 267 | **+10.10%** | 负收益，回退 |
 | recent-t32 phase1 budget2 | **55.169 ms** | 255 | **-7.55% vs budget4** | 新单请求最佳，独立 preset 保留 |
+| recent-t32 phase1 budget1 | **53.726 ms** | 261 | **-2.62% vs budget2** | 再次刷新单请求最佳，独立 preset 保留 |
 
 同一旧提交 `296cf59` 在 2026-08-18 的一次结果为 59.701 ms，本日复跑为 56.846 ms，
 说明随机 sampling 路径与系统状态足以造成显著单请求漂移。四条输出都通过 validation，
@@ -61,6 +62,11 @@ round wall 从 116.830 降到 114.056 ms，却因随机轨迹分叉多出 10 个
 110.555 ms；该点还比 `296cf59` 同日锚点 56.846 快 **2.95%**，因此成为当前单请求
 全局最佳。新增独立 `...phase1_recent_t32_b2` preset，budget4 与所有动态 fallback 不变。
 同轮 0.98 动态门限为 61.020 ms/token（+2.26%）而被否决，0.97 继续保留。
+
+继续收紧 phase1 budget 到 1 后，单请求进一步降至 **53.726 ms/token**：相对 budget2
+改善 2.62%，相对 budget4 改善 9.97%，相对 `296cf59` 同日锚点改善 5.49%。b1 虽比
+b2 多 6 个 decode rounds，mean round wall 仍从 110.555 降到 105.187 ms。新增独立
+`...phase1_recent_t32_b1` preset，并保留 b2/b4 作为跨 workload fallback。
 
 ## 2026-08-19 最终补充：KT 精度口径与 metadata/prefetch 收尾
 
@@ -182,6 +188,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `f844475` | `optimization_commits/20260819_19_revert_verify_histogram_numpy_collect.md` | 恢复已实测更快的 PyTorch verify hybrid collect，保留 route-mask 与动态配置。 |
 | `ac254df` | `optimization_commits/20260819_20_skip_production_verify_consumption.md` | production-off 跳过只供诊断的 verify consumption 状态，单请求 TPOT 改善 3.37%。 |
 | `b8be0aa` | `optimization_commits/20260819_22_cpuinfer_t32.md` | 保留双 NUMA 2 x 16 CPUInfer preset，微基准改善 7.83%、单请求 TPOT 改善 1.24%。 |
+| `1602a85` | `optimization_commits/20260819_24_phase1_budget2.md` | recent phase1 budget4→2，单请求达到 55.169 ms/token 并刷新当时最佳。 |
 
 相对较早的核心历史提交也应保留在理解调用链时使用：
 
@@ -222,6 +229,7 @@ miss MoE、KV 带宽和 graph launch 的 roofline 下界，并用 native CPUInfe
 | `optimization_commits/20260819_22_cpuinfer_t32.md` | t12--t40 同源 CPUInfer 扫描与单请求 TPOT | 当前分支推荐 2 x 16；t16/t28/active14 fallback 全保留。 |
 | `optimization_commits/20260819_23_rejected_cpuinfer_groupmin2.md` | exact-Nano qlen1/2/3 微基准与一条 TPOT 负结果 | group_min=2 回退 1.37%，运行时代码撤销并保留 group_min=1。 |
 | `optimization_commits/20260819_24_phase1_budget2.md` | budget2 正收益、0.98 门限负结果与 m_block 扫描 | phase1 budget2 达到 55.169 ms/token，并保留所有父 preset。 |
+| `optimization_commits/20260819_25_phase1_budget1.md` | budget1 的相邻点正收益与输出/round 对照 | phase1 budget1 达到 53.726 ms/token，b2/b4 fallback 均保留。 |
 
 ## 5. 热点的统一解释
 
