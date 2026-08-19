@@ -52,11 +52,28 @@ verify/draft/phase1 分别提交 1560/711/260 个 expert；没有 late transfer 
 
 - phase1 budget1 与 verify vpb2 是当前相邻扫描保留点；
 - 单看 source 或 segment 消费率不足以安全删除第二候选；
-- profile 中同步 boundary submit 在 instrumentation 下仍有明显可见成本，下一步应测试
-  当前低预算路径能否由已有 async boundary worker 隐藏，而不是继续砍候选数量；
+- profile 中同步 boundary submit 在 instrumentation 下仍有明显可见成本，因此又测试了
+  当前低预算路径能否由已有 async boundary worker 隐藏；结果见下节；
 - 所有后续运行时改动继续以一条 production-off 真实请求 TPOT 作保留门禁。
+
+## 否决 3：async verify boundary worker
+
+临时增加默认关闭的 benchmark 开关，复用已有 worker，把 boundary ranking/transfer
+submit 从主线程移出；候选 summary 确认
+`NANOVLLM_VERIFY_BOUNDARY_PREFETCH_ASYNC=1`：
+
+| 配置 | TPOT | decode rounds | mean round wall | validation |
+|:---|---:|---:|---:|:---|
+| b1 同步 boundary | **53.726 ms** | 261 | **105.187 ms** | 512 token，valid |
+| b1 async boundary | 57.504 ms | 267 | 110.054 ms | 512 token，valid |
+| 变化 | **+3.778 ms / +7.03%** | +6 | **+4.867 ms / +4.63%** | 无错误 |
+
+输出从第 63 token 起分叉，但 TPOT、rounds 与 round wall 全部回退。worker queue、drain、
+锁以及同一 H2D/copy resource 的竞争没有隐藏提交，反而放大关键路径；这与旧路径的 async
+负结果一致。显式开关、metadata 字段和测试已全部撤销，继续固定 async=0。结果目录：
+`results/tpot_phase1_b1_verify_async_20260819/`。
 
 ## 一句话总结
 
 b1 profile 证明 phase1/verify/draft 首次消费率依次为 81.5%/89.3%/95.8%；verify 全局
-vpb1 和分段 2/2/1 均回退，因此保持 b1+vpb2，并撤销 per-segment 代码。
+vpb1、分段 2/2/1 和 async boundary 均回退，因此保持 b1+vpb2+sync，并撤销候选代码。
