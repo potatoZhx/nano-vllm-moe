@@ -298,6 +298,47 @@ class TestPredictivePhase1(unittest.TestCase):
         self.assertIn((1, 2), rt.inflight)   # highest freq
         self.assertNotIn((1, 3), rt.inflight)  # lower freq excluded by budget=1
 
+    def test_phase1_can_prefer_recent_verify_candidate(self):
+        rt, _caches = self._two_layer_runtime(
+            budget=1,
+            freqs={2: 50, 3: 1},
+        )
+        rt.config.predictive_phase1_recent_verify = True
+        rt.verify_segment_index.update_from_runtime_meta(
+            runtime_meta=_meta(
+                1,
+                [3],
+                step_id=0,
+                mode="verify",
+                weights=[1.0],
+            ),
+            source="verify_history",
+            step_id=0,
+            layer_caches=rt.layer_caches,
+        )
+
+        rt.begin_draft_iteration(step_id=1)
+        self.assertEqual(rt.maybe_submit_phase1(step_id=1), 1)
+        self.assertIn((1, 3), rt.inflight)
+        self.assertNotIn((1, 2), rt.inflight)
+        profile = rt.get_profile(reset=False)
+        self.assertEqual(profile["predictive_phase1_recent_verify_round_count"], 1)
+        self.assertEqual(profile["predictive_phase1_frequency_fallback_round_count"], 0)
+
+    def test_phase1_recent_policy_falls_back_before_verify_history(self):
+        rt, _caches = self._two_layer_runtime(
+            budget=1,
+            freqs={2: 50, 3: 1},
+        )
+        rt.config.predictive_phase1_recent_verify = True
+
+        rt.begin_draft_iteration(step_id=1)
+        self.assertEqual(rt.maybe_submit_phase1(step_id=1), 1)
+        self.assertIn((1, 2), rt.inflight)
+        profile = rt.get_profile(reset=False)
+        self.assertEqual(profile["predictive_phase1_recent_verify_round_count"], 0)
+        self.assertEqual(profile["predictive_phase1_frequency_fallback_round_count"], 1)
+
 
 class TestPredictivePhase2(unittest.TestCase):
     def _two_segment_runtime(self):

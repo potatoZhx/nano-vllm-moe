@@ -41,6 +41,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k1_f16_3080",
     "k2_dynamic_f16_3080",
     "k2_dynamic_f16_3080_active14",
+    "k2_dynamic_f16_3080_active14_phase1_recent",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -238,6 +239,13 @@ OPTIMIZED_CONFIG_PRESETS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Keep the measured active14 preset byte-for-byte intact.  The recent-verify
+# phase-1 policy is an independent, explicitly selectable candidate/fallback.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14"],
+    "predictive_phase1_recent_verify": True,
+}
+
 def str2bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -313,6 +321,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "kt_capture_bs": "--kt-capture-bs",
         "verify_cuda_graph_bucket_steps": "--verify-cuda-graph-bucket-steps",
         "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
+        "predictive_phase1_recent_verify": "--predictive-phase1-recent-verify",
         "gpu_memory_utilization": "--gpu-memory-utilization",
         "warmup_model_tokens": "--warmup-model-tokens",
         "decode_driver": "--decode-driver",
@@ -489,6 +498,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k1_f16_3080",
             "k2_dynamic_f16_3080",
             "k2_dynamic_f16_3080_active14",
+            "k2_dynamic_f16_3080_active14_phase1_recent",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
@@ -786,6 +796,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-verify-layer-max-budget", type=int, default=8)
     parser.add_argument("--prefetch-verify-attention-ratio", type=float, default=1.0)
     parser.add_argument("--predictive-phase1-budget", type=int, default=4)
+    parser.add_argument(
+        "--predictive-phase1-recent-verify",
+        type=str2bool,
+        default=False,
+        help=(
+            "Prefer recent verify-route candidates for predictive phase-1; "
+            "fall back to lifetime access frequency when the index is empty."
+        ),
+    )
     parser.add_argument("--dual-queue-ground-truth-decay", type=float, default=0.9)
     parser.add_argument("--dual-queue-ground-truth-ttl-rounds", type=int, default=64)
     parser.add_argument("--dual-queue-ground-truth-count-weight", type=float, default=0.1)

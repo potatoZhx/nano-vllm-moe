@@ -185,6 +185,9 @@ def build_llm_kwargs(
         "dual_queue_secondary_index_weight": float(args.dual_queue_secondary_index_weight),
         "prefetch_verify_attention_ratio": float(args.prefetch_verify_attention_ratio),
         "predictive_phase1_budget": int(args.predictive_phase1_budget),
+        "predictive_phase1_recent_verify": bool(
+            getattr(args, "predictive_phase1_recent_verify", False)
+        ),
         "prefetch_staging_slots_per_layer": int(args.prefetch_staging_slots_per_layer),
         "prefetch_max_inflight": int(args.prefetch_max_inflight),
         "prefetch_transfer_stream_count": int(args.prefetch_transfer_stream_count),

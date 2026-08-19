@@ -665,6 +665,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "rank_guard_threshold": float(args.rank_guard_threshold),
             "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
             "predictive_phase1_budget": int(args.predictive_phase1_budget),
+            "predictive_phase1_recent_verify": bool(
+                getattr(args, "predictive_phase1_recent_verify", False)
+            ),
             "prefetch_history_decay": float(args.prefetch_history_decay),
             "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
             "prefetch_source_weight_prefill": float(args.prefetch_source_weight_prefill),

@@ -72,6 +72,9 @@ class Config:
     prefetch_verify_attention_ratio: float = 0.3
     # Phase-1 cold-start prefetch budget (number of experts) for segment n-1.
     predictive_phase1_budget: int = 4
+    # Prefer the previous verify route index over lifetime access frequency for
+    # predictive phase-1.  Opt-in so retained presets keep their exact policy.
+    predictive_phase1_recent_verify: bool = False
     # Dual-queue segment prefetcher. A single segment size drives both draft and
     # verify graphs so queue segment ids have identical layer ranges.
     dual_queue_segment_size: int = 12

@@ -34,6 +34,7 @@ class TestConfigPredictivePrefetch(unittest.TestCase):
         cfg = self._build_config(enable_heterogeneous=True, inference_mode="spec")
         self.assertAlmostEqual(cfg.prefetch_verify_attention_ratio, 0.3)
         self.assertEqual(cfg.predictive_phase1_budget, 4)
+        self.assertFalse(cfg.predictive_phase1_recent_verify)
 
     def test_dual_queue_forces_shared_segment_graph_configuration(self):
         cfg = self._build_config(

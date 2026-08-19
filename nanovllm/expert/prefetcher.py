@@ -3242,28 +3242,70 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             return 0
         last_segment_id = max(self._segment_id_for_layer(int(l)) for l in self.layer_caches)
 
-        # Highest ground-truth-frequency uncached experts in segment n-1.
-        candidates: list[tuple[int, int, int]] = []
-        for layer_idx, cache in self.layer_caches.items():
-            if self._segment_id_for_layer(int(layer_idx)) != last_segment_id:
-                continue
-            pool = self.cpu_expert_pool.get(layer_idx)
-            if not pool:
-                continue
-            ac = cache.access_count
-            for expert_idx in pool.keys():
-                eid = int(expert_idx)
-                if cache.is_cached_cpu(eid) or cache.is_pending_cpu(eid):
+        target_layers = [
+            int(layer_idx)
+            for layer_idx in self.layer_caches
+            if self._segment_id_for_layer(int(layer_idx)) == last_segment_id
+        ]
+        if not target_layers:
+            return 0
+
+        # The retained policy scans lifetime ground-truth frequency.  The
+        # opt-in policy first reuses the previous verify route index, whose
+        # score/count/age priority is both more recent and already cached by
+        # SegmentCandidateIndex.  Fall back on the first round before verify
+        # metadata exists.
+        candidates: list[tuple[float, int, int]] = []
+        use_recent_verify = bool(
+            getattr(self.config, "predictive_phase1_recent_verify", False)
+        )
+        if use_recent_verify:
+            recent = self.verify_segment_index.candidates_for_layer_range(
+                layer_start=min(target_layers),
+                layer_end=max(target_layers) + 1,
+                step_id=int(step_id),
+                layer_caches=self.layer_caches,
+                inflight_keys=set(self.inflight),
+                max_candidates=budget,
+            )
+            candidates = [
+                (
+                    float(candidate.priority),
+                    int(candidate.layer_idx),
+                    int(candidate.expert_idx),
+                )
+                for candidate in recent
+            ]
+            self._profile["predictive_phase1_recent_verify_candidate_count"] += len(
+                candidates
+            )
+            if candidates:
+                self._profile["predictive_phase1_recent_verify_round_count"] += 1
+
+        if not candidates:
+            if use_recent_verify:
+                self._profile["predictive_phase1_frequency_fallback_round_count"] += 1
+            for layer_idx in target_layers:
+                cache = self.layer_caches[layer_idx]
+                pool = self.cpu_expert_pool.get(layer_idx)
+                if not pool:
                     continue
-                candidates.append((int(ac[eid]), int(layer_idx), eid))
+                ac = cache.access_count
+                for expert_idx in pool.keys():
+                    eid = int(expert_idx)
+                    if cache.is_cached_cpu(eid) or cache.is_pending_cpu(eid):
+                        continue
+                    candidates.append((float(ac[eid]), int(layer_idx), eid))
         if not candidates:
             return 0
-        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+        candidates.sort(
+            key=lambda candidate: (-candidate[0], candidate[1], candidate[2])
+        )
 
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
         max_submit = min(budget, inflight_budget)
         submitted = 0
-        for _freq, layer_idx, expert_idx in candidates:
+        for _priority, layer_idx, expert_idx in candidates:
             if submitted >= max_submit:
                 break
             key = (layer_idx, expert_idx)
@@ -3434,6 +3476,21 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
             ),
             "predictive_draft_stale_observe_count": int(
                 self._profile.get("predictive_draft_stale_observe_count", 0.0)
+            ),
+            "predictive_phase1_recent_verify_candidate_count": int(
+                self._profile.get(
+                    "predictive_phase1_recent_verify_candidate_count", 0.0
+                )
+            ),
+            "predictive_phase1_recent_verify_round_count": int(
+                self._profile.get(
+                    "predictive_phase1_recent_verify_round_count", 0.0
+                )
+            ),
+            "predictive_phase1_frequency_fallback_round_count": int(
+                self._profile.get(
+                    "predictive_phase1_frequency_fallback_round_count", 0.0
+                )
             ),
         }
         out = super().get_profile(reset=reset)

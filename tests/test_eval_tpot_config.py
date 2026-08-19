@@ -180,7 +180,27 @@ def test_active14_dynamic_preset_retains_workload_sized_tpot_optimum(tmp_path):
     assert args.verify_cuda_graph_bucket_steps == "2,3"
     assert args.gpu_memory_utilization == 0.98
     assert args.warmup_model_tokens == 1024
+    assert args.predictive_phase1_recent_verify is False
 
+    env = configure_optimized_env(args)
+    assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
+
+
+def test_active14_recent_phase1_is_independent_opt_in_preset(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k2_dynamic_f16_3080_active14_phase1_recent",
+        ]
+    )
+
+    assert args.cache_ratios == "0.109375"
+    assert args.max_draft_tokens_values == "2"
+    assert args.draft_tpot_td_ms == 97.0
+    assert args.gpu_memory_utilization == 0.98
+    assert args.predictive_phase1_recent_verify is True
     env = configure_optimized_env(args)
     assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
 
