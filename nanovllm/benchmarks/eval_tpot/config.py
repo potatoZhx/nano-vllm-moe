@@ -46,6 +46,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
+    "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -281,6 +282,11 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghos
     "predictive_ghost_protect_steps": 8,
 }
 
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8"],
+    "fused_cache_lut_updates": True,
+}
+
 def str2bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -360,6 +366,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "predictive_phase1_recent_verify": "--predictive-phase1-recent-verify",
         "predictive_ghost_window_steps": "--predictive-ghost-window-steps",
         "predictive_ghost_protect_steps": "--predictive-ghost-protect-steps",
+        "fused_cache_lut_updates": "--fused-cache-lut-updates",
         "gpu_memory_utilization": "--gpu-memory-utilization",
         "warmup_model_tokens": "--warmup-model-tokens",
         "decode_driver": "--decode-driver",
@@ -541,6 +548,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
@@ -858,6 +866,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Protect a ghost-hit expert from predictive eviction for this many model steps.",
+    )
+    parser.add_argument(
+        "--fused-cache-lut-updates",
+        type=str2bool,
+        default=False,
+        help="Fuse each CUDA cache mapping commit instead of launching scalar updates.",
     )
     parser.add_argument("--dual-queue-ground-truth-decay", type=float, default=0.9)
     parser.add_argument("--dual-queue-ground-truth-ttl-rounds", type=int, default=64)

@@ -670,6 +670,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "predictive_ghost_window_steps": int(args.predictive_ghost_window_steps),
             "predictive_ghost_protect_steps": int(args.predictive_ghost_protect_steps),
+            "fused_cache_lut_updates": bool(args.fused_cache_lut_updates),
             "prefetch_history_decay": float(args.prefetch_history_decay),
             "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
             "prefetch_source_weight_prefill": float(args.prefetch_source_weight_prefill),

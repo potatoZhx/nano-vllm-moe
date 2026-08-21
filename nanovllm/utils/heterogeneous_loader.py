@@ -39,6 +39,12 @@ class HeterogeneousModelLoader:
         cpu_pool = self._load_expert_weights_to_cpu(path)
         layer_caches = self._init_layer_caches(cpu_pool)
         self._load_initial_placement(layer_caches, cpu_pool)
+        if bool(getattr(self.config, "fused_cache_lut_updates", False)):
+            from nanovllm.expert.cache_lut import warmup_cache_lut_kernels
+
+            warmup_cache_lut_kernels(
+                next(iter(layer_caches.values())).expert_to_slot_lut.device
+            )
         torch.cuda.synchronize()
         return layer_caches, cpu_pool
 
@@ -148,6 +154,9 @@ class HeterogeneousModelLoader:
                 cpu_expert_pool=experts,
                 staging_slots_per_layer=getattr(self.config, "prefetch_staging_slots_per_layer", 0),
                 enable_prefetch=bool(getattr(self.config, "spec_enable_prefetch", False)),
+                fused_lut_updates=bool(
+                    getattr(self.config, "fused_cache_lut_updates", False)
+                ),
             )
         return layer_caches
 

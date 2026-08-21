@@ -18,11 +18,12 @@
 当前基于同日直接 A/B 推荐的 preset 是：
 
 ```text
-k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8
+k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse
 ```
 
 2026-08-21 production-off 一请求中，b1 baseline 为 57.293907 ms/token，ghost8 为
-**54.392560 ms/token**，同日改善 **5.06%**。跨日期所有已测点的绝对最低值仍是原 b1
+**54.392560 ms/token**，同日改善 **5.06%**；预热后的融合 LUT commit 进一步到
+**54.235843 ms/token**，相对 ghost8 改善 **0.29%**。跨日期所有已测点的绝对最低值仍是原 b1
 在 2026-08-19 得到的 **53.725789 ms/token**；ghost8 没有覆盖或改写这个历史点。
 相比跨日期漂移后的绝对值，同日直接 A/B 是本次保留 ghost8 更强的证据。配置保留了动态
 draft 长度框架，并采用：
@@ -33,10 +34,12 @@ draft 长度框架，并采用：
 - segment 16、verify prefetch budget 2、staging 0；
 - recent-verify phase1，只提交最高排名的 1 个候选；
 - 对 8 steps 内被换出又重载的 expert 提供 8-step ghost 保护；
+- 预热的 fused cache LUT update，单次 publication 只发出一个映射 kernel；
 - CPUInfer 32 total threads，2 个 NUMA pool，各 16 threads；
 - warmup 1024 tokens。
 
-它没有覆盖旧配置。原 b1 是直接 fallback；以下 preset 也仍可独立选择：budget2、
+它没有覆盖旧配置。ghost8 是只关闭 LUT fusion 的直接 fallback，原 b1 同时关闭 ghost 和
+fusion；以下 preset 也仍可独立选择：budget2、
 budget4/t32、recent-t16、active14，以及可容纳完整 8192 context 的
 `k2_dynamic_f16_3080`。本次实测请求的物理
 KV capacity 为 1536 tokens，足以覆盖 107-token prompt + 512-token output，但不应把
@@ -73,6 +76,7 @@ MoE layer 的 draft/verify CUDA graph 都因此删除了冗余 memcpy node。它
 | phase1 budget2 `1602a85` | **55.169 ms** | 相对 budget4 59.673，-7.55% | **首次超过同日旧提交锚点** |
 | phase1 budget1 `7c5e139` | **53.726 ms** | 相对 b2 -2.62%，相对 b4 -9.97% | **跨日期绝对最低点；比同日旧提交低 5.49%** |
 | ghost8（2026-08-21） | 54.393 ms | 相对同日 b1 57.294，-5.06% | 同日正收益；未刷新跨日绝对最低点 |
+| ghost8 + LUT fusion | 54.236 ms | 相对同日 ghost8 -0.29% | 同日正收益；未刷新跨日绝对最低点 |
 
 所以答案是：**后续路线确实以 `296cf59` 为累计基础，并最终拿到了额外收益。**最可靠的
 表述不是把 53.726 直接全归因给每一个中间 commit，而是：budget2/budget1 在当前累计
@@ -175,6 +179,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `7acb865` | analysis docs / [26](optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md) | 记录 b1 lifecycle 及 vpb1、2/2/1 两个负结果。 |
 | `1290bee` | rejected docs / [26](optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md) | async verify boundary 回退 7.03%，开关与实现完全撤销。 |
 | 本次更新 | perf / [27](optimization_commits/20260821_27_predictive_ghost8.md) | 8/8 短期 ghost 保护同日一请求改善 5.06%，原 b1 保留为 fallback。 |
+| 本次更新 | perf / [28](optimization_commits/20260821_28_fused_cache_lut_updates.md) | 预热并禁止动态索引 specialization 的 LUT fusion 再改善 0.29%。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -237,6 +242,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_phase1_b1_verify_async_20260819/` | 57.504 ms | async boundary 否决并删除实现。 |
 | `results/tpot_phase1_b1_baseline_20260821/` | 57.294 ms | ghost8 的同日直接 baseline。 |
 | `results/tpot_phase1_b1_ghost8_20260821/` | **54.393 ms** | 同日改善 5.06%，保留独立 preset。 |
+| `results/tpot_phase1_b1_ghost8_lutfuse_20260821/` | 59.467 ms | 未正确预热产生 611.618 ms JIT 尖峰，否决该实现。 |
+| `results/tpot_phase1_b1_ghost8_lutfuse_prewarm_20260821/` | **54.236 ms** | 修正版相对 ghost8 再改善 0.29%，保留独立 preset。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -283,8 +290,9 @@ tail”分配，而不是按 route 总量或 miss ratio 分配。
 
 因此最值得先做的不是全局减 budget，而是 source/rank-aware admission、短期 ghost
 protection 和按预期首次使用时刻排队。8/8 ghost protection 已在 2026-08-21 以独立
-preset 落地：同日 b1 57.294、ghost8 54.393 ms/token（-5.06%）。下一步应把连续 expert
-copy、event、publish/LUT commit 批量化；它们应先以 shadow trace 估算 saved tail 与
+preset 落地：同日 b1 57.294、ghost8 54.393 ms/token（-5.06%）。随后 fused LUT commit
+把 ghost8 进一步降到 54.236 ms/token（-0.29%）；未预热版本的 JIT 尖峰已记录。下一步应
+把连续 expert copy、event 和 publication 批量化；它们应先以 shadow trace 估算 saved tail 与
 eviction externality，再进入一请求门禁。
 
 ## 6. 已排除或暂不应重试的方向
@@ -306,8 +314,9 @@ eviction externality，再进入一请求门禁。
 1. **建立稳定 holdout 门禁。** 固定双方 sampling/chat template，至少 3 个独立 seed，
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
-2. **批量化 transfer/publish/LUT。** 当前 b1 profile 有 2531 次、约 22.24 GiB publication。
-   评估 NUMA-local pinned packing ring、一次提交 2–8 个 expert、批量 cache commit/LUT 更新，
+2. **批量化 transfer/publish。** LUT commit 已融合；当前 b1 profile 仍有 2531 次、约
+   22.24 GiB publication。评估 NUMA-local pinned packing ring、一次提交 2–8 个 expert、
+   批量 event query/publication，
    减少 Python/锁/event/小 H2D 开销；已有 worker async 负结果，所以应减少工作量而不是只换线程。
 3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
    估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
@@ -353,10 +362,11 @@ eviction externality，再进入一请求门禁。
 
 ## 8. 收尾状态
 
-- 同日 A/B 推荐：`k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8`；原 b1 是关闭
-  ghost 的直接 fallback。
+- 同日 A/B 推荐：`k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse`；ghost8
+  是关闭 fusion 的直接 fallback，原 b1 同时关闭 ghost 和 fusion。
 - 跨日期已测绝对最低点：b1 的 53.725789 ms/token；ghost8 同日从 57.293907 降到
-  54.392560 ms/token（-5.06%），两者均通过 512-token validation。
+  54.392560 ms/token（-5.06%），LUT fusion 再到 54.235843 ms/token（-0.29%），三者均
+  通过 512-token validation。
 - 59.701 所在提交：`296cf59`；当前路线完整继承它。
 - b1 历史最低点实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销；
   ghost8 在独立 preset 中累计继承 b1。

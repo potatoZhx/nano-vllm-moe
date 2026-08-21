@@ -68,11 +68,13 @@ class LayerExpertCache:
         cpu_expert_pool: dict[int, dict[str, torch.Tensor]] | None = None,
         staging_slots_per_layer: int = 0,
         enable_prefetch: bool = False,
+        fused_lut_updates: bool = False,
     ) -> None:
         self.num_experts = num_experts
         self.num_slots = max(1, min(slots_per_layer, self.num_experts))
         self.cpu_expert_pool = cpu_expert_pool or {}
         self.enable_prefetch = bool(enable_prefetch)
+        self.fused_lut_updates = bool(fused_lut_updates)
         self.num_staging_slots = int(staging_slots_per_layer) if self.enable_prefetch else 0
 
         # Buffers are always contiguous and fixed-size for fused MoE kernels.
@@ -134,6 +136,37 @@ class LayerExpertCache:
         self.staging_slot_to_expert = [-1] * self.num_staging_slots
         self.staging_slot_generation = [0] * self.num_staging_slots
         self.active_slot_pending_expert = [-1] * self.num_slots
+
+    def _unmap_device_slot(self, *, previous_expert: int, slot_idx: int) -> None:
+        from nanovllm.expert.cache_lut import unmap_cache_slot
+
+        unmap_cache_slot(
+            self.expert_to_slot_lut,
+            self.slot_to_expert_lut,
+            self.cached_expert_mask,
+            previous_expert=int(previous_expert),
+            slot_idx=int(slot_idx),
+        )
+
+    def _publish_device_slot(
+        self,
+        *,
+        previous_expert: int,
+        expert_idx: int,
+        slot_idx: int,
+        evict_previous: bool,
+    ) -> None:
+        from nanovllm.expert.cache_lut import commit_cache_slot
+
+        commit_cache_slot(
+            self.expert_to_slot_lut,
+            self.slot_to_expert_lut,
+            self.cached_expert_mask,
+            previous_expert=int(previous_expert),
+            expert_idx=int(expert_idx),
+            slot_idx=int(slot_idx),
+            evict_previous=bool(evict_previous),
+        )
 
     def put_to_slot(
         self,
@@ -374,14 +407,22 @@ class LayerExpertCache:
             return None
 
         prev_expert = self.slot_to_expert[active_slot_idx]
-        if prev_expert >= 0 and prev_expert in self.expert_to_slot:
+        mapped_previous = prev_expert >= 0 and prev_expert in self.expert_to_slot
+        if mapped_previous:
             del self.expert_to_slot[prev_expert]
-            self.expert_to_slot_lut[prev_expert] = -1
-            self.cached_expert_mask[prev_expert] = False
+            if not (self.fused_lut_updates and self.expert_to_slot_lut.is_cuda):
+                self.expert_to_slot_lut[prev_expert] = -1
+                self.cached_expert_mask[prev_expert] = False
             self.cached_expert_mask_host[prev_expert] = False
 
         self.slot_to_expert[active_slot_idx] = -1
-        self.slot_to_expert_lut[active_slot_idx] = -1
+        if self.fused_lut_updates and self.expert_to_slot_lut.is_cuda:
+            self._unmap_device_slot(
+                previous_expert=int(prev_expert) if mapped_previous else -1,
+                slot_idx=int(active_slot_idx),
+            )
+        else:
+            self.slot_to_expert_lut[active_slot_idx] = -1
         self.active_slot_pending_expert[active_slot_idx] = int(expert_idx)
         self.slot_generation[active_slot_idx] += 1
         return ActiveReservation(
@@ -455,10 +496,18 @@ class LayerExpertCache:
             return None
 
         self.slot_to_expert[slot_idx] = expert_idx
-        self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
-        self.expert_to_slot_lut[expert_idx] = slot_idx
-        self.cached_expert_mask[expert_idx] = True
+        if self.fused_lut_updates and self.expert_to_slot_lut.is_cuda:
+            self._publish_device_slot(
+                previous_expert=-1,
+                expert_idx=int(expert_idx),
+                slot_idx=int(slot_idx),
+                evict_previous=False,
+            )
+        else:
+            self.slot_to_expert_lut[slot_idx] = expert_idx
+            self.expert_to_slot_lut[expert_idx] = slot_idx
+            self.cached_expert_mask[expert_idx] = True
         self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         return PublishedExpert(
@@ -483,17 +532,27 @@ class LayerExpertCache:
             self.active_slot_pending_expert[slot_idx] = -1
             return None
 
-        if prev_expert >= 0 and prev_expert in self.expert_to_slot:
+        mapped_previous = prev_expert >= 0 and prev_expert in self.expert_to_slot
+        if mapped_previous:
             del self.expert_to_slot[prev_expert]
-            self.expert_to_slot_lut[prev_expert] = -1
-            self.cached_expert_mask[prev_expert] = False
+            if not (self.fused_lut_updates and self.expert_to_slot_lut.is_cuda):
+                self.expert_to_slot_lut[prev_expert] = -1
+                self.cached_expert_mask[prev_expert] = False
             self.cached_expert_mask_host[prev_expert] = False
 
         self.slot_to_expert[slot_idx] = expert_idx
-        self.slot_to_expert_lut[slot_idx] = expert_idx
         self.expert_to_slot[expert_idx] = slot_idx
-        self.expert_to_slot_lut[expert_idx] = slot_idx
-        self.cached_expert_mask[expert_idx] = True
+        if self.fused_lut_updates and self.expert_to_slot_lut.is_cuda:
+            self._publish_device_slot(
+                previous_expert=int(prev_expert) if mapped_previous else -1,
+                expert_idx=int(expert_idx),
+                slot_idx=int(slot_idx),
+                evict_previous=bool(mapped_previous),
+            )
+        else:
+            self.slot_to_expert_lut[slot_idx] = expert_idx
+            self.expert_to_slot_lut[expert_idx] = slot_idx
+            self.cached_expert_mask[expert_idx] = True
         self.cached_expert_mask_host[expert_idx] = True
         self.active_slot_pending_expert[slot_idx] = -1
         return PublishedExpert(

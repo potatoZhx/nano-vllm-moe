@@ -94,6 +94,27 @@ class TestExpertCacheStaging(unittest.TestCase):
         self.assertFalse(cache.is_cached_cpu(0))
         self.assertTrue(cache.is_cached_cpu(3))
 
+    def test_fused_lut_option_preserves_cpu_deferred_commit_semantics(self):
+        cache = LayerExpertCache(
+            num_experts=4,
+            slots_per_layer=2,
+            gate_up_shape=(4, 4),
+            down_shape=(4, 2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            cpu_expert_pool={},
+            staging_slots_per_layer=0,
+            enable_prefetch=True,
+            fused_lut_updates=True,
+        )
+        cache.put_to_slot(0, 0, torch.ones(4, 4), torch.ones(4, 2))
+        reservation = cache.reserve_active_slot_for_prefetch_deferred(0, 0, 3)
+        self.assertIsNotNone(reservation)
+        self.assertIsNotNone(cache.commit_deferred_active_prefetch(reservation))
+        self._assert_host_mask_matches(cache)
+        self.assertEqual(cache.expert_to_slot_lut.tolist(), [-1, -1, -1, 0])
+        self.assertEqual(cache.slot_to_expert_lut.tolist(), [3, -1])
+
 
 if __name__ == "__main__":
     unittest.main()

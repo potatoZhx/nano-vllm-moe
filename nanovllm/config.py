@@ -79,6 +79,9 @@ class Config:
     # Zero keeps every retained preset byte-for-byte unchanged.
     predictive_ghost_window_steps: int = 0
     predictive_ghost_protect_steps: int = 0
+    # Fuse each CUDA cache mapping commit into one prewarmed tiny kernel.
+    # Opt-in so retained presets keep their original update path.
+    fused_cache_lut_updates: bool = False
     # Dual-queue segment prefetcher. A single segment size drives both draft and
     # verify graphs so queue segment ids have identical layer ranges.
     dual_queue_segment_size: int = 12
