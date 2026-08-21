@@ -180,6 +180,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `1290bee` | rejected docs / [26](optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md) | async verify boundary 回退 7.03%，开关与实现完全撤销。 |
 | 本次更新 | perf / [27](optimization_commits/20260821_27_predictive_ghost8.md) | 8/8 短期 ghost 保护同日一请求改善 5.06%，原 b1 保留为 fallback。 |
 | 本次更新 | perf / [28](optimization_commits/20260821_28_fused_cache_lut_updates.md) | 预热并禁止动态索引 specialization 的 LUT fusion 再改善 0.29%。 |
+| 本次更新 | analysis / [29](optimization_commits/20260821_29_publish_batching_shadow.md) | LUT fusion 后跨层 publication batching 的理想上界不到 0.1% TPOT，调整后续排序。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -291,9 +292,16 @@ tail”分配，而不是按 route 总量或 miss ratio 分配。
 因此最值得先做的不是全局减 budget，而是 source/rank-aware admission、短期 ghost
 protection 和按预期首次使用时刻排队。8/8 ghost protection 已在 2026-08-21 以独立
 preset 落地：同日 b1 57.294、ghost8 54.393 ms/token（-5.06%）。随后 fused LUT commit
-把 ghost8 进一步降到 54.236 ms/token（-0.29%）；未预热版本的 JIT 尖峰已记录。下一步应
-把连续 expert copy、event 和 publication 批量化；它们应先以 shadow trace 估算 saved tail 与
-eviction externality，再进入一请求门禁。
+把 ghost8 进一步降到 54.236 ms/token（-0.29%）；未预热版本的 JIT 尖峰已记录。原始
+trace 还建议评估连续 expert copy、event 和 publication 批量化；LUT 落地后需按新的单次
+commit 成本重新计算其上界。
+
+LUT fusion 后又按 ticket submit step 做了 publication grouping shadow：2531 次 publication
+最多可归并为 571 个跨层组，但 `(submit step, layer)` 上 2411/2531 是 singleton。按已测
+13.565 µs/fused commit 计算，把全部跨层 publication 理想压到 571 次也只省约
+26.59 ms/request，即 0.052 ms/token、不到当前 TPOT 的 0.1%，且尚未计入共享二维 LUT、
+pointer batch 和延迟 expert 可见性的成本。因此 batching 已降到 CPUInfer native 分解和
+source/rank admission 之后。
 
 ## 6. 已排除或暂不应重试的方向
 
@@ -314,17 +322,17 @@ eviction externality，再进入一请求门禁。
 1. **建立稳定 holdout 门禁。** 固定双方 sampling/chat template，至少 3 个独立 seed，
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
-2. **批量化 transfer/publish。** LUT commit 已融合；当前 b1 profile 仍有 2531 次、约
-   22.24 GiB publication。评估 NUMA-local pinned packing ring、一次提交 2–8 个 expert、
-   批量 event query/publication，
-   减少 Python/锁/event/小 H2D 开销；已有 worker async 负结果，所以应减少工作量而不是只换线程。
-3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
-   估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
-   ghost TTL：16/16 的 shadow 已会影响约 5.1% victim，先量化 eviction externality。
-4. **对 exact current path 做 CPUInfer native phase profile。** 使用当前约 51% CPU route、
+2. **对 exact current path 做 CPUInfer native phase profile。** 使用当前约 51% CPU route、
    qlen1/2/3、group_min1、m_block32、t32/双 NUMA，拆出 queue/group、gate/up GEMM、SiLU、
    mul、down、merge 与 exposed sync。接着评估跨层 task batching、persistent worker、core
    affinity、NUMA first-touch/hugepage；不再先扫 dtype/group_min/m_block。
+3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
+   估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
+   ghost TTL：16/16 的 shadow 已会影响约 5.1% victim，先量化 eviction externality。
+4. **有条件地批量化 transfer/publish。** LUT commit 已融合；当前仍有 2531 次、约
+   22.24 GiB publication，但只读上界表明跨层 commit 合并不到 0.1% TPOT。只有 native
+   profile 证明 event/H2D 控制面仍显著，且能保持每个 expert 独立可见时刻时，才评估
+   NUMA-local pinned packing ring 或一次提交 2–8 个 expert。
 5. **谨慎重拟合 active-cache 层间分配。** 在固定 672 slots 下，用下一 slot 的 miss-tail
    边际收益分配，并用 holdout 防止只拟合 sample0。当前未来信息 oracle 表明层间重分配只比
    保持当前 per-layer 数量多降低约 0.55 route points，所以它应与 admission 联合做，不能
