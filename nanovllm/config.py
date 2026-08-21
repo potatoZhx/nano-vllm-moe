@@ -75,6 +75,10 @@ class Config:
     # Prefer the previous verify route index over lifetime access frequency for
     # predictive phase-1.  Opt-in so retained presets keep their exact policy.
     predictive_phase1_recent_verify: bool = False
+    # Opt-in 2Q-style protection for experts reloaded shortly after eviction.
+    # Zero keeps every retained preset byte-for-byte unchanged.
+    predictive_ghost_window_steps: int = 0
+    predictive_ghost_protect_steps: int = 0
     # Dual-queue segment prefetcher. A single segment size drives both draft and
     # verify graphs so queue segment ids have identical layer ranges.
     dual_queue_segment_size: int = 12
@@ -251,6 +255,8 @@ class Config:
         assert self.prefetch_runtime_kind in {"legacy", "predictive", "dual_queue"}
         assert 0.0 < self.prefetch_verify_attention_ratio <= 1.0
         assert self.predictive_phase1_budget >= 0
+        assert self.predictive_ghost_window_steps >= 0
+        assert self.predictive_ghost_protect_steps >= 0
         assert self.dual_queue_segment_size >= 1
         assert 0.0 <= self.dual_queue_ground_truth_decay <= 1.0
         assert self.dual_queue_ground_truth_ttl_rounds >= 1

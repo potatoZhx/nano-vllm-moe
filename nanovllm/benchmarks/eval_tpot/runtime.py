@@ -188,6 +188,8 @@ def build_llm_kwargs(
         "predictive_phase1_recent_verify": bool(
             getattr(args, "predictive_phase1_recent_verify", False)
         ),
+        "predictive_ghost_window_steps": int(args.predictive_ghost_window_steps),
+        "predictive_ghost_protect_steps": int(args.predictive_ghost_protect_steps),
         "prefetch_staging_slots_per_layer": int(args.prefetch_staging_slots_per_layer),
         "prefetch_max_inflight": int(args.prefetch_max_inflight),
         "prefetch_transfer_stream_count": int(args.prefetch_transfer_stream_count),

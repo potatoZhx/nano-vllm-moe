@@ -1,12 +1,13 @@
 # TPOT 优化路线最终收尾
 
-日期：2026-08-19
+日期：2026-08-19；最后更新：2026-08-21
 
 硬件：RTX 3080 10 GiB，2 x Xeon Gold 5218R
 
 模型：Qwen3-30B-A3B
 
-范围：从 single-weight 到 recent phase1 budget1，以及随后三个被否决的 verify 候选
+范围：从 single-weight 到 recent phase1 budget1、三个被否决的 verify 候选，以及
+随后保留的 ghost8 cache 保护
 
 > 本文是本轮路线的权威收尾入口。较早的
 > [`tpot_optimization_final_review_20260813.md`](tpot_optimization_final_review_20260813.md)
@@ -14,25 +15,30 @@
 
 ## 1. 最终结论
 
-当前保留的单请求最优 preset 是：
+当前基于同日直接 A/B 推荐的 preset 是：
 
 ```text
-k2_dynamic_f16_3080_active14_phase1_recent_t32_b1
+k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8
 ```
 
-正式 production-off 单请求结果为 **53.725789 ms/token**，即文档取整后的
-**53.726 ms/token**。配置保留了动态 draft 长度框架，并采用：
+2026-08-21 production-off 一请求中，b1 baseline 为 57.293907 ms/token，ghost8 为
+**54.392560 ms/token**，同日改善 **5.06%**。跨日期所有已测点的绝对最低值仍是原 b1
+在 2026-08-19 得到的 **53.725789 ms/token**；ghost8 没有覆盖或改写这个历史点。
+相比跨日期漂移后的绝对值，同日直接 A/B 是本次保留 ghost8 更强的证据。配置保留了动态
+draft 长度框架，并采用：
 
 - single-weight、llamafile F16 CPU expert、BF16 hidden；
 - workload-sized active14 cache，GPU memory utilization 0.98；
 - 动态 K1/K2、`first_increase`、静态 `td/tv=97/100`；
 - segment 16、verify prefetch budget 2、staging 0；
 - recent-verify phase1，只提交最高排名的 1 个候选；
+- 对 8 steps 内被换出又重载的 expert 提供 8-step ghost 保护；
 - CPUInfer 32 total threads，2 个 NUMA pool，各 16 threads；
 - warmup 1024 tokens。
 
-它没有覆盖旧配置。以下 preset 都仍可独立选择：budget2、budget4/t32、recent-t16、
-active14，以及可容纳完整 8192 context 的 `k2_dynamic_f16_3080`。本次实测请求的物理
+它没有覆盖旧配置。原 b1 是直接 fallback；以下 preset 也仍可独立选择：budget2、
+budget4/t32、recent-t16、active14，以及可容纳完整 8192 context 的
+`k2_dynamic_f16_3080`。本次实测请求的物理
 KV capacity 为 1536 tokens，足以覆盖 107-token prompt + 512-token output，但不应把
 workload-sized b1 当作任意长上下文的默认配置。
 
@@ -65,7 +71,8 @@ MoE layer 的 draft/verify CUDA graph 都因此删除了冗余 memcpy node。它
 | recent phase1 | 60.420 ms | 相对 active14 60.526，-0.175% | 未超过 56.846 |
 | recent + t32 | 59.673 ms | 相对 t16 60.420，-1.24% | 仅略低于历史 59.701，未超过同日 56.846 |
 | phase1 budget2 `1602a85` | **55.169 ms** | 相对 budget4 59.673，-7.55% | **首次超过同日旧提交锚点** |
-| phase1 budget1 `7c5e139` | **53.726 ms** | 相对 b2 -2.62%，相对 b4 -9.97% | **当前最佳；比同日旧提交低 5.49%** |
+| phase1 budget1 `7c5e139` | **53.726 ms** | 相对 b2 -2.62%，相对 b4 -9.97% | **跨日期绝对最低点；比同日旧提交低 5.49%** |
+| ghost8（2026-08-21） | 54.393 ms | 相对同日 b1 57.294，-5.06% | 同日正收益；未刷新跨日绝对最低点 |
 
 所以答案是：**后续路线确实以 `296cf59` 为累计基础，并最终拿到了额外收益。**最可靠的
 表述不是把 53.726 直接全归因给每一个中间 commit，而是：budget2/budget1 在当前累计
@@ -123,7 +130,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 
 ## 4. 完整提交、文档与一句话总结
 
-下表覆盖 `8943dd4..1290bee` 的完整路线，包括运行时优化、分析基础设施、回退和文档补记。
+下表覆盖从 `8943dd4` 到本文更新提交的完整路线，包括运行时优化、分析基础设施、回退和
+文档补记。
 
 | commit | 类型 / 文档 | 一句话总结 |
 |:---|:---|:---|
@@ -166,6 +174,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `e8f549e` | rejected docs / [25](optimization_commits/20260819_25_phase1_budget1.md) | budget0 回退 2.83%，证明最高排名 phase1 候选仍有净价值。 |
 | `7acb865` | analysis docs / [26](optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md) | 记录 b1 lifecycle 及 vpb1、2/2/1 两个负结果。 |
 | `1290bee` | rejected docs / [26](optimization_commits/20260819_26_b1_prefetch_lifecycle_and_verify_budget.md) | async verify boundary 回退 7.03%，开关与实现完全撤销。 |
+| 本次更新 | perf / [27](optimization_commits/20260821_27_predictive_ghost8.md) | 8/8 短期 ghost 保护同日一请求改善 5.06%，原 b1 保留为 fallback。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -221,11 +230,13 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 结果目录 | TPOT | 决定 |
 |:---|---:|:---|
 | `results/tpot_phase1_recent_t32_budget2_20260819/` | 55.169 ms | 保留 b2 fallback。 |
-| `results/tpot_phase1_recent_t32_budget1_20260819/` | **53.726 ms** | 当前推荐。 |
+| `results/tpot_phase1_recent_t32_budget1_20260819/` | **53.726 ms** | 跨日期绝对最低点；ghost-off fallback。 |
 | `results/tpot_phase1_recent_t32_budget0_20260819/` | 55.248 ms | budget0 否决。 |
 | `results/tpot_phase1_b1_vpb1_20260819/` | 56.203 ms | 全局 vpb1 否决。 |
 | `results/tpot_phase1_b1_vpb221_20260819/` | 54.449 ms | 分段 2/2/1 否决并删除实现。 |
 | `results/tpot_phase1_b1_verify_async_20260819/` | 57.504 ms | async boundary 否决并删除实现。 |
+| `results/tpot_phase1_b1_baseline_20260821/` | 57.294 ms | ghost8 的同日直接 baseline。 |
+| `results/tpot_phase1_b1_ghost8_20260821/` | **54.393 ms** | 同日改善 5.06%，保留独立 preset。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -271,8 +282,10 @@ tail”分配，而不是按 route 总量或 miss ratio 分配。
 平均约 13.52/14.20/25.95 ms，首次消费平均滞后 0.59/2.62/4.64 steps。
 
 因此最值得先做的不是全局减 budget，而是 source/rank-aware admission、短期 ghost
-protection 和按预期首次使用时刻排队；随后把连续 expert copy、event、publish/LUT commit
-批量化。它们应先以 shadow trace 估算 saved tail 与 eviction externality，再进入一请求门禁。
+protection 和按预期首次使用时刻排队。8/8 ghost protection 已在 2026-08-21 以独立
+preset 落地：同日 b1 57.294、ghost8 54.393 ms/token（-5.06%）。下一步应把连续 expert
+copy、event、publish/LUT commit 批量化；它们应先以 shadow trace 估算 saved tail 与
+eviction externality，再进入一请求门禁。
 
 ## 6. 已排除或暂不应重试的方向
 
@@ -293,13 +306,12 @@ protection 和按预期首次使用时刻排队；随后把连续 expert copy、
 1. **建立稳定 holdout 门禁。** 固定双方 sampling/chat template，至少 3 个独立 seed，
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
-2. **做 rank-aware cache admission/retention shadow。** 为每个 source+rank 记录 publish
-   成本、首次使用、未消费换出、被它挤出的对象和命中时规避的 CPU tail；加入短期 ghost
-   记录，对“刚被无效换出且很快又请求”的对象施加保护。现有 trace 中 75.86% 的未消费
-   换出对象后来重传，中位间隔 11 steps，是比继续减 budget 更直接的目标。
-3. **批量化 transfer/publish/LUT。** 当前 b1 profile 有 2531 次、约 22.24 GiB publication。
+2. **批量化 transfer/publish/LUT。** 当前 b1 profile 有 2531 次、约 22.24 GiB publication。
    评估 NUMA-local pinned packing ring、一次提交 2–8 个 expert、批量 cache commit/LUT 更新，
    减少 Python/锁/event/小 H2D 开销；已有 worker async 负结果，所以应减少工作量而不是只换线程。
+3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
+   估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
+   ghost TTL：16/16 的 shadow 已会影响约 5.1% victim，先量化 eviction externality。
 4. **对 exact current path 做 CPUInfer native phase profile。** 使用当前约 51% CPU route、
    qlen1/2/3、group_min1、m_block32、t32/双 NUMA，拆出 queue/group、gate/up GEMM、SiLU、
    mul、down、merge 与 exposed sync。接着评估跨层 task batching、persistent worker、core
@@ -341,10 +353,13 @@ protection 和按预期首次使用时刻排队；随后把连续 expert copy、
 
 ## 8. 收尾状态
 
-- 推荐：`k2_dynamic_f16_3080_active14_phase1_recent_t32_b1`。
-- 当前正式最优：53.725789 ms/token，512-token validation 通过。
+- 同日 A/B 推荐：`k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8`；原 b1 是关闭
+  ghost 的直接 fallback。
+- 跨日期已测绝对最低点：b1 的 53.725789 ms/token；ghost8 同日从 57.293907 降到
+  54.392560 ms/token（-5.06%），两者均通过 512-token validation。
 - 59.701 所在提交：`296cf59`；当前路线完整继承它。
-- 当前最佳实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销。
+- b1 历史最低点实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销；
+  ghost8 在独立 preset 中累计继承 b1。
 - 动态 draft 的历史最优、active14、recent-t16、t32/b4、b2 与 full-context-safe preset
   全部保留。
 - 本文之后不再把旧综述中的 59.701 或 63.713 称为“当前最终状态”。

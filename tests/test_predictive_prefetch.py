@@ -212,6 +212,46 @@ class TestPredictiveRoundProtection(unittest.TestCase):
         rt.on_verify_layer_start(2)
         self.assertNotIn(2, rt._round_loaded)
 
+    def test_ghost_hit_protects_reloaded_expert_until_ttl(self):
+        cache = self._two_slot_cache(freq0=1, freq1=5)
+        rt = _build_runtime(
+            {0: cache},
+            {0: {}},
+            cfg=_config(
+                predictive_ghost_window_steps=8,
+                predictive_ghost_protect_steps=8,
+            ),
+        )
+        rt._ghost_evicted_step[(0, 0)] = 3
+        ticket = SimpleNamespace(
+            layer_idx=0,
+            expert_idx=0,
+            active_slot_prev_expert=3,
+        )
+        rt._record_ghost_publication(ticket, step_id=8)
+
+        # expert0 is the normal LFU victim but remains hot through step 16.
+        self.assertEqual(rt._select_protected_victim(cache, 0, 2, step_id=9), 1)
+        self.assertEqual(rt._select_protected_victim(cache, 0, 2, step_id=17), 0)
+        self.assertEqual(rt.get_profile()["predictive_ghost_hit_count"], 1)
+        self.assertEqual(
+            rt.get_profile()["predictive_ghost_victim_avoided_count"], 1
+        )
+
+    def test_ghost_disabled_keeps_original_victim(self):
+        cache = self._two_slot_cache(freq0=1, freq1=5)
+        rt = _build_runtime({0: cache}, {0: {}})
+        rt._ghost_evicted_step[(0, 0)] = 3
+        ticket = SimpleNamespace(
+            layer_idx=0,
+            expert_idx=0,
+            active_slot_prev_expert=3,
+        )
+        rt._record_ghost_publication(ticket, step_id=8)
+
+        self.assertEqual(rt._select_protected_victim(cache, 0, 2, step_id=9), 0)
+        self.assertEqual(rt._ghost_hot_until, {})
+
 
 class TestPredictiveLifecycle(unittest.TestCase):
     def _rt(self):

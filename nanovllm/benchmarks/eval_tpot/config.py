@@ -45,6 +45,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080_active14_phase1_recent_t32",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
+    "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
     "k3_3080",
     "k6_decode",
     "k12_decode",
@@ -272,6 +273,14 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"] = 
     "predictive_phase1_budget": 1,
 }
 
+# Preserve b1 unchanged.  This conservative candidate protects an expert only
+# after it is reloaded within eight model steps of an earlier eviction.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"],
+    "predictive_ghost_window_steps": 8,
+    "predictive_ghost_protect_steps": 8,
+}
+
 def str2bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -349,6 +358,8 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "verify_prefetch_rank_multiplier": "--verify-prefetch-rank-multiplier",
         "predictive_phase1_budget": "--predictive-phase1-budget",
         "predictive_phase1_recent_verify": "--predictive-phase1-recent-verify",
+        "predictive_ghost_window_steps": "--predictive-ghost-window-steps",
+        "predictive_ghost_protect_steps": "--predictive-ghost-protect-steps",
         "gpu_memory_utilization": "--gpu-memory-utilization",
         "warmup_model_tokens": "--warmup-model-tokens",
         "decode_driver": "--decode-driver",
@@ -529,6 +540,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14_phase1_recent_t32",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
@@ -834,6 +846,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Prefer recent verify-route candidates for predictive phase-1; "
             "fall back to lifetime access frequency when the index is empty."
         ),
+    )
+    parser.add_argument(
+        "--predictive-ghost-window-steps",
+        type=int,
+        default=0,
+        help="Treat an expert reloaded within this many model steps as a ghost hit.",
+    )
+    parser.add_argument(
+        "--predictive-ghost-protect-steps",
+        type=int,
+        default=0,
+        help="Protect a ghost-hit expert from predictive eviction for this many model steps.",
     )
     parser.add_argument("--dual-queue-ground-truth-decay", type=float, default=0.9)
     parser.add_argument("--dual-queue-ground-truth-ttl-rounds", type=int, default=64)

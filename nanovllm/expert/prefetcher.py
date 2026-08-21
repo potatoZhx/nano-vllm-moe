@@ -3105,6 +3105,10 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         # Phase-1 fires once per round; begin_draft_iteration arms this and
         # maybe_submit_phase1 (called after the run_draft drain) consumes it.
         self._phase1_pending: bool = False
+        # Small production 2Q state.  Unlike lifecycle telemetry, this stores
+        # only one integer per observed layer/expert and never scans metadata.
+        self._ghost_evicted_step: dict[tuple[int, int], int] = {}
+        self._ghost_hot_until: dict[tuple[int, int], int] = {}
 
     # Always use the segment-indexed plumbing regardless of the config string.
     def _segment_indexed_enabled(self) -> bool:
@@ -3210,7 +3214,51 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         if not loaded:
             self._round_loaded.pop(int(layer_idx), None)
 
-    def _select_protected_victim(self, cache, layer_idx, incoming_expert_idx) -> int | None:
+    def _ghost_enabled(self) -> bool:
+        return bool(
+            int(getattr(self.config, "predictive_ghost_window_steps", 0)) > 0
+            and int(getattr(self.config, "predictive_ghost_protect_steps", 0)) > 0
+        )
+
+    def _record_ghost_publication(self, ticket: PrefetchTicket, *, step_id: int) -> None:
+        if not self._ghost_enabled():
+            return
+        step = int(step_id)
+        layer_idx = int(ticket.layer_idx)
+        incoming = (layer_idx, int(ticket.expert_idx))
+        previous_eviction = self._ghost_evicted_step.get(incoming)
+        window = int(self.config.predictive_ghost_window_steps)
+        if (
+            previous_eviction is not None
+            and 0 < step - int(previous_eviction) <= window
+        ):
+            protect_steps = int(self.config.predictive_ghost_protect_steps)
+            self._ghost_hot_until[incoming] = max(
+                int(self._ghost_hot_until.get(incoming, -1)),
+                step + protect_steps,
+            )
+            self._profile["predictive_ghost_hit_count"] += 1
+
+        previous_expert = int(ticket.active_slot_prev_expert)
+        if previous_expert >= 0 and previous_expert != incoming[1]:
+            self._ghost_evicted_step[(layer_idx, previous_expert)] = step
+
+    def _record_prefetch_residency_published(
+        self,
+        ticket: PrefetchTicket,
+        *,
+        step_id: int,
+    ) -> None:
+        self._record_ghost_publication(ticket, step_id=int(step_id))
+        super()._record_prefetch_residency_published(ticket, step_id=int(step_id))
+
+    def _select_protected_victim(
+        self,
+        cache,
+        layer_idx,
+        incoming_expert_idx,
+        step_id: int | None = None,
+    ) -> int | None:
         if layer_idx is not None:
             self._round_loaded[int(layer_idx)].add(int(incoming_expert_idx))
         strategy_name = str(getattr(self.config, "cache_strategy", "lru")).strip().lower()
@@ -3219,6 +3267,20 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         li = None if layer_idx is None else int(layer_idx)
 
         protected = set(self._round_loaded.get(li, ())) if li is not None else set()
+        ghost_protected: set[int] = set()
+        if self._ghost_enabled() and li is not None and step_id is not None:
+            step = int(step_id)
+            for slot_expert in cache.slot_to_expert:
+                expert_idx = int(slot_expert)
+                if expert_idx < 0:
+                    continue
+                key = (li, expert_idx)
+                hot_until = int(self._ghost_hot_until.get(key, -1))
+                if hot_until >= step:
+                    protected.add(expert_idx)
+                    ghost_protected.add(expert_idx)
+                elif key in self._ghost_hot_until:
+                    self._ghost_hot_until.pop(key, None)
         if rankguard is not None and li is not None:
             protected.update(
                 int(expert_idx)
@@ -3226,21 +3288,45 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 if int(expert_idx) >= 0
                 and rankguard.is_protected(li, int(expert_idx))
             )
+        non_ghost_protected = protected.difference(ghost_protected)
         access_values = (
             cache.access_count if use_lfu else cache.last_access_step
         )
-        return select_predictive_victim_slot(
+        selected = select_predictive_victim_slot(
             slots=cache.slot_to_expert,
             pending=cache.active_slot_pending_expert,
             access_values=access_values,
             protected_experts=protected,
         )
+        if selected is not None and ghost_protected:
+            selected_expert = int(cache.slot_to_expert[selected])
+            if selected_expert in ghost_protected:
+                # Every usable slot was protected, so the safety valve kept
+                # progress by selecting the normal LRU/LFU fallback.
+                self._profile["predictive_ghost_safety_valve_count"] += 1
+            else:
+                without_ghost = select_predictive_victim_slot(
+                    slots=cache.slot_to_expert,
+                    pending=cache.active_slot_pending_expert,
+                    access_values=access_values,
+                    protected_experts=non_ghost_protected,
+                )
+                if (
+                    without_ghost is not None
+                    and int(cache.slot_to_expert[without_ghost]) in ghost_protected
+                ):
+                    self._profile["predictive_ghost_victim_avoided_count"] += 1
+        return selected
 
     def _select_publish_slot_cpu(self, cache, *, expert_idx, step_id, layer_idx=None) -> int | None:
-        return self._select_protected_victim(cache, layer_idx, expert_idx)
+        return self._select_protected_victim(
+            cache, layer_idx, expert_idx, step_id=int(step_id)
+        )
 
     def _select_publish_slot(self, cache, *, layer_idx, expert_idx, step_id) -> int | None:
-        return self._select_protected_victim(cache, layer_idx, expert_idx)
+        return self._select_protected_victim(
+            cache, layer_idx, expert_idx, step_id=int(step_id)
+        )
 
     # ----- phase-1 cold start (E.9) ---------------------------------------
     def submit_phase1_prefetch(self, *, step_id: int) -> int:
@@ -3500,6 +3586,15 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 self._profile.get(
                     "predictive_phase1_frequency_fallback_round_count", 0.0
                 )
+            ),
+            "predictive_ghost_hit_count": int(
+                self._profile.get("predictive_ghost_hit_count", 0.0)
+            ),
+            "predictive_ghost_victim_avoided_count": int(
+                self._profile.get("predictive_ghost_victim_avoided_count", 0.0)
+            ),
+            "predictive_ghost_safety_valve_count": int(
+                self._profile.get("predictive_ghost_safety_valve_count", 0.0)
             ),
         }
         out = super().get_profile(reset=reset)

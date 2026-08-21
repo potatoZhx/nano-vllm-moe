@@ -270,6 +270,27 @@ def test_active14_recent_phase1_t32_budget1_is_independent_preset(tmp_path):
     assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
 
 
+def test_active14_budget1_ghost8_is_independent_preset(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
+        ]
+    )
+
+    assert args.predictive_phase1_budget == 1
+    assert args.predictive_phase1_recent_verify is True
+    assert args.predictive_ghost_window_steps == 8
+    assert args.predictive_ghost_protect_steps == 8
+    assert args.kt_num_threads == 32
+    assert args.kt_threadpool_count == 2
+    assert args.kt_numa_nodes == "0,1"
+    env = configure_optimized_env(args)
+    assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
+
+
 def test_parse_args_rejects_verify_buckets_that_force_eager_fallback(tmp_path):
     try:
         parse_args(

@@ -668,6 +668,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "predictive_phase1_recent_verify": bool(
                 getattr(args, "predictive_phase1_recent_verify", False)
             ),
+            "predictive_ghost_window_steps": int(args.predictive_ghost_window_steps),
+            "predictive_ghost_protect_steps": int(args.predictive_ghost_protect_steps),
             "prefetch_history_decay": float(args.prefetch_history_decay),
             "prefetch_history_ttl_steps": int(args.prefetch_history_ttl_steps),
             "prefetch_source_weight_prefill": float(args.prefetch_source_weight_prefill),
