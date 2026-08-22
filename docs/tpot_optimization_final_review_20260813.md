@@ -5,6 +5,11 @@
 > 最新最低点为 **52.566035 ms/token**。权威更正、结果目录与 canonical preset 见
 > [`optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md`](optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md)。
 
+> **权重格式约束（2026-08-22）：** 用户明确禁止压缩或量化权重。本文历史分析中曾列出的
+> Q8/Q4/INT8/INT4/FP8、weight-only、稀疏化及压缩 GPU cache 路线均已撤回，不再属于
+> 后续候选；canonical 始终保持未压缩 F16 single-weight。权威边界见
+> [`optimization_commits/20260822_35_uncompressed_weight_constraint.md`](optimization_commits/20260822_35_uncompressed_weight_constraint.md)。
+
 > **状态提示（2026-08-19）：** recent phase1 budget1 已把正式单请求最优刷新到
 > 53.726 ms/token。权威最终状态、`296cf59` 后续收益判读、完整提交账本和下一阶段优先级
 > 见 [`tpot_optimization_closeout_20260819.md`](tpot_optimization_closeout_20260819.md)。
@@ -343,7 +348,7 @@ active14 三轮共有 888 个 speculative round（含 2 个 terminal K0），只
 | P0 | active14 fixed K1 同布局因果对照 | 决策价值高，开发成本几乎为零 | 仅实验成本 | 3 seed，与 active14 dynamic 配对。 |
 | P0 | pinned packing ring + 合批 H2D/publish/LUT 更新 | 高；现有换入主机毛开销很大 | cache 一致性、NUMA 与并发中风险 | 先做逐 expert 生命周期计时，再按小提交验证 enqueue/publish 与 TPOT。 |
 | P0 | CPUInfer qlen2/3 F16 native 分项计时与专用 kernel | 高 | C++/NUMA/kernel 中高风险 | queue/GEMM/activation/merge 分项 + 3 seed TPOT。 |
-| P0 | 压缩 GPU cached expert 权重以同时增加 active experts 和 KV | 高 | 数值、kernel 与加载器高风险 | logits/acceptance 正确；active 数增加；完整 512/8192 容量分档。 |
+| P0 | 精确 F16 CPUInfer 的软件预取、NUMA-local 分块和写回削减 | 高 | C++/NUMA/kernel 中高风险 | 完全相同权重与 route；native 分项 + 3 seed TPOT。 |
 | P0 | 根据请求长度自动选择 active12-safe / active14-fast 内存档 | 中高 | 配置与容量校验低风险 | 运行前证明 KV capacity >= prompt+max output+graph padding。 |
 | P1 | 标准 speculative acceptance 的 GPU 化/融合 | 上限约 0.683 ms/token | RNG、top-k/top-p 与 residual sampling 语义中风险 | 分布/固定随机流测试；只回传最终 accept length/token。 |
 | P1 | legacy llamafile 跳过冗余 expert-mask D2H | 低但置信度高 | 后端分支不变量低风险 | mask/route 单测，确认 legacy 构造器确实不读 host mask。 |
@@ -360,7 +365,7 @@ active14 三轮共有 888 个 speculative round（含 2 个 terminal K0），只
 | P2 | graph route accumulation、CPU output add 与 workspace 融合 | 中 | 48 层 graph-safe kernel 中风险 | 去掉 zero/index_copy/reduce 节点，数值一致。 |
 | P2 | production fast path：关闭 trace/profile/mode 遍历 | 低到中 | 可观测性回归低风险 | profile-on/off 功能一致，最终生产口径单独报告。 |
 | P2 | 自动不等长 segment（按预计 CPU tail 划分） | 中 | graph bucket 数和显存风险 | segment event 尾差下降且 graph 全命中。 |
-| P2 | CPU expert INT8/INT4/FP8 或 weight packing | 高 | 精度与新 kernel 高风险 | perplexity/logit/acceptance + CPU native throughput + TPOT。 |
+| P2 | 精确 F16 expert activation/down 或跨 task 融合 | 中高 | 新 kernel 与调度高风险 | bitwise/容差正确；CPU native throughput + TPOT。 |
 | P3 | 更便宜/更准确的 draft model、early-exit/self-spec | 很高 | 算法与训练/权重大改 | acceptance、draft cost、verify rounds共同进入 TPOT 模型。 |
 | P3 | EAGLE/Medusa/tree speculative decoding | 很高 | 大规模重写、graph 与采样复杂 | exact sampling 正确性及多 workload TPOT。 |
 | P3 | 把 heterogeneous MoE/spec 链迁入 KTransformers | 架构价值，短期 TPOT 不确定 | 很高 | 按 MVP -> spec -> prefetch -> graph 分阶段。 |
@@ -378,19 +383,16 @@ segment16、vpb2、warmup1024，关闭 predictor 并固定 K1，跑相同 seeds�
 - 两者相当：说明 K2 的少量收益大致偿还 predictor 成本，当前 0.97 已接近局部平衡。
 - dynamic 更快：才有直接证据说明 rare high-alpha K2 在同布局上产生净收益。
 
-### 8.2 内存压缩比继续加 cache ratio 更有战略价值
+### 8.2 保持精确权重后的容量边界
 
 active12 到 active14 只把 CPU route ratio 从 0.9068 降到 0.8952，就带来 4.28% 动态
-均值改善，但代价是 KV 从 9728 tokens 降到 1536 tokens。继续裸增 active experts
-已经没有显存空间；应改变每个 cached expert 的字节数，而不是继续挤 KV：
+均值改善，但代价是 KV 从 9728 tokens 降到 1536 tokens。权重压缩已经明确禁止，因此
+不能再通过降低 cached expert 字节数扩大 active slots。后续容量工作只允许：
 
-1. GPU cache 权重 FP8/INT8，CPU 主权重仍保留 F16；
-2. 只量化最占空间的 gate/up/down 权重，route/gate 保持高精度；
-3. 加载或换入时一次性 dequant/pack 到 kernel 所需布局，避免每 token host 转换；
-4. 分别建立 full-context-safe 与 workload-sized 档位。
-
-若数值误差改变 draft 分布或 acceptance，必须重新比较最终输出质量和标准 speculative
-sampling，而不能只看 kernel tok/s。
+1. 保持原始 F16/BF16 权重表示，消除重复副本、过量 workspace 或不必要的临时 buffer；
+2. 根据请求长度在已验证的 active12-safe / active14-fast 档位之间选择；
+3. 改善 placement、admission、prefetch 和 eviction，使相同 slots 覆盖更有价值的 routes；
+4. 分别保留 full-context-safe 与 workload-sized 档位，绝不以隐式压缩突破容量约束。
 
 ### 8.3 CPU expert 是 verify 的最大结构性机会
 
@@ -458,7 +460,7 @@ features 约 1.938 ms/call。建议拆成可回退的小提交：
 - early-exit/self-spec，共享主模型前层或隐藏状态；
 - EAGLE/Medusa 类多 token head；
 - tree speculative，一次 verify 多分支候选；
-- CPU expert 量化/稀疏化；
+- 精确 F16 CPU expert 的跨层/task 融合与带宽优化；
 - 把 heterogeneous MoE 功能逐阶段迁入 KTransformers。
 
 这些都必须保持 exact/standard sampling 语义或明确标注近似模式，且开发成本显著高于
@@ -471,7 +473,7 @@ features 约 1.938 ms/call。建议拆成可回退的小提交：
    评估短生命周期 pinned packing ring、批量 LUT/mask 更新和 source 消费价值。
 3. 做 current-path native CPUInfer qlen2/3 分项 profile；再按证据优化 kernel、task、
    affinity/NUMA 和 threadpool。
-4. 评估 GPU cached expert INT8/其他压缩格式的容量、误差与小 M kernel 可行性。
+4. 在原始 F16/BF16 表示下评估 GPU cached expert 的小 M kernel、workspace 与 route 融合。
 5. 再做 verify qlen2/3 GPU kernel、route accumulation、reroute/plan 和 acceptance 融合，
    每个正收益独立提交并补文档。
 6. 收集停止点 shadow alpha2 后，把动态决策升级为 K2-vs-K1；不要只微调 0.97 小数位。
@@ -550,7 +552,7 @@ token 不在该 trace 中。按每轮 trace 输出归一化：
 | 删除整个 draft | 18.255 ms/token、28.65%的绝对硬上限；删除后也失去 speculative 收益。 |
 | acceptance 融合 | 0.683 ms/token、1.07%的直接硬上限。 |
 | prefetch enqueue/publish | 只有调用路径毛时间，因异步重叠和嵌套计时，不能直接换算 TPOT。 |
-| cache/量化/新算法 | 间接改变 CPU route、KV 或 round 数，没有现成单项硬上限，必须重测。 |
+| cache placement/新算法 | 间接改变 CPU route、KV 或 round 数，没有现成单项硬上限，必须重测。 |
 
 按实际选择的 K 分桶，已有 trace 给出：
 
@@ -620,9 +622,9 @@ active14 profile 已直接量到 0.683 ms/token，所以即使完全删除该阶
   `max(p-q, 0)` 并采样；
 - top-k/top-p、temperature、residual distribution 和 RNG 消耗顺序必须分别测试。
 
-LM head 每行是 `151936 x 2048`，约 0.622 GFLOP，F16/BF16 权重 593.5 MiB。长期可以
-探索 fused logits filtering/sampling 或量化 LM head，但此前 tail graph 已改变 RNG/轨迹
-并产生负收益，因此不能简单重做相同融合。
+LM head 每行是 `151936 x 2048`，约 0.622 GFLOP，F16/BF16 权重 593.5 MiB。长期只在
+保持原始权重表示的前提下探索 fused logits filtering/sampling；此前 tail graph 已改变
+RNG/轨迹并产生负收益，因此不能简单重做相同融合。
 
 ### 13.3 当前动态控制器判断的是 K1 对 K0，不是 K2 对 K1
 
@@ -698,10 +700,9 @@ tokens。差值与 864 MiB expert cache 增量及 `gpu_memory_utilization` 0.97�
 
 - 只把 KV 变成 1 byte 格式，在其他内存不变时 active14 约从 1536 增到 3072 tokens，
   仍不足 8192；
-- 把 active14 GPU expert cache 从 2 byte 压到 1 byte，理论释放约 3024 MiB，可大幅
-  增加 KV 或 active slots，但必须有 decode 小 M 友好的 dequant/GEMM；
-- RTX 3080 上 INT8 比 FP8 更贴近原生硬件能力；格式选择应由 qlen1/2/3 kernel 与数值
-  共同决定，不能只按字节数；
+- 禁止把 active14 GPU expert cache 从 2 byte 压到 1 byte；约 3024 MiB 的理论释放量
+  仅作为为什么该路线曾被考虑的历史容量上限，不再是实现候选；
+- qlen1/2/3 kernel 必须直接消费原始 F16/BF16 权重，不允许隐式 weight-only 转换；
 - graph pool、临时 route buffer、LM head 和 warmup peak 也占显存，任何理论 slot/block
   数都必须在 capture 完成后重新做显存 census。
 
@@ -783,11 +784,11 @@ instrumentation-off 的生产 TPOT，不能拿来悄悄替换本文 profile-on �
 
 - fused QKV split + q/k norm + RoPE，减少 48 层短 qlen 的 memory pass/graph nodes；
 - KV store 与 attention 的接口融合，或只为 qlen1/2/3 做专用 decode kernel；
-- LM head INT8/weight-only、分块 logits 与 fused sampling，减少 593.5 MiB 权重读取；
+- 保持 LM head 原始权重表示，评估分块 logits 与 fused sampling，减少中间张量写回；
 - standard acceptance 与普通 sampler 统一随机数生成接口，避免多套 full-vocab 分布；
 - 单请求时复用 input/position/context pinned buffers，减少每轮 Python list→tensor；
 - KV block 从 256 变小主要改善并发/碎片，不会减少单请求 579-token 的实际 KV 字节，
-  优先级低于 expert cache 压缩。
+  优先级低于固定 slots 下的 expert cache placement。
 
 每项都必须先用无扰动 event/graph node 计数给出上限。当前 verify/draft 大头在 MoE 与
 prefetch/CPU 路径，不能因为这些融合容易编码就错误置顶。
@@ -835,7 +836,7 @@ predictor，而不是沿用旧成本下的阈值。再往后依次是：
 1. 更便宜的 self-spec/early-exit draft；
 2. 多 token head（Medusa/EAGLE 类）；
 3. tree speculative，一次 verify 多分支；
-4. CPU expert INT8/稀疏化；
+4. CPU expert 精确 F16 的 persistent task、NUMA-local 分块或 activation/down 融合；
 5. 将 Nano 的 heterogeneous MoE、spec、prefetch 和 graph 分阶段迁入 KTransformers。
 
 这些路线可能获得数量级更大的收益，但 exact sampling、模型权重/训练、graph bucket 和
@@ -853,7 +854,7 @@ predictor，而不是沿用旧成本下的阈值。再往后依次是：
 | D | 当前 CPU 尾部在哪里 | native qlen2/3 分项 + NUMA/affinity | 找到占 exposed tail 的首要 kernel/queue |
 | E | 小 kernel/GPU graph 上限 | instrumentation-off node/event census | 单项上限足够覆盖开发与回归风险 |
 | F | 新动态 K2-vs-K1 控制器 | shadow alpha2/cost + holdout replay | 期望收益稳定且 fail-safe 不差于 0.97 |
-| G | 权重量化/新 speculative 算法 | correctness/quality 后再 TPOT | 独立 preset，不覆盖精确基线 |
+| G | 新 speculative 算法 | correctness/quality 后再 TPOT | 独立 preset，不覆盖现有基线 |
 
 提交规则继续保持：
 
@@ -874,7 +875,7 @@ safe 与 workload-sized 两个动态最优；但没有足够证据宣称硬件�
 
 1. **先消除 single-weight NUMA 分片换入的逐 expert 提交/发布毛开销；**
 2. **再定位并加速 qlen2/3 CPUInfer exposed tail；**
-3. **用压缩 expert cache 同时改善 active slots 与 KV 容量；**
+3. **在固定 F16/BF16 slots 下用 placement/admission 改善 cache 命中和 CPU 尾部；**
 4. **补 fixed K1 因果对照与 shadow alpha2，再把动态决策改为 K2-vs-K1；**
 5. **最后处理 acceptance、graph 小 kernel、norm/RoPE 与 production profile fast path。**
 
@@ -985,12 +986,12 @@ SiLU/mul、down GEMM、merge、wrapper 和 exposed sync；再选择 m-block、�
 结果直接保留运行时改动。qlen2 all-CPU 只有在
 当前 speculative graph 的针对性分析证明更快后才进入候选。
 
-**P1：压缩和重做 cache placement。** 用新 workload profile 做边际收益 allocator，
+**P1：在固定权重格式下重做 cache placement。** 用新 workload profile 做边际收益 allocator，
 约束为固定总 slots 和少数 bucket shape；加入 churn-aware eviction、protection TTL、未来
-reuse distance、draft/verify 分区或共享策略。并分析 F16、INT8/weight-only expert cache：
-压缩可同时增加 active slots 和 KV 容量，但需要 qlen1/2/3 的小 M 解量化 GEMM 与质量
-验证。score_sum 可先做 FP16、top-N 或 delta 编码的 shadow ranking agreement，而不是
-直接删除。
+reuse distance、draft/verify 分区或共享策略。expert 权重保持原始 F16/BF16；容量只能
+通过消除重复副本/workspace 或请求长度分档改善，不能通过量化增加 slots。score_sum 是
+控制元数据而非权重，可先做 FP16、top-N 或 delta 编码的 shadow ranking agreement，
+但其收益必须与 expert 权重格式严格区分。
 
 **P1：继续缩短 metadata/control 热路径。** 将 histogram 的计数、score 聚合、稀疏
 compact 融合到 C++/NumPy/native worker；复用 buffer，避免 GIL 与小 tensor 分配；profile
@@ -1008,10 +1009,10 @@ first-step confidence、route/cache、transfer backlog、KV length 和条件 acc
 低置信度/分布外一律退回现有 K1/K2 preset，永久保留
 `k2_dynamic_f16_3080` 与 `k2_dynamic_f16_3080_active14`。
 
-**P2/P3：容量、workload 与架构。** 分析 KV/cache 量化、prefix cache、连续 batching、
+**P2/P3：容量、workload 与架构。** 分析 prefix cache、连续 batching、
 跨请求 route 合批和 cache 隔离；覆盖 prompt/output 长度、sampling、并发、p95/p99、TTFT、
 吞吐和能耗。更大改动包括 early-exit/self-spec、Medusa/EAGLE/tree speculative、CPU
-expert INT8/稀疏化，以及把 heterogeneous MoE/spec/prefetch/graph 分阶段迁入 KT runtime。
+expert 精确算子融合，以及把 heterogeneous MoE/spec/prefetch/graph 分阶段迁入 KT runtime。
 这些都应使用独立 preset 和正确性/质量门禁，不覆盖当前 exact 基线。
 
 ### 17.7 最终执行顺序与冻结项
@@ -1020,7 +1021,7 @@ expert INT8/稀疏化，以及把 heterogeneous MoE/spec/prefetch/graph 分阶�
 
 1. source-specific telemetry 与 current-workload route/profile；
 2. pinned packing/batched publish 和 CPUInfer BF16/F16 原生分项；
-3. 新 profile 上的 marginal cache allocation 与 cache 压缩；
+3. 新 profile 上固定 F16/BF16 slots 的 marginal cache allocation；
 4. metadata/control/native batch 快路径和 GPU MoE/graph 融合；
 5. shadow alpha2 后的 K2-vs-K1 动态控制器；
 6. workload/concurrency 与新 speculative 架构。

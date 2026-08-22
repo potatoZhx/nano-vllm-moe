@@ -192,6 +192,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | rejected/analysis / [32](optimization_commits/20260822_32_rejected_dynamic_threshold095_t16.md) | 公平 t16 下动态门限 0.97→0.95 回退 2.72%；保留 0.97，不再盲扫静态门限。 |
 | 本次更新 | rejected/analysis / [33](optimization_commits/20260822_33_rejected_cpuinfer_static_schedule.md) | native 分项定位三次 GEMM；static 微基准正、端到端回退 2.04%，不启用。 |
 | 本次更新 | rejected/analysis / [34](optimization_commits/20260822_34_rejected_lru_frequency_tiebreak.md) | lifetime frequency 破 LRU 同分使公平 t16 TPOT 回退 5.42%，候选代码撤销。 |
+| 本次更新 | constraint / [35](optimization_commits/20260822_35_uncompressed_weight_constraint.md) | 撤回全部压缩权重路线；后续只做保持 F16/BF16 表示的等价优化。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -340,6 +341,7 @@ source/rank admission 之后。
 - dynamic threshold 0.95：公平 t16 下相对 0.97 回退 2.72%；结合历史 0.98 负结果，
   不再继续静态门限扫描。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
+- Q8/Q4/INT8/FP8 等压缩或量化权重：用户明确禁止；没有运行时代码或 preset，后续不再评估。
 - 全量迁移 KTransformers runtime：Nano 已复用其 CPUInfer 核心，架构迁移风险高且不是
   当前差距的主要来源。
 
@@ -350,10 +352,11 @@ source/rank admission 之后。
 1. **建立稳定 holdout 门禁。** 固定双方 sampling/chat template，至少 3 个独立 seed，
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
-2. **从 CPUInfer native 分项进入真正的带宽优化。** exact-current qlen2/3 profile 已证明
+2. **从 CPUInfer native 分项进入精确 F16 算子优化。** exact-current qlen2/3 profile 已证明
    gate/up 占 65–67%、down 约 30%，input copy/merge 仅 1–4%；static scheduling 又在真实请求
-   回退 2.04%。因此下一 operator 候选必须减少三份大权重的带宽/算术，例如有质量门禁的
-   packed weight-only kernel；不再先扫 dtype、group_min、m_block 或 worker scheduling。
+   回退 2.04%。权重压缩已明确禁止，后续只允许等价的软件预取、NUMA-local 分块、减少
+   中间 buffer 写回或 activation/down 融合；不再扫描 dtype、group_min、m_block 或 worker
+   scheduling。
 3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；简单 lifetime frequency
    破 LRU 同分已回退 5.42%，证明 choice-difference 不能代表收益。下一版必须按 source+rank
    直接预测 next reuse / CPU tail saved，并减去 victim reload、publication 和 overlap 成本。
@@ -378,8 +381,8 @@ source/rank admission 之后。
    TPOT；保留现有 0.97 preset 为 fallback。
 8. **GPU 小 M MoE/route 融合。** 对 qlen1/2/3 专门融合 reroute/LUT/scatter/reduce、GPU
    cached expert 计算和 CPU result add，减少 workspace 与小 kernel launch。
-9. **cache 容量换算子格式。** 评估 INT8 weight-only/FP8 GPU cached experts，以质量校验
-   和真实 kernel 为门禁；收益目标是增加 active experts并减少 CPU exposed tail，而非只省显存。
+9. **保持权重格式的 cache/算子融合。** 不允许通过 INT8/Q8/Q4/FP8 增加 cache 容量；只在
+   原始 F16/BF16 表示下评估 route/LUT/scatter/reduce 与 expert kernel 的等价融合。
 10. **attention/sampling 小核融合。** qk-norm、RoPE、QKV/KV-store 与 sampler 是 CPU MoE
     尾部压低后会显现的固定成本，可由 CUDA graph/event profile 再排序。
 11. **自动选择 workload-sized 与 full-context-safe preset。** 按 prompt + max output +
@@ -409,4 +412,5 @@ source/rank admission 之后。
   preset 中累计继承 b1。
 - 动态 draft 的历史最优、active14、recent/b4、b2 与 full-context-safe preset 全部保留；
   旧 t32 名称仅作命令兼容 alias，实际也固定为 16 threads。
+- 权重格式红线：禁止任何 Q8/Q4/INT8/FP8 压缩或量化；canonical 保持 F16 single-weight。
 - 本文之后不再把旧综述中的 59.701 或 63.713 称为“当前最终状态”。
