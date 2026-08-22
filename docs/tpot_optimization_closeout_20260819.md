@@ -189,6 +189,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | analysis / [29](optimization_commits/20260821_29_publish_batching_shadow.md) | LUT fusion 后跨层 publication batching 的理想上界不到 0.1% TPOT，调整后续排序。 |
 | 本次更新 | fairness/perf / [30](optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md) | 全部 preset 固定 t16；同资源累计链逐项为正，最终 52.566 ms/token。 |
 | 本次更新 | rejected/analysis / [31](optimization_commits/20260822_31_rejected_ghost16_after_t16_profiles.md) | t16 profile 定位 CPUInfer sync；ghost16 回退 5.69%，不新增 preset。 |
+| 本次更新 | rejected/analysis / [32](optimization_commits/20260822_32_rejected_dynamic_threshold095_t16.md) | 公平 t16 下动态门限 0.97→0.95 回退 2.72%；保留 0.97，不再盲扫静态门限。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -260,6 +261,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | 当前同资源已测最低点。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
 | `results/tpot_t16_b1_ghost16_lutfuse_20260822/` | 55.559 ms | 相对 ghost8/fusion 回退 5.69%，不新增 preset。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_threshold095_20260822/` | 53.994 ms | 动态门限 0.97→0.95 回退 2.72%，不新增 preset。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -327,6 +329,8 @@ source/rank admission 之后。
 - 直接删除 verify metadata 聚合：回退 15.48%，先解释 pacing 再改。
 - m_block 盲扫：exact-Nano qlen1/2/3 没有超出噪声的候选。
 - ghost16：公平 t16 下与 ghost8/fusion 相比回退 5.69%，不再盲扫更长 TTL。
+- dynamic threshold 0.95：公平 t16 下相对 0.97 回退 2.72%；结合历史 0.98 负结果，
+  不再继续静态门限扫描。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
 - 全量迁移 KTransformers runtime：Nano 已复用其 CPUInfer 核心，架构迁移风险高且不是
   当前差距的主要来源。
@@ -359,9 +363,10 @@ source/rank admission 之后。
 
 ### P1：在现有动态框架上继续扩展
 
-7. **重写 K2 边际决策而不是继续扫 0.97。** 当前 `first_increase` 主要用 K1 相对 K0 的
-   预测量判断是否继续，缺少 K2 相对 K1 的 shadow/counterfactual。记录预测 alpha2、实际
-   接受长度、额外 draft cost、verify qlen3 cost、cache/prefetch credit，直接最小化预期
+7. **重写 K2 边际决策而不是继续扫静态门限。** 公平 t16 trace 中现有 K2 的第二 draft
+   接受 23/24，但把门限从 0.97 放宽到 0.95 仍端到端回退 2.72%，证明 alpha1/接受率不足以
+   表达额外 qlen3 verify 与 cache/prefetch 外部性。下一版应在 K1 记录或 shadow 预测 alpha2、
+   额外 draft cost、verify qlen3 cost、cache/prefetch credit，直接最小化 K2 相对 K1 的边际
    TPOT；保留现有 0.97 preset 为 fallback。
 8. **GPU 小 M MoE/route 融合。** 对 qlen1/2/3 专门融合 reroute/LUT/scatter/reduce、GPU
    cached expert 计算和 CPU result add，减少 workspace 与小 kernel launch。
