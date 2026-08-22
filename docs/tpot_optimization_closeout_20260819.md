@@ -188,6 +188,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | perf / [28](optimization_commits/20260821_28_fused_cache_lut_updates.md) | 预热并禁止动态索引 specialization 的 LUT fusion 再改善 0.29%。 |
 | 本次更新 | analysis / [29](optimization_commits/20260821_29_publish_batching_shadow.md) | LUT fusion 后跨层 publication batching 的理想上界不到 0.1% TPOT，调整后续排序。 |
 | 本次更新 | fairness/perf / [30](optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md) | 全部 preset 固定 t16；同资源累计链逐项为正，最终 52.566 ms/token。 |
+| 本次更新 | rejected/analysis / [31](optimization_commits/20260822_31_rejected_ghost16_after_t16_profiles.md) | t16 profile 定位 CPUInfer sync；ghost16 回退 5.69%，不新增 preset。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -257,6 +258,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_fair_b1_20260822/` | 54.627 ms | 相对公平 b2 改善 0.76%。 |
 | `results/tpot_t16_fair_b1_ghost8_20260822/` | 53.337 ms | 相对公平 b1 改善 2.36%。 |
 | `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | 当前同资源已测最低点。 |
+| `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
+| `results/tpot_t16_b1_ghost16_lutfuse_20260822/` | 55.559 ms | 相对 ghost8/fusion 回退 5.69%，不新增 preset。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -323,6 +326,7 @@ source/rank admission 之后。
 - verify NumPy collect：孤立函数变快但两套端到端均回退，已经 revert。
 - 直接删除 verify metadata 聚合：回退 15.48%，先解释 pacing 再改。
 - m_block 盲扫：exact-Nano qlen1/2/3 没有超出噪声的候选。
+- ghost16：公平 t16 下与 ghost8/fusion 相比回退 5.69%，不再盲扫更长 TTL。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
 - 全量迁移 KTransformers runtime：Nano 已复用其 CPUInfer 核心，架构迁移风险高且不是
   当前差距的主要来源。
@@ -335,12 +339,13 @@ source/rank admission 之后。
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
 2. **对 exact current path 做 CPUInfer native phase profile。** 使用当前约 51% CPU route、
-   qlen1/2/3、group_min1、m_block32、t32/双 NUMA，拆出 queue/group、gate/up GEMM、SiLU、
+   qlen1/2/3、group_min1、m_block32、t16/双 NUMA 2 x 8，拆出 queue/group、gate/up GEMM、SiLU、
    mul、down、merge 与 exposed sync。接着评估跨层 task batching、persistent worker、core
    affinity、NUMA first-touch/hugepage；不再先扫 dtype/group_min/m_block。
 3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
    估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
-   ghost TTL：16/16 的 shadow 已会影响约 5.1% victim，先量化 eviction externality。
+   ghost TTL：16/16 已在公平 t16 请求中回退 5.69%，应直接量化 admission/eviction
+   externality，不再扫描更长 TTL。
 4. **有条件地批量化 transfer/publish。** LUT commit 已融合；当前仍有 2531 次、约
    22.24 GiB publication，但只读上界表明跨层 commit 合并不到 0.1% TPOT。只有 native
    profile 证明 event/H2D 控制面仍显著，且能保持每个 expert 独立可见时刻时，才评估
