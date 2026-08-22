@@ -21,7 +21,7 @@ Example:
         --segment-sizes 12 \
         --runtime-kinds dual_queue,predictive \
         --secondary-index-weight 0.8 \
-        --kt-num-threads 32
+        --kt-num-threads 16
 """
 from __future__ import annotations
 

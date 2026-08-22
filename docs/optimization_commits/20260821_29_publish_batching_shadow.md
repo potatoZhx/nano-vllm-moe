@@ -2,6 +2,11 @@
 
 日期：2026-08-21
 
+> **证据边界更正（2026-08-22）：** 本页源 trace 来自旧 t32 请求，因此不能用于公平
+> TPOT 对比；publication 计数和分组仍可作为结构性假设，但在决定实现前应以当前 t16 /
+> 双 NUMA 2 x 8 preset 重新采集 profile。当前公平性能入口见
+> [`20260822_30_uniform_t16_fairness_revalidation.md`](20260822_30_uniform_t16_fairness_revalidation.md)。
+
 ## 一句话总结
 
 LUT fusion 落地后，跨层 publication 再批处理的理想 launch 上界不到 0.1% TPOT，且会

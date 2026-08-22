@@ -2,6 +2,12 @@
 
 日期：2026-08-21
 
+> **公平性复测（2026-08-22）：** 保留 preset 的 canonical 名称改为
+> `k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse`。统一 16 total threads /
+> 双 NUMA 2 x 8 后，ghost8 **53.336804** → fusion **52.566035 ms/token**，改善
+> **1.45%**。下文 2026-08-21 数值是旧 t32 资源下的历史门禁；完整复测见
+> [`20260822_30_uniform_t16_fairness_revalidation.md`](20260822_30_uniform_t16_fairness_revalidation.md)。
+
 ## 一句话总结
 
 把每次 active-cache 映射提交的 3–5 个 CUDA 标量更新融合为一个预热 Triton kernel，
@@ -36,7 +42,7 @@ RTX 3080、5000 次循环、每组 5 次取中位数：
 全部旧 preset 继续走原来的内联 PyTorch 更新。保留的独立 preset 为：
 
 ```text
-k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse
+k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse
 ```
 
 第一次实现虽然融合了 kernel，但把 expert/slot 索引作为普通 Python integer 传给 Triton。

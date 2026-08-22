@@ -42,6 +42,12 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080",
     "k2_dynamic_f16_3080_active14",
     "k2_dynamic_f16_3080_active14_phase1_recent",
+    "k2_dynamic_f16_3080_active14_phase1_recent_b2",
+    "k2_dynamic_f16_3080_active14_phase1_recent_b1",
+    "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8",
+    "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse",
+    # Compatibility aliases retained for historical commands.  They resolve
+    # to the same 16-thread presets below; no built-in preset uses 32 threads.
     "k2_dynamic_f16_3080_active14_phase1_recent_t32",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b2",
     "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
@@ -251,40 +257,52 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"] = {
     "predictive_phase1_recent_verify": True,
 }
 
-# Preserve the 16-thread recent-route preset as a fallback.  The dual-NUMA
-# 32-thread variant is independently selectable after paired kernel and
-# one-request TPOT validation on the 2 x 20-core target host.
-OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
+# All comparable baseline and optimized runs use 16 total CPUInfer threads:
+# two NUMA pools with eight workers each.  Budget variants inherit that exact
+# resource topology and differ only in the prefetch/cache algorithm.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b2"] = {
     **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"],
-    "kt_num_threads": 32,
-}
-
-# Preserve the measured t32/budget4 point as a fallback.  Limiting phase-1 to
-# its two highest-ranked recent verify candidates reduces transfer/cache churn
-# without changing the verify prefetch budget or dynamic K1/K2 controller.
-OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"] = {
-    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"],
     "predictive_phase1_budget": 2,
 }
 
 # The single highest-ranked recent candidate is the retained one-request best;
 # keep budget2 and budget4 as independent fallbacks for broader workloads.
-OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"] = {
-    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"],
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b2"],
     "predictive_phase1_budget": 1,
 }
 
 # Preserve b1 unchanged.  This conservative candidate protects an expert only
 # after it is reloaded within eight model steps of an earlier eviction.
-OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8"] = {
-    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"],
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1"],
     "predictive_ghost_window_steps": 8,
     "predictive_ghost_protect_steps": 8,
 }
 
-OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse"] = {
-    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8"],
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8"],
     "fused_cache_lut_updates": True,
+}
+
+# Historical command aliases.  Their names describe the old experiment, not
+# the effective topology: every alias is intentionally capped at 16 threads.
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent"],
+}
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b2"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b2"],
+}
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1"],
+}
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8"] = {
+    **OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8"],
+}
+OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse"] = {
+    **OPTIMIZED_CONFIG_PRESETS[
+        "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse"
+    ],
 }
 
 def str2bool(value: str | bool) -> bool:
@@ -422,6 +440,12 @@ def resolve_acceptance_predictor(args: argparse.Namespace) -> dict[str, Any]:
 
 def validate_runtime_config(args: argparse.Namespace) -> None:
     mode = str(args.inference_mode)
+    optimized_config = str(getattr(args, "optimized_config", "none") or "none")
+    if optimized_config != "none" and int(args.kt_num_threads) != 16:
+        raise ValueError(
+            "built-in optimized configs require exactly 16 total CPUInfer "
+            "threads for baseline-comparable resource settings"
+        )
     if bool(args.spec_enable_prefetch) and mode != "spec":
         raise ValueError(
             "--spec-enable-prefetch=true requires --inference-mode=spec"
@@ -549,6 +573,10 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8",
             "k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8_lutfuse",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b2",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b1",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:

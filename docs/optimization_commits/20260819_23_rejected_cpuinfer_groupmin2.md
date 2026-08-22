@@ -1,5 +1,9 @@
 # 否决 CPUInfer `group_min_len=2`
 
+> **公平性更正（2026-08-22）：** 本页使用的 t32 资源超过 16-thread baseline 上限，
+> 因此只保留为历史负结果，不能据此推荐线程配置。当前统一 t16 口径见
+> [`20260822_30_uniform_t16_fairness_revalidation.md`](20260822_30_uniform_t16_fairness_revalidation.md)。
+
 ## 假设
 
 Nano 的 legacy llamafile CPUInfer 当前固定 `m_block=32`、`group_min_len=1`，因此 qlen1

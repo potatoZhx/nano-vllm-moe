@@ -2,6 +2,12 @@
 
 日期：2026-08-21
 
+> **公平性复测（2026-08-22）：** 保留 preset 的 canonical 名称改为
+> `k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8`。统一 16 total threads / 双 NUMA
+> 2 x 8 后，b1 **54.627249** → ghost8 **53.336804 ms/token**，改善 **2.36%**。下文
+> 2026-08-21 数值是旧 t32 资源下的历史门禁；完整复测见
+> [`20260822_30_uniform_t16_fairness_revalidation.md`](20260822_30_uniform_t16_fairness_revalidation.md)。
+
 ## 一句话总结
 
 对“换出后 8 个 model step 内又被传回”的 expert 提供 8-step 保护，同日一请求
@@ -45,7 +51,7 @@ Predictive runtime 在一次成功 publication 后记录它替换的 `(layer, ex
 保留的独立 preset：
 
 ```text
-k2_dynamic_f16_3080_active14_phase1_recent_t32_b1_ghost8
+k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8
 ```
 
 原 `..._b1` 是关闭 ghost 的直接 fallback；budget2、active14 与 full-context-safe 动态

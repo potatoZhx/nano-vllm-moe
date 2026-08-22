@@ -19,7 +19,7 @@ unique miss experts, and cache hit rate changes.
         --output-lens 128,512,1024,4096,8092 \
         --max-draft-tokens-values 4,5,8,10 \
         --segment-sizes 12 \
-        --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 32 
+        --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 16
     EOS
 """
 from __future__ import annotations

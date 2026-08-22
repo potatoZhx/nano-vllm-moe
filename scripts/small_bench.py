@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES=2 python scripts/small_bench.py \
     --prefetch-verify-layer-max-budget 8 \
     --prefetch-max-inflight 16 \
     --cpu-expert-backend kt_direct --spec-verify-miss-policy cpu \
-    --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 32 
+    --kt-threadpool-count 1 --kt-chunked-prefill-size 4096 --kt-direct-backend auto --kt-num-threads 16
 EOS
 """
 

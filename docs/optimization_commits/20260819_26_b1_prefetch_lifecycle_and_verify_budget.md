@@ -1,5 +1,10 @@
 # b1 prefetch lifecycle 与 verify budget 否决点
 
+> **证据边界更正（2026-08-22）：** 本页 instrumented 请求使用旧 t32 资源。其 lifecycle
+> 结构仍可用于提出假设，但不能作为当前公平 TPOT 对照；后续运行时候选必须在 t16 / 双
+> NUMA 2 x 8 下重新采集和验证。当前统一口径见
+> [`20260822_30_uniform_t16_fairness_revalidation.md`](20260822_30_uniform_t16_fairness_revalidation.md)。
+
 ## b1 analysis profile
 
 为避免在 b1 的 53.726 ms/token 后继续盲扫，使用相同 MMLU-Pro 第 0 条、512 token、

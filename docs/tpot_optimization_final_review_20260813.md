@@ -1,5 +1,10 @@
 # TPOT 优化收尾审计与后续路线图
 
+> **资源公平性更正（2026-08-22）：** 旧 t32 结果不能与 16-thread baseline 作公平对比，
+> 也不再代表当前最佳。全部内置优化 preset 已统一为 16 total threads；同资源累计链的
+> 最新最低点为 **52.566035 ms/token**。权威更正、结果目录与 canonical preset 见
+> [`optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md`](optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md)。
+
 > **状态提示（2026-08-19）：** recent phase1 budget1 已把正式单请求最优刷新到
 > 53.726 ms/token。权威最终状态、`296cf59` 后续收益判读、完整提交账本和下一阶段优先级
 > 见 [`tpot_optimization_closeout_20260819.md`](tpot_optimization_closeout_20260819.md)。
