@@ -10,6 +10,10 @@
 > 后续候选；canonical 始终保持未压缩 F16 single-weight。权威边界见
 > [`optimization_commits/20260822_35_uncompressed_weight_constraint.md`](optimization_commits/20260822_35_uncompressed_weight_constraint.md)。
 
+> **精确算子路线更新（2026-08-22）：** post-hoc F16 hugepage collapse 已在约 31.78 GiB
+> 实际覆盖下完成公平请求，TPOT 为 52.677165 ms/token、相对最优回退 0.21%，候选代码撤销。
+> 见 [`optimization_commits/20260822_36_rejected_f16_hugepage_collapse.md`](optimization_commits/20260822_36_rejected_f16_hugepage_collapse.md)。
+
 > **状态提示（2026-08-19）：** recent phase1 budget1 已把正式单请求最优刷新到
 > 53.726 ms/token。权威最终状态、`296cf59` 后续收益判读、完整提交账本和下一阶段优先级
 > 见 [`tpot_optimization_closeout_20260819.md`](tpot_optimization_closeout_20260819.md)。

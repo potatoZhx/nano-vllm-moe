@@ -193,6 +193,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | rejected/analysis / [33](optimization_commits/20260822_33_rejected_cpuinfer_static_schedule.md) | native 分项定位三次 GEMM；static 微基准正、端到端回退 2.04%，不启用。 |
 | 本次更新 | rejected/analysis / [34](optimization_commits/20260822_34_rejected_lru_frequency_tiebreak.md) | lifetime frequency 破 LRU 同分使公平 t16 TPOT 回退 5.42%，候选代码撤销。 |
 | 本次更新 | constraint / [35](optimization_commits/20260822_35_uncompressed_weight_constraint.md) | 撤回全部压缩权重路线；后续只做保持 F16/BF16 表示的等价优化。 |
+| 本次更新 | rejected/analysis / [36](optimization_commits/20260822_36_rejected_f16_hugepage_collapse.md) | exact F16 大页实际覆盖约 31.78 GiB，但公平 t16 TPOT 回退 0.21%，代码撤销。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -342,6 +343,8 @@ source/rank admission 之后。
   不再继续静态门限扫描。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
 - Q8/Q4/INT8/FP8 等压缩或量化权重：用户明确禁止；没有运行时代码或 preset，后续不再评估。
+- 对已 first-touch native weights 做 post-hoc `MADV_COLLAPSE`：微基准信号没有转化为 TPOT，
+  完整模型还有 `ENOMEM/EAGAIN/EINVAL` 与显著启动成本，不再重试同一路径。
 - 全量迁移 KTransformers runtime：Nano 已复用其 CPUInfer 核心，架构迁移风险高且不是
   当前差距的主要来源。
 
@@ -356,7 +359,7 @@ source/rank admission 之后。
    gate/up 占 65–67%、down 约 30%，input copy/merge 仅 1–4%；static scheduling 又在真实请求
    回退 2.04%。权重压缩已明确禁止，后续只允许等价的软件预取、NUMA-local 分块、减少
    中间 buffer 写回或 activation/down 融合；不再扫描 dtype、group_min、m_block 或 worker
-   scheduling。
+   scheduling，也不再对已加载权重做 post-hoc hugepage collapse。
 3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；简单 lifetime frequency
    破 LRU 同分已回退 5.42%，证明 choice-difference 不能代表收益。下一版必须按 source+rank
    直接预测 next reuse / CPU tail saved，并减去 victim reload、publication 和 overlap 成本。
