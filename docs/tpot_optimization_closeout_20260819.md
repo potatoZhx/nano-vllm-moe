@@ -190,6 +190,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | fairness/perf / [30](optimization_commits/20260822_30_uniform_t16_fairness_revalidation.md) | 全部 preset 固定 t16；同资源累计链逐项为正，最终 52.566 ms/token。 |
 | 本次更新 | rejected/analysis / [31](optimization_commits/20260822_31_rejected_ghost16_after_t16_profiles.md) | t16 profile 定位 CPUInfer sync；ghost16 回退 5.69%，不新增 preset。 |
 | 本次更新 | rejected/analysis / [32](optimization_commits/20260822_32_rejected_dynamic_threshold095_t16.md) | 公平 t16 下动态门限 0.97→0.95 回退 2.72%；保留 0.97，不再盲扫静态门限。 |
+| 本次更新 | rejected/analysis / [33](optimization_commits/20260822_33_rejected_cpuinfer_static_schedule.md) | native 分项定位三次 GEMM；static 微基准正、端到端回退 2.04%，不启用。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -262,6 +263,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
 | `results/tpot_t16_b1_ghost16_lutfuse_20260822/` | 55.559 ms | 相对 ghost8/fusion 回退 5.69%，不新增 preset。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_threshold095_20260822/` | 53.994 ms | 动态门限 0.97→0.95 回退 2.72%，不新增 preset。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_static_schedule_20260822/` | 53.638 ms | static worker scheduling 微基准正、TPOT 回退 2.04%，不启用。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -325,6 +327,8 @@ source/rank admission 之后。
 - phase1 budget0、verify vpb1、verify 2/2/1、async boundary：均有当前 b1 一请求负结果。
 - dynamic threshold 0.98：相对 0.97 回退 2.26%。
 - CPUInfer t28、group_min2：分别回退 1.55% 和 1.37%。
+- CPUInfer static worker scheduling：qlen2/3 微基准改善 4.17%/0.91%，但公平 t16 TPOT
+  回退 2.04%；不能用孤立 GEMM 结果替代端到端 overlap 门禁。
 - verify NumPy collect：孤立函数变快但两套端到端均回退，已经 revert。
 - 直接删除 verify metadata 聚合：回退 15.48%，先解释 pacing 再改。
 - m_block 盲扫：exact-Nano qlen1/2/3 没有超出噪声的候选。
@@ -342,10 +346,10 @@ source/rank admission 之后。
 1. **建立稳定 holdout 门禁。** 固定双方 sampling/chat template，至少 3 个独立 seed，
    覆盖 MMLU-Pro、MT-Bench、HumanEval 和不同 prompt/output 长度；同时报告 TPOT、rounds、
    round wall、acceptance 和输出 digest。单请求仍可作每轮快速门禁，holdout 用于发布。
-2. **对 exact current path 做 CPUInfer native phase profile。** 使用当前约 51% CPU route、
-   qlen1/2/3、group_min1、m_block32、t16/双 NUMA 2 x 8，拆出 queue/group、gate/up GEMM、SiLU、
-   mul、down、merge 与 exposed sync。接着评估跨层 task batching、persistent worker、core
-   affinity、NUMA first-touch/hugepage；不再先扫 dtype/group_min/m_block。
+2. **从 CPUInfer native 分项进入真正的带宽优化。** exact-current qlen2/3 profile 已证明
+   gate/up 占 65–67%、down 约 30%，input copy/merge 仅 1–4%；static scheduling 又在真实请求
+   回退 2.04%。因此下一 operator 候选必须减少三份大权重的带宽/算术，例如有质量门禁的
+   packed weight-only kernel；不再先扫 dtype、group_min、m_block 或 worker scheduling。
 3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
    估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
    ghost TTL：16/16 已在公平 t16 请求中回退 5.69%，应直接量化 admission/eviction
