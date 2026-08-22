@@ -191,6 +191,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | rejected/analysis / [31](optimization_commits/20260822_31_rejected_ghost16_after_t16_profiles.md) | t16 profile 定位 CPUInfer sync；ghost16 回退 5.69%，不新增 preset。 |
 | 本次更新 | rejected/analysis / [32](optimization_commits/20260822_32_rejected_dynamic_threshold095_t16.md) | 公平 t16 下动态门限 0.97→0.95 回退 2.72%；保留 0.97，不再盲扫静态门限。 |
 | 本次更新 | rejected/analysis / [33](optimization_commits/20260822_33_rejected_cpuinfer_static_schedule.md) | native 分项定位三次 GEMM；static 微基准正、端到端回退 2.04%，不启用。 |
+| 本次更新 | rejected/analysis / [34](optimization_commits/20260822_34_rejected_lru_frequency_tiebreak.md) | lifetime frequency 破 LRU 同分使公平 t16 TPOT 回退 5.42%，候选代码撤销。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -264,6 +265,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_b1_ghost16_lutfuse_20260822/` | 55.559 ms | 相对 ghost8/fusion 回退 5.69%，不新增 preset。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_threshold095_20260822/` | 53.994 ms | 动态门限 0.97→0.95 回退 2.72%，不新增 preset。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_static_schedule_20260822/` | 53.638 ms | static worker scheduling 微基准正、TPOT 回退 2.04%，不启用。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_lrufreq_20260822/` | 55.417 ms | LRU 同龄时按 lifetime frequency 破同分回退 5.42%，实现撤销。 |
 
 b1 profile 共记录 2531 次 source-tracked publication；verify/draft/phase1 submit 为
 1560/711/260，没有 late transfer 或 timeout。verify 三段首次消费率为
@@ -329,6 +331,8 @@ source/rank admission 之后。
 - CPUInfer t28、group_min2：分别回退 1.55% 和 1.37%。
 - CPUInfer static worker scheduling：qlen2/3 微基准改善 4.17%/0.91%，但公平 t16 TPOT
   回退 2.04%；不能用孤立 GEMM 结果替代端到端 overlap 门禁。
+- lifetime frequency 打破 LRU 同一步并列：公平 t16 TPOT 回退 5.42%；离线 choice-difference
+  上界不是 miss/tail 收益，不再尝试 LFU/LRU 简单混合或静态加权。
 - verify NumPy collect：孤立函数变快但两套端到端均回退，已经 revert。
 - 直接删除 verify metadata 聚合：回退 15.48%，先解释 pacing 再改。
 - m_block 盲扫：exact-Nano qlen1/2/3 没有超出噪声的候选。
@@ -350,10 +354,10 @@ source/rank admission 之后。
    gate/up 占 65–67%、down 约 30%，input copy/merge 仅 1–4%；static scheduling 又在真实请求
    回退 2.04%。因此下一 operator 候选必须减少三份大权重的带宽/算术，例如有质量门禁的
    packed weight-only kernel；不再先扫 dtype、group_min、m_block 或 worker scheduling。
-3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；下一版为每个 source+rank
-   估计 publish 成本、首次使用、被挤出对象和命中时规避的 CPU tail。不要直接扫描更长
-   ghost TTL：16/16 已在公平 t16 请求中回退 5.69%，应直接量化 admission/eviction
-   externality，不再扫描更长 TTL。
+3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；简单 lifetime frequency
+   破 LRU 同分已回退 5.42%，证明 choice-difference 不能代表收益。下一版必须按 source+rank
+   直接预测 next reuse / CPU tail saved，并减去 victim reload、publication 和 overlap 成本。
+   不再扫描更长 ghost TTL 或 LFU/LRU 静态混合。
 4. **有条件地批量化 transfer/publish。** LUT commit 已融合；当前仍有 2531 次、约
    22.24 GiB publication，但只读上界表明跨层 commit 合并不到 0.1% TPOT。只有 native
    profile 证明 event/H2D 控制面仍显著，且能保持每个 expert 独立可见时刻时，才评估
