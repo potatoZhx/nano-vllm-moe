@@ -814,6 +814,9 @@ class PrefetchRuntime:
         # shares the profile gate so production does not retain per-publish
         # residency objects or scan them on verify metadata consumption.
         self._source_lifecycle_profile_enabled = self._diagnostic_profile_enabled
+        self._transfer_aware_profile_enabled = bool(
+            getattr(config, "transfer_aware_profile", False)
+        )
 
         self.global_queue = GlobalWarmStartQueue(config)
         self.long_term_segment_index = SegmentCandidateIndex(config)
@@ -1009,8 +1012,123 @@ class PrefetchRuntime:
                 "segment_id": int(ticket.segment_id),
                 "num_bytes": int(ticket.num_bytes),
                 "transfer_stream_idx": int(ticket.transfer_stream_idx),
+                "candidate_source": str(
+                    getattr(ticket, "candidate_source", "")
+                ),
+                "candidate_rank": int(getattr(ticket, "candidate_rank", -1)),
+                "candidate_count": int(getattr(ticket, "candidate_count", 0)),
+                "candidate_priority": float(
+                    getattr(ticket, "candidate_priority", 0.0)
+                ),
+                "candidate_score_sum": float(
+                    getattr(ticket, "candidate_score_sum", 0.0)
+                ),
+                "candidate_activation_count": int(
+                    getattr(ticket, "candidate_activation_count", 0)
+                ),
+                "candidate_age_steps": int(
+                    getattr(ticket, "candidate_age_steps", -1)
+                ),
+                "victim_last_access_step": int(
+                    getattr(ticket, "victim_last_access_step", -1)
+                ),
+                "victim_access_count": int(
+                    getattr(ticket, "victim_access_count", 0)
+                ),
+                "victim_ghost_hot_until": int(
+                    getattr(ticket, "victim_ghost_hot_until", -1)
+                ),
             }
         )
+
+    def _record_admission_candidates(
+        self,
+        *,
+        candidates: list[PrefetchCandidate],
+        step_id: int,
+        submit_source: str,
+        segment_id: int = -1,
+    ) -> None:
+        """Record the ranked set without changing live admission decisions."""
+        if not self._transfer_aware_profile_enabled:
+            return
+        candidate_count = len(candidates)
+        for rank, candidate in enumerate(candidates):
+            self._transfer_lifecycle_events.append(
+                {
+                    "event": "admission_candidate",
+                    "step_id": int(step_id),
+                    "layer_idx": int(candidate.layer_idx),
+                    "expert_idx": int(candidate.expert_idx),
+                    "source": str(submit_source),
+                    "candidate_source": str(candidate.source),
+                    "candidate_rank": int(rank),
+                    "candidate_count": int(candidate_count),
+                    "candidate_priority": float(candidate.priority),
+                    "candidate_score_sum": float(candidate.score_sum),
+                    "candidate_activation_count": int(
+                        candidate.activation_count
+                    ),
+                    "candidate_age_steps": max(
+                        0, int(step_id) - int(candidate.last_seen_step)
+                    ),
+                    "segment_id": int(segment_id),
+                }
+            )
+
+    def _annotate_admission_ticket(
+        self,
+        ticket: PrefetchTicket,
+        *,
+        candidate: PrefetchCandidate | None,
+        candidate_rank: int,
+        candidate_count: int,
+        cache: LayerExpertCache,
+        victim_slot: int,
+        step_id: int,
+        candidate_source: str | None = None,
+        candidate_priority: float | None = None,
+    ) -> None:
+        """Attach shadow features after victim selection and before submit."""
+        if not self._transfer_aware_profile_enabled:
+            return
+        ticket.candidate_source = str(
+            candidate_source
+            if candidate_source is not None
+            else (candidate.source if candidate is not None else "")
+        )
+        ticket.candidate_rank = int(candidate_rank)
+        ticket.candidate_count = int(candidate_count)
+        ticket.candidate_priority = float(
+            candidate_priority
+            if candidate_priority is not None
+            else (candidate.priority if candidate is not None else 0.0)
+        )
+        if candidate is not None:
+            ticket.candidate_score_sum = float(candidate.score_sum)
+            ticket.candidate_activation_count = int(candidate.activation_count)
+            ticket.candidate_age_steps = max(
+                0, int(step_id) - int(candidate.last_seen_step)
+            )
+
+        victim_expert = int(ticket.active_slot_prev_expert)
+        if victim_expert < 0 and 0 <= int(victim_slot) < len(cache.slot_to_expert):
+            victim_expert = int(cache.slot_to_expert[int(victim_slot)])
+        if victim_expert < 0:
+            return
+        if victim_expert < len(cache.last_access_step):
+            ticket.victim_last_access_step = int(
+                cache.last_access_step[victim_expert]
+            )
+        if victim_expert < len(cache.access_count):
+            ticket.victim_access_count = int(cache.access_count[victim_expert])
+        ghost_hot_until = getattr(self, "_ghost_hot_until", None)
+        if ghost_hot_until is not None:
+            ticket.victim_ghost_hot_until = int(
+                ghost_hot_until.get(
+                    (int(ticket.layer_idx), victim_expert), -1
+                )
+            )
 
     def _record_prefetch_residency_published(
         self,
@@ -1808,10 +1926,16 @@ class PrefetchRuntime:
         ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
         self._profile["draft_segment_indexed_candidate_merge_count"] += len(ranked)
         self._profile["draft_segment_indexed_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0
+        self._record_admission_candidates(
+            candidates=ranked,
+            step_id=int(step_id),
+            submit_source="draft_segment_indexed",
+            segment_id=int(segment_id),
+        )
 
         submitted = 0
         used_transfer_ms = 0.0
-        for candidate in ranked:
+        for candidate_rank, candidate in enumerate(ranked):
             if submitted >= dispatch_budget:
                 break
 
@@ -1895,6 +2019,15 @@ class PrefetchRuntime:
                 num_bytes=num_bytes,
                 transfer_enqueue_ms=enqueue_ms,
                 transfer_stream_idx=stream_idx,
+            )
+            self._annotate_admission_ticket(
+                ticket,
+                candidate=candidate,
+                candidate_rank=int(candidate_rank),
+                candidate_count=len(ranked),
+                cache=cache,
+                victim_slot=int(victim_slot),
+                step_id=int(step_id),
             )
             self.inflight[key] = ticket
             self._record_prefetch_submitted(ticket)
@@ -2014,6 +2147,12 @@ class PrefetchRuntime:
         self._profile["verify_segment_prefetch_rank_sort_ms"] += (time.perf_counter() - sort_t0) * 1000.0
         self._profile["verify_segment_prefetch_candidate_merge_count"] += len(ranked)
         self._profile["verify_segment_prefetch_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0
+        self._record_admission_candidates(
+            candidates=ranked,
+            step_id=int(step_id),
+            submit_source="verify_segment",
+            segment_id=int(target_seg),
+        )
         if not ranked:
             self._profile["verify_segment_prefetch_no_candidate_count"] += 1
 
@@ -2025,7 +2164,7 @@ class PrefetchRuntime:
         reservation_ms = 0.0
         transfer_call_ms = 0.0
         bookkeeping_ms = 0.0
-        for candidate in ranked:
+        for candidate_rank, candidate in enumerate(ranked):
             if submitted >= dispatch_budget:
                 break
 
@@ -2111,6 +2250,15 @@ class PrefetchRuntime:
                 num_bytes=num_bytes,
                 transfer_enqueue_ms=enqueue_ms,
                 transfer_stream_idx=stream_idx,
+            )
+            self._annotate_admission_ticket(
+                ticket,
+                candidate=candidate,
+                candidate_rank=int(candidate_rank),
+                candidate_count=len(ranked),
+                cache=cache,
+                victim_slot=int(victim_slot),
+                step_id=int(step_id),
             )
             self.inflight[key] = ticket
             self._record_prefetch_submitted(ticket)
@@ -3351,6 +3499,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         # SegmentCandidateIndex.  Fall back on the first round before verify
         # metadata exists.
         candidates: list[tuple[float, int, int]] = []
+        phase1_candidate_source = "phase1_frequency_fallback"
         use_recent_verify = bool(
             getattr(self.config, "predictive_phase1_recent_verify", False)
         )
@@ -3375,6 +3524,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 candidates
             )
             if candidates:
+                phase1_candidate_source = "phase1_recent_verify"
                 self._profile["predictive_phase1_recent_verify_round_count"] += 1
 
         if not candidates:
@@ -3400,7 +3550,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         inflight_budget = max(0, int(self.config.prefetch_max_inflight) - len(self.inflight))
         max_submit = min(budget, inflight_budget)
         submitted = 0
-        for _priority, layer_idx, expert_idx in candidates:
+        for candidate_rank, (_priority, layer_idx, expert_idx) in enumerate(candidates):
             if submitted >= max_submit:
                 break
             key = (layer_idx, expert_idx)
@@ -3454,6 +3604,17 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 transfer_enqueue_ms=enqueue_ms,
                 transfer_stream_idx=stream_idx,
             )
+            self._annotate_admission_ticket(
+                ticket,
+                candidate=None,
+                candidate_rank=int(candidate_rank),
+                candidate_count=len(candidates),
+                cache=cache,
+                victim_slot=int(victim_slot),
+                step_id=int(step_id),
+                candidate_source=phase1_candidate_source,
+                candidate_priority=float(_priority),
+            )
             self.inflight[key] = ticket
             self._record_prefetch_submitted(ticket)
             submitted += 1
@@ -3493,6 +3654,12 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         if not ranked:
             return 0
         ranked.sort(key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+        self._record_admission_candidates(
+            candidates=ranked,
+            step_id=int(step_id),
+            submit_source="verify_layer_predict",
+            segment_id=int(segment_id),
+        )
 
         max_submit = min(
             max(0, int(self.config.prefetch_step_budget)),
@@ -3501,7 +3668,7 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
         )
         submitted = 0
         used_budget_ms = 0.0
-        for candidate in ranked:
+        for candidate_rank, candidate in enumerate(ranked):
             if submitted >= max_submit:
                 break
             expert_idx = int(candidate.expert_idx)
@@ -3553,6 +3720,15 @@ class PredictivePrefetchRuntime(PrefetchRuntime):
                 num_bytes=num_bytes,
                 transfer_enqueue_ms=enqueue_ms,
                 transfer_stream_idx=stream_idx,
+            )
+            self._annotate_admission_ticket(
+                ticket,
+                candidate=candidate,
+                candidate_rank=int(candidate_rank),
+                candidate_count=len(ranked),
+                cache=cache,
+                victim_slot=int(victim_slot),
+                step_id=int(step_id),
             )
             self.inflight[key] = ticket
             self._record_prefetch_submitted(ticket)

@@ -194,10 +194,12 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | rejected/analysis / [34](optimization_commits/20260822_34_rejected_lru_frequency_tiebreak.md) | lifetime frequency 破 LRU 同分使公平 t16 TPOT 回退 5.42%，候选代码撤销。 |
 | 本次更新 | constraint / [35](optimization_commits/20260822_35_uncompressed_weight_constraint.md) | 撤回全部压缩权重路线；后续只做保持 F16/BF16 表示的等价优化。 |
 | 本次更新 | rejected/analysis / [36](optimization_commits/20260822_36_rejected_f16_hugepage_collapse.md) | exact F16 大页实际覆盖约 31.78 GiB，但公平 t16 TPOT 回退 0.21%，代码撤销。 |
+| 本次更新 | telemetry/analysis / [37](optimization_commits/20260822_37_admission_shadow_cpu_route_causes.md) | 平均每次 verify 每层 8.895 CPU routes；71.80% CPU routes 不在候选集，准入 guard 上限太低而不启用。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
-`0a40f64` 是 telemetry，不是性能提交。
+`0a40f64` 和 [37](optimization_commits/20260822_37_admission_shadow_cpu_route_causes.md)
+是 telemetry/analysis，不是性能提交。
 
 ## 5. Profile、分析与结果目录总索引
 
@@ -264,6 +266,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_fair_b1_ghost8_20260822/` | 53.337 ms | 相对公平 b1 改善 2.36%。 |
 | `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | 当前同资源已测最低点。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
+| `results/analysis_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 58.114 ms | 记录候选 rank/victim 与逐层 CPU route 归因；profile 数值不作 TPOT。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 54.368 ms | production-off 可用性门禁；动态路径 276 steps，与 265-step 最低点不作性能归因。 |
 | `results/tpot_t16_b1_ghost16_lutfuse_20260822/` | 55.559 ms | 相对 ghost8/fusion 回退 5.69%，不新增 preset。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_threshold095_20260822/` | 53.994 ms | 动态门限 0.97→0.95 回退 2.72%，不新增 preset。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_static_schedule_20260822/` | 53.638 ms | static worker scheduling 微基准正、TPOT 回退 2.04%，不启用。 |
@@ -326,6 +330,20 @@ LUT fusion 后又按 ticket submit step 做了 publication grouping shadow：253
 pointer batch 和延迟 expert 可见性的成本。因此 batching 已降到 CPUInfer native 分解和
 source/rank admission 之后。
 
+### 5.7 t16 准入 shadow 与平均逐层 CPU 计算
+
+`results/analysis_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` 在当前推荐配置上记录
+262 次 verify、216576 条 routes 和 111869 条 CPU routes（51.653%）。动态 K 口径下，
+平均每次 verify 每层为 **8.895 CPU routes**；合并同 expert routes 后，平均为
+**7.410 个实际 CPU experts**。按 verified token 归一化则是每层 4.132/8 条 CPU routes。
+
+shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候选但未准入、
+0.815% 已 submit 仍走 CPU、0.260% 本轮换出后又用。draft token 的 expert-set recall 只有
+43.296%，其 CPU routes 中 72.601% 未被 draft 预测。未来 8 steps 的完美准入 oracle 也
+最多挽回 787 条 routes（CPU routes 的 0.704%），且当前 rank/priority/recency 无法稳定
+区分正负替换，因此不新增运行时 guard。完整口径和限制见
+[37](optimization_commits/20260822_37_admission_shadow_cpu_route_causes.md)。
+
 ## 6. 已排除或暂不应重试的方向
 
 - phase1 budget0、verify vpb1、verify 2/2/1、async boundary：均有当前 b1 一请求负结果。
@@ -360,10 +378,11 @@ source/rank admission 之后。
    回退 2.04%。权重压缩已明确禁止，后续只允许等价的软件预取、NUMA-local 分块、减少
    中间 buffer 写回或 activation/down 融合；不再扫描 dtype、group_min、m_block 或 worker
    scheduling，也不再对已加载权重做 post-hoc hugepage collapse。
-3. **深化 rank/source-aware admission。** 8/8 ghost 已保守落地；简单 lifetime frequency
-   破 LRU 同分已回退 5.42%，证明 choice-difference 不能代表收益。下一版必须按 source+rank
-   直接预测 next reuse / CPU tail saved，并减去 victim reload、publication 和 overlap 成本。
-   不再扫描更长 ghost TTL 或 LFU/LRU 静态混合。
+3. **提高 top-rank predictor 覆盖而不是扩大预算。** admission shadow 显示 71.80% CPU
+   routes 未进入本轮候选，而已 submit 仍走 CPU和本轮错误换出合计只有 1.08%；draft expert-set
+   recall 也只有 43.30%。下一版应把 recent verify、draft live、层内转移和候选置信度做
+   shadow 校准；当前 trace 中固定 vpb2 的保守 1 draft + 1 history shadow 把当前-step demand
+   从 1462 提到 1703。历史 b4/vpb1/2-2-1 负结果已证明不能用全局 budget 扫描替代排序质量。
 4. **有条件地批量化 transfer/publish。** LUT commit 已融合；当前仍有 2531 次、约
    22.24 GiB publication，但只读上界表明跨层 commit 合并不到 0.1% TPOT。只有 native
    profile 证明 event/H2D 控制面仍显著，且能保持每个 expert 独立可见时刻时，才评估
@@ -401,7 +420,7 @@ source/rank admission 之后。
     仍有大块不可消除开销时，再分阶段迁移 KT scheduler/cache，而不是整体替换。
 
 优先级的核心判断是：当前 adjacent 参数点已经连续出现负收益；下一阶段最可能的增益来自
-减少 CPU exposed tail、批量化 prefetch 控制面，以及让动态 K/prefetch 使用真实边际价值。
+提高固定预算下的预测覆盖、减少 CPU exposed tail，以及让动态 K/prefetch 使用真实边际价值。
 继续扫描小整数预算或单一阈值的预期收益已经较低。
 
 ## 8. 收尾状态

@@ -426,6 +426,44 @@ class TestPredictivePhase2(unittest.TestCase):
         self.assertEqual(submitted, 0)
         self.assertNotIn(2, rt._round_loaded.get(0, set()))
 
+    def test_transfer_profile_records_rank_and_victim_shadow_features(self):
+        pool = {0: {2: _weights()}}
+        cache = _make_cache(slots=1, cpu_pool=pool[0])
+        cache.put_to_slot(0, 0, _weights()["gate_up"], _weights()["down"])
+        cache.last_access_step[0] = 3
+        cache.access_count[0] = 7
+        rt = _build_runtime(
+            {0: cache},
+            pool,
+            cfg=_config(
+                draft_prefetch_segment_size=1,
+                transfer_aware_profile=True,
+            ),
+        )
+        rt.begin_draft_iteration(step_id=5)
+        rt.observe_draft(_meta(0, [2], step_id=5), step_id=5)
+
+        self.assertEqual(
+            rt.submit_draft_segment_indexed_prefetch(
+                step_id=5,
+                phase="draft",
+                frontier_layer_idx=0,
+                visible_budget_ms=10.0,
+            ),
+            1,
+        )
+        events = rt.get_profile(reset=False)["transfer_lifecycle_events"]
+        candidate = next(e for e in events if e["event"] == "admission_candidate")
+        submitted = next(e for e in events if e["event"] == "submit")
+
+        self.assertEqual(candidate["candidate_rank"], 0)
+        self.assertEqual(candidate["candidate_source"], "draft_live")
+        self.assertEqual(submitted["candidate_rank"], 0)
+        self.assertEqual(submitted["candidate_count"], 1)
+        self.assertEqual(submitted["candidate_source"], "draft_live")
+        self.assertEqual(submitted["victim_last_access_step"], 3)
+        self.assertEqual(submitted["victim_access_count"], 7)
+
 
 class TestPredictiveVerifyPrefetch(unittest.TestCase):
     def _rt(self, attention_ratio=1.0):
