@@ -6,8 +6,8 @@
 
 模型：Qwen3-30B-A3B
 
-范围：从 single-weight 到 recent phase1 budget1、三个被否决的 verify 候选，以及
-随后保留的 ghost8 cache 保护、LUT fusion 与 verify source-aware 1+1
+范围：从 single-weight 到 recent phase1 budget1、被否决的 verify 候选，以及随后保留的
+ghost8 cache 保护、LUT fusion、verify source-aware 1+1 与被否决的 draft-first 扩展
 
 > 本文是本轮路线的权威收尾入口。较早的
 > [`tpot_optimization_final_review_20260813.md`](tpot_optimization_final_review_20260813.md)
@@ -106,7 +106,7 @@ temperature 0.6、single-weight F16，关闭 collect/engine/transfer profile。�
 2. CPU NUMA、cache、温度和后台状态会造成跨日/跨进程漂移；
 3. instrumentation profile 明显放大 TPOT，只用于定位，不能替代 production-off 数值。
 
-因此当前 52.566 是“同资源已测点中的单请求最优”，不是跨数据集统计最优或硬件理论下界。
+因此当前 51.794 是“同资源已测点中的单请求最优”，不是跨数据集统计最优或硬件理论下界。
 更强的发布结论仍需同 sampling 参数、多个独立 seed、MMLU-Pro/MT-Bench/HumanEval holdout
 的配对复测。
 
@@ -202,6 +202,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | telemetry/analysis / [37](optimization_commits/20260822_37_admission_shadow_cpu_route_causes.md) | 平均每次 verify 每层 8.895 CPU routes；71.80% CPU routes 不在候选集，准入 guard 上限太低而不启用。 |
 | `a835071` | analysis / [38](optimization_commits/20260822_38_global_draft_acceptance_cost_and_sources.md) | 量化 82.70% draft 接受率、约 19.46 ms 边际 draft 成本和两种预取 source 的互补准确度。 |
 | `e59824e` | perf / [39](optimization_commits/20260823_39_source_aware_verify_prefetch.md) | 固定 vpb2 的 history+draft 1+1 获得 51.794 ms/token，保留原 lutfuse fallback。 |
+| 本次更新 | rejected docs / [40](optimization_commits/20260823_40_rejected_draftfirst_verify_prefetch.md) | 两个 draft 优先位置使 TPOT 回退 9.88%；实现和 preset 完整撤销，保留 source11。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -273,6 +274,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_fair_b1_ghost8_20260822/` | 53.337 ms | 相对公平 b1 改善 2.36%。 |
 | `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | source11 的公平直接前序。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_source11_20260823/` | **51.794 ms** | source-aware 1+1 正收益门禁；新的同资源一请求最低点。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_draftfirst_20260823/` | 56.911 ms | 两个 draft 优先位置相对 source11 回退 9.88%；实现和 preset 撤销。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 58.114 ms | 记录候选 rank/victim 与逐层 CPU route 归因；profile 数值不作 TPOT。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 54.368 ms | production-off 可用性门禁；动态路径 276 steps，与 265-step 最低点不作性能归因。 |
@@ -367,6 +369,8 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 - ghost16：公平 t16 下与 ghost8/fusion 相比回退 5.69%，不再盲扫更长 TTL。
 - dynamic threshold 0.95：公平 t16 下相对 0.97 回退 2.72%；结合历史 0.98 负结果，
   不再继续静态门限扫描。
+- verify draft-first：当前-step 离线覆盖虽从 source11 的 1703 提到 1914，但公平 t16 TPOT
+  回退 9.88%；draft 只能补充、不能完全替换 history，不再重试 reserve=2。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
 - Q8/Q4/INT8/FP8 等压缩或量化权重：用户明确禁止；没有运行时代码或 preset，后续不再评估。
 - 对已 first-touch native weights 做 post-hoc `MADV_COLLAPSE`：微基准信号没有转化为 TPOT，
@@ -389,8 +393,9 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 3. **提高 top-rank predictor 覆盖而不是扩大预算。** admission shadow 显示 71.80% CPU
    routes 未进入本轮候选，而已 submit 仍走 CPU和本轮错误换出合计只有 1.08%；draft expert-set
    recall 也只有 43.30%。下一版应把 recent verify、draft live、层内转移和候选置信度做
-   shadow 校准；当前 trace 中固定 vpb2 的保守 1 draft + 1 history shadow 把当前-step demand
-   从 1462 提到 1703。历史 b4/vpb1/2-2-1 负结果已证明不能用全局 budget 扫描替代排序质量。
+   shadow 校准；固定 vpb2 的保守 1 draft + 1 history 已取得正收益，而两个 draft 虽把离线
+   current-step demand 从 1703 提到 1914，端到端却回退 9.88%。后续必须显式计入 history 的
+   cache 驻留和 exposed-tail 价值；不能再以扩大预算或当前-step precision 代替全局排序质量。
 4. **有条件地批量化 transfer/publish。** LUT commit 已融合；当前仍有 2531 次、约
    22.24 GiB publication，但只读上界表明跨层 commit 合并不到 0.1% TPOT。只有 native
    profile 证明 event/H2D 控制面仍显著，且能保持每个 expert 独立可见时刻时，才评估
@@ -440,6 +445,7 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 - 59.701 所在提交：`296cf59`；当前路线完整继承它。
 - b1 实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销；ghost8 在独立
   preset 中累计继承 b1。
+- source11 后的 draft-first 扩展回退 9.88%，运行时和 preset 已撤销，仅保留负结果文档。
 - 动态 draft 的历史最优、active14、recent/b4、b2 与 full-context-safe preset 全部保留；
   旧 t32 名称仅作命令兼容 alias，实际也固定为 16 threads。
 - 权重格式红线：禁止任何 Q8/Q4/INT8/FP8 压缩或量化；canonical 保持 F16 single-weight。
