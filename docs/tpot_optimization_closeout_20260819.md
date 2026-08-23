@@ -7,7 +7,8 @@
 模型：Qwen3-30B-A3B
 
 范围：从 single-weight 到 recent phase1 budget1、被否决的 verify 候选，以及随后保留的
-ghost8 cache 保护、LUT fusion、verify source-aware 1+1 与被否决的 draft-first 扩展
+ghost8 cache 保护、LUT fusion、verify source-aware 1+1，以及被否决的 draft-first 和
+选择性动态 K3 扩展
 
 > 本文是本轮路线的权威收尾入口。较早的
 > [`tpot_optimization_final_review_20260813.md`](tpot_optimization_final_review_20260813.md)
@@ -203,6 +204,7 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `a835071` | analysis / [38](optimization_commits/20260822_38_global_draft_acceptance_cost_and_sources.md) | 量化 82.70% draft 接受率、约 19.46 ms 边际 draft 成本和两种预取 source 的互补准确度。 |
 | `e59824e` | perf / [39](optimization_commits/20260823_39_source_aware_verify_prefetch.md) | 固定 vpb2 的 history+draft 1+1 获得 51.794 ms/token，保留原 lutfuse fallback。 |
 | 本次更新 | rejected docs / [40](optimization_commits/20260823_40_rejected_draftfirst_verify_prefetch.md) | 两个 draft 优先位置使 TPOT 回退 9.88%；实现和 preset 完整撤销，保留 source11。 |
+| 本次更新 | rejected/analysis / [41](optimization_commits/20260823_41_rejected_selective_dynamic_k3.md) | 选择性 K3 减少 rounds 但增加单步成本，公平 TPOT 回退 1.82%；preset 完整撤销。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -229,6 +231,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/dynamic_k2_active14_threshold097_gmu098_512_r{0,1,2}/` | active14 三轮正式请求 | 均值 63.713 ms，证明 K2 可达且动态框架可用。 |
 | `results/dynamic_k2_best_draft_op_profile_64/` | draft per-op instrumentation | 只看热点占比，不作 TPOT 数值。 |
 | `results/tpot_phase1_recent_t32_threshold098_20260819/` | 历史 t32 的 0.98 候选 | 61.020 vs 59.673 ms，回退 2.26%；只支持保留 0.97 的历史判断。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_source11_selectivek3_20260823/` | 选择性 K3 公平门禁 | 52.734 ms，相对 source11 回退 1.82%；preset 撤销。 |
+| `results/analysis_t16_b1_ghost8_lutfuse_source11_selectivek3_20260823/` | K3 analysis-only trace | K1/K2/K3=200/40/12；K3 第三 token 接受 11/12，但 wall/output 仍略差于 K2 组。 |
 | [`draft_tpot_stop_policy_analysis.md`](optimize_ops/draft_tpot_stop_policy_analysis.md) | stop-policy 全史 | 下一步必须估计 K2 相对 K1 的边际收益，而非继续盲扫单门限。 |
 
 ### 5.3 CPUInfer 与 KT 同源算子
@@ -371,6 +375,8 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
   不再继续静态门限扫描。
 - verify draft-first：当前-step 离线覆盖虽从 source11 的 1703 提到 1914，但公平 t16 TPOT
   回退 9.88%；draft 只能补充、不能完全替换 history，不再重试 reserve=2。
+- 选择性动态 K3：qlen4 graph 与 1536-token KV capacity 正常、K3 第三 token 接受 11/12，
+  但公平 TPOT 仍回退 1.82%；不再扫描 K3 静态门限或直接放宽 Kmax。
 - 仅因 KT YAML 是 BF16 就切回 BF16：同 route 微基准不支持。
 - Q8/Q4/INT8/FP8 等压缩或量化权重：用户明确禁止；没有运行时代码或 preset，后续不再评估。
 - 对已 first-touch native weights 做 post-hoc `MADV_COLLAPSE`：微基准信号没有转化为 TPOT，
@@ -409,11 +415,12 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 
 ### P1：在现有动态框架上继续扩展
 
-7. **重写 K2 边际决策而不是继续扫静态门限。** 公平 t16 trace 中现有 K2 的第二 draft
+7. **重写动态 K 的边际决策而不是继续扫静态门限。** 公平 t16 trace 中现有 K2 的第二 draft
    接受 23/24，但把门限从 0.97 放宽到 0.95 仍端到端回退 2.72%，证明 alpha1/接受率不足以
-   表达额外 qlen3 verify 与 cache/prefetch 外部性。下一版应在 K1 记录或 shadow 预测 alpha2、
-   额外 draft cost、verify qlen3 cost、cache/prefetch credit，直接最小化 K2 相对 K1 的边际
-   TPOT；保留现有 0.97 preset 为 fallback。
+   表达额外 qlen3 verify 与 cache/prefetch 外部性。选择性 K3 中第三 token 接受 11/12 仍使
+   TPOT 回退 1.82%，又证明高接受率不能覆盖第三 draft、qlen4 和 tail 成本。下一版必须在执行
+   前预测 alpha2/alpha3、对应 verify cost 和 cache/prefetch credit，直接最小化边际 TPOT；
+   保留现有 K1/K2 0.97 preset，不再直接放宽 Kmax 或扫描静态门限。
 8. **GPU 小 M MoE/route 融合。** 对 qlen1/2/3 专门融合 reroute/LUT/scatter/reduce、GPU
    cached expert 计算和 CPU result add，减少 workspace 与小 kernel launch。
 9. **保持权重格式的 cache/算子融合。** 不允许通过 INT8/Q8/Q4/FP8 增加 cache 容量；只在
@@ -446,6 +453,7 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 - b1 实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销；ghost8 在独立
   preset 中累计继承 b1。
 - source11 后的 draft-first 扩展回退 9.88%，运行时和 preset 已撤销，仅保留负结果文档。
+- source11 上的选择性动态 K3 回退 1.82%；qlen4 容量正常但边际成本过高，preset 已撤销。
 - 动态 draft 的历史最优、active14、recent/b4、b2 与 full-context-safe preset 全部保留；
   旧 t32 名称仅作命令兼容 alias，实际也固定为 16 threads。
 - 权重格式红线：禁止任何 Q8/Q4/INT8/FP8 压缩或量化；canonical 保持 F16 single-weight。
