@@ -1,13 +1,13 @@
 # TPOT 优化路线最终收尾
 
-日期：2026-08-19；最后更新：2026-08-22
+日期：2026-08-19；最后更新：2026-08-23
 
 硬件：RTX 3080 10 GiB，2 x Xeon Gold 5218R
 
 模型：Qwen3-30B-A3B
 
 范围：从 single-weight 到 recent phase1 budget1、三个被否决的 verify 候选，以及
-随后保留的 ghost8 cache 保护
+随后保留的 ghost8 cache 保护、LUT fusion 与 verify source-aware 1+1
 
 > 本文是本轮路线的权威收尾入口。较早的
 > [`tpot_optimization_final_review_20260813.md`](tpot_optimization_final_review_20260813.md)
@@ -23,13 +23,15 @@
 当前基于同资源一请求门禁推荐的 preset 是：
 
 ```text
-k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse
+k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11
 ```
 
 2026-08-22 production-off 公平复测中，所有候选均使用 16 total CPUInfer threads、双
 NUMA 2 x 8。budget4/budget2/budget1/ghost8/LUT fusion 依次为 60.909540、55.043059、
 54.627249、53.336804、**52.566035 ms/token**，每个相邻点均为正，累计改善 **13.70%**。
-因此 52.566035 是当前同资源、同门禁已测最低点；旧 53.725789/t32 不再称为公平最佳。
+其后固定 vpb2、只把 verify dispatch source 从两个 history 改为一个 history 加一个
+draft-live 的独立 preset 获得 **51.793570 ms/token**，相对 52.566035 再改善 1.47%。
+因此 51.793570 是当前同资源、同门禁已测最低点；旧 53.725789/t32 不再称为公平最佳。
 配置保留动态 draft 长度框架，并采用：
 
 - single-weight、llamafile F16 CPU expert、BF16 hidden；
@@ -39,11 +41,12 @@ NUMA 2 x 8。budget4/budget2/budget1/ghost8/LUT fusion 依次为 60.909540、55.
 - recent-verify phase1，只提交最高排名的 1 个候选；
 - 对 8 steps 内被换出又重载的 expert 提供 8-step ghost 保护；
 - 预热的 fused cache LUT update，单次 publication 只发出一个映射 kernel；
+- verify boundary 固定 vpb2 内保留一个 recent-history 和一个 marginal draft-live 位置；
 - CPUInfer 16 total threads，2 个 NUMA pool，各 8 threads；
 - warmup 1024 tokens。
 
-它没有覆盖旧配置。ghost8 是只关闭 LUT fusion 的直接 fallback，原 b1 同时关闭 ghost 和
-fusion；以下 preset 也仍可独立选择：budget2、
+它没有覆盖旧配置。原 lutfuse preset 是关闭 source-aware 1+1 的直接 fallback，ghost8
+再关闭 LUT fusion，原 b1 同时关闭 ghost 和 fusion；以下 preset 也仍可独立选择：budget2、
 budget4/recent、active14，以及可容纳完整 8192 context 的
 `k2_dynamic_f16_3080`。本次实测请求的物理
 KV capacity 为 1536 tokens，足以覆盖 107-token prompt + 512-token output，但不应把
@@ -82,11 +85,13 @@ MoE layer 的 draft/verify CUDA graph 都因此删除了冗余 memcpy node。它
 | ghost8（2026-08-21，历史 t32） | 54.393 ms | 相对同日 b1 57.294，-5.06% | 旧资源口径的正收益门禁 |
 | ghost8 + LUT fusion（历史 t32） | 54.236 ms | 相对同日 ghost8 -0.29% | 旧资源口径的正收益门禁 |
 | budget4→b2→b1（2026-08-22，公平 t16） | 60.910→55.043→54.627 ms | 相邻 -9.63%、-0.76% | 算法收益在同资源下全部复现 |
-| ghost8→LUT fusion（2026-08-22，公平 t16） | 53.337→**52.566 ms** | 相邻 -2.36%、-1.45% | **当前同资源已测最低点** |
+| ghost8→LUT fusion（2026-08-22，公平 t16） | 53.337→52.566 ms | 相邻 -2.36%、-1.45% | source11 的直接前序 |
+| source-aware 1+1（2026-08-23，公平 t16） | **51.794 ms** | 相对 lutfuse -1.47% | **当前同资源已测最低点** |
 
 所以答案是：**后续路线确实以 `296cf59` 为累计基础，并最终拿到了额外收益。**在修正
 资源口径后，budget2、budget1、ghost8、LUT fusion 又在同一 16-thread 链上逐项通过门禁；
-当前 52.566 比历史 59.701 数值低约 11.95%，但跨日期随机请求仍不作严格隔离归因。
+source-aware 1+1 又在相同资源下通过门禁。当前 51.794 比历史 59.701 数值低约 13.24%，
+但跨日期随机请求仍不作严格隔离归因。
 
 ## 2. 测量口径与证据边界
 
@@ -195,6 +200,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | 本次更新 | constraint / [35](optimization_commits/20260822_35_uncompressed_weight_constraint.md) | 撤回全部压缩权重路线；后续只做保持 F16/BF16 表示的等价优化。 |
 | 本次更新 | rejected/analysis / [36](optimization_commits/20260822_36_rejected_f16_hugepage_collapse.md) | exact F16 大页实际覆盖约 31.78 GiB，但公平 t16 TPOT 回退 0.21%，代码撤销。 |
 | 本次更新 | telemetry/analysis / [37](optimization_commits/20260822_37_admission_shadow_cpu_route_causes.md) | 平均每次 verify 每层 8.895 CPU routes；71.80% CPU routes 不在候选集，准入 guard 上限太低而不启用。 |
+| `a835071` | analysis / [38](optimization_commits/20260822_38_global_draft_acceptance_cost_and_sources.md) | 量化 82.70% draft 接受率、约 19.46 ms 边际 draft 成本和两种预取 source 的互补准确度。 |
+| `e59824e` | perf / [39](optimization_commits/20260823_39_source_aware_verify_prefetch.md) | 固定 vpb2 的 history+draft 1+1 获得 51.794 ms/token，保留原 lutfuse fallback。 |
 
 每个实际保留的运行时版本都在同一提交中包含文档，或紧随一个 docs-only 补记提交。
 `9eea588`、`461165c` 只能声明分析/微基准收益，不能追溯性声称独立 TPOT 收益；
@@ -264,7 +271,8 @@ cache/prefetch 决策和 CPU/GPU exposed tail，而不是再做一次同名算�
 | `results/tpot_t16_fair_recent_b2_20260822/` | 55.043 ms | 相对公平 b4 改善 9.63%。 |
 | `results/tpot_t16_fair_b1_20260822/` | 54.627 ms | 相对公平 b2 改善 0.76%。 |
 | `results/tpot_t16_fair_b1_ghost8_20260822/` | 53.337 ms | 相对公平 b1 改善 2.36%。 |
-| `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | 当前同资源已测最低点。 |
+| `results/tpot_t16_fair_b1_ghost8_lutfuse_20260822/` | **52.566 ms** | source11 的公平直接前序。 |
+| `results/tpot_t16_b1_ghost8_lutfuse_source11_20260823/` | **51.794 ms** | source-aware 1+1 正收益门禁；新的同资源一请求最低点。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_{latency,lifecycle}_20260822/` | 54.118/57.128 ms | 只作低扰动热点和 lifecycle 分析，不作正式 TPOT。 |
 | `results/analysis_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 58.114 ms | 记录候选 rank/victim 与逐层 CPU route 归因；profile 数值不作 TPOT。 |
 | `results/tpot_t16_b1_ghost8_lutfuse_admission_shadow_20260822/` | 54.368 ms | production-off 可用性门禁；动态路径 276 steps，与 265-step 最低点不作性能归因。 |
@@ -425,10 +433,10 @@ shadow 把 CPU routes 分成：71.802% 未进入本轮候选、27.123% 在宽候
 
 ## 8. 收尾状态
 
-- 同资源推荐：`k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse`；ghost8
-  是关闭 fusion 的直接 fallback，原 b1 同时关闭 ghost 和 fusion。
-- 公平 t16 已测最低点：52.566035 ms/token；b4→b2→b1→ghost8→LUT fusion 的相邻改善
-  分别为 9.63%、0.76%、2.36%、1.45%，五条均通过 512-token validation。
+- 同资源推荐：`k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11`；
+  原 lutfuse 是关闭 source 1+1 的直接 fallback，ghost8 再关闭 fusion。
+- 公平 t16 已测最低点：51.793570 ms/token；b4→b2→b1→ghost8→LUT fusion→source11
+  的相邻改善分别为 9.63%、0.76%、2.36%、1.45%、1.47%，六条均通过 512-token validation。
 - 59.701 所在提交：`296cf59`；当前路线完整继承它。
 - b1 实现提交：`7c5e139`；其后的三个 verify 候选均被否决且代码已撤销；ghost8 在独立
   preset 中累计继承 b1。
