@@ -223,6 +223,7 @@ def build_llm_kwargs(
         "verify_prefetch_visible_budget_ms": float(args.verify_prefetch_visible_budget_ms),
         "verify_prefetch_min_per_boundary": 0,
         "verify_prefetch_max_per_boundary": int(args.verify_prefetch_max_per_boundary),
+        "verify_prefetch_draft_reserve": int(args.verify_prefetch_draft_reserve),
         "verify_prefetch_tpot_dynamic_budget_enabled": bool(
             args.verify_prefetch_tpot_dynamic_budget_enabled
         ),

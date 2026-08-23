@@ -140,6 +140,10 @@ class Config:
     verify_prefetch_visible_budget_ms: float = 12.0
     verify_prefetch_min_per_boundary: int = 0
     verify_prefetch_max_per_boundary: int = 4
+    # Reserve verify-boundary dispatch positions for marginal draft-live
+    # candidates when both draft-live and verify-history are available.
+    # Zero preserves the existing global-priority ranking.
+    verify_prefetch_draft_reserve: int = 0
     perf_profile_level: str = "basic"
     # On-GPU theoretical-acceptance predictor for the draft path. When enabled, a
     # lightweight MLP (trained by random_cache_srdp_scripts-1) predicts per-step
@@ -339,6 +343,7 @@ class Config:
         assert self.verify_prefetch_segment_size >= 1
         assert self.verify_prefetch_visible_budget_ms >= 0.0
         assert self.verify_prefetch_max_per_boundary >= self.verify_prefetch_min_per_boundary
+        assert self.verify_prefetch_draft_reserve >= 0
         if self.verify_cuda_graph and self.enforce_eager:
             self.verify_cuda_graph = False
         if (

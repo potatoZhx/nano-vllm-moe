@@ -81,6 +81,44 @@ def compute_priority(
     )
 
 
+def source_aware_verify_candidates(
+    candidates: list[PrefetchCandidate],
+    *,
+    dispatch_budget: int,
+    draft_reserve: int,
+) -> list[PrefetchCandidate]:
+    """Put complementary draft/history candidates in the dispatch prefix.
+
+    The input is already sorted by the existing global priority. When both
+    sources exist, reserve up to ``draft_reserve`` prefix positions for the
+    best marginal draft-live candidates and preserve at least one
+    verify-history position. The untouched priority order remains as the
+    fallback if a prefixed candidate cannot be submitted.
+    """
+    budget = max(0, int(dispatch_budget))
+    reserve = max(0, int(draft_reserve))
+    if budget <= 1 or reserve <= 0 or len(candidates) <= 1:
+        return candidates
+
+    draft = [candidate for candidate in candidates if candidate.source == "draft_live"]
+    history = [candidate for candidate in candidates if candidate.source == "verify_history"]
+    if not draft or not history:
+        return candidates
+
+    draft_count = min(reserve, budget - 1, len(draft))
+    history_count = min(budget - draft_count, len(history))
+    if draft_count <= 0 or history_count <= 0:
+        return candidates
+
+    prefix_ids = {
+        id(candidate)
+        for candidate in (draft[:draft_count] + history[:history_count])
+    }
+    prefix = [candidate for candidate in candidates if id(candidate) in prefix_ids]
+    tail = [candidate for candidate in candidates if id(candidate) not in prefix_ids]
+    return prefix + tail
+
+
 def select_predictive_victim_slot(
     *,
     slots: list[int] | tuple[int, ...],
@@ -1050,7 +1088,7 @@ class PrefetchRuntime:
         segment_id: int = -1,
     ) -> None:
         """Record the ranked set without changing live admission decisions."""
-        if not self._transfer_aware_profile_enabled:
+        if not bool(getattr(self, "_transfer_aware_profile_enabled", False)):
             return
         candidate_count = len(candidates)
         for rank, candidate in enumerate(candidates):
@@ -1090,7 +1128,7 @@ class PrefetchRuntime:
         candidate_priority: float | None = None,
     ) -> None:
         """Attach shadow features after victim selection and before submit."""
-        if not self._transfer_aware_profile_enabled:
+        if not bool(getattr(self, "_transfer_aware_profile_enabled", False)):
             return
         ticket.candidate_source = str(
             candidate_source
@@ -2144,6 +2182,13 @@ class PrefetchRuntime:
         self._profile["verify_segment_prefetch_rank_scan_ms"] += (time.perf_counter() - scan_t0) * 1000.0
         sort_t0 = time.perf_counter()
         ranked = sorted(ranked_by_key.values(), key=lambda x: (-x.priority, x.layer_idx, x.expert_idx))
+        ranked = source_aware_verify_candidates(
+            ranked,
+            dispatch_budget=dispatch_budget,
+            draft_reserve=int(
+                getattr(self.config, "verify_prefetch_draft_reserve", 0)
+            ),
+        )
         self._profile["verify_segment_prefetch_rank_sort_ms"] += (time.perf_counter() - sort_t0) * 1000.0
         self._profile["verify_segment_prefetch_candidate_merge_count"] += len(ranked)
         self._profile["verify_segment_prefetch_rank_ms"] += (time.perf_counter() - rank_t0) * 1000.0

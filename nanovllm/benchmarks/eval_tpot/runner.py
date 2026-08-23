@@ -662,6 +662,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.verify_prefetch_rank_multiplier is not None
                 else None
             ),
+            "verify_prefetch_draft_reserve": int(
+                args.verify_prefetch_draft_reserve
+            ),
             "rank_guard_threshold": float(args.rank_guard_threshold),
             "rank_guard_ema_alpha": float(args.rank_guard_ema_alpha),
             "predictive_phase1_budget": int(args.predictive_phase1_budget),

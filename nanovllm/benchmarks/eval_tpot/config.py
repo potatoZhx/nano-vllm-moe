@@ -46,6 +46,7 @@ OPTIMIZED_CONFIG_CHOICES = (
     "k2_dynamic_f16_3080_active14_phase1_recent_b1",
     "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8",
     "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse",
+    "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11",
     # Compatibility aliases retained for historical commands.  They resolve
     # to the same 16-thread presets below; no built-in preset uses 32 threads.
     "k2_dynamic_f16_3080_active14_phase1_recent_t32",
@@ -285,6 +286,18 @@ OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_l
     "fused_cache_lut_updates": True,
 }
 
+# Keep the measured lutfuse optimum unchanged. This candidate preserves the
+# vpb2 transfer budget while reserving one verify-boundary slot for the best
+# marginal draft-live prediction whenever verify history is also available.
+OPTIMIZED_CONFIG_PRESETS[
+    "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11"
+] = {
+    **OPTIMIZED_CONFIG_PRESETS[
+        "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse"
+    ],
+    "verify_prefetch_draft_reserve": 1,
+}
+
 # Historical command aliases.  Their names describe the old experiment, not
 # the effective topology: every alias is intentionally capped at 16 threads.
 OPTIMIZED_CONFIG_PRESETS["k2_dynamic_f16_3080_active14_phase1_recent_t32"] = {
@@ -358,6 +371,7 @@ def apply_optimized_config(args: argparse.Namespace, argv: list[str]) -> dict[st
         "max_draft_tokens_values": "--max-draft-tokens-values",
         "segment_sizes": "--segment-sizes",
         "verify_prefetch_max_per_boundary": "--verify-prefetch-max-per-boundary",
+        "verify_prefetch_draft_reserve": "--verify-prefetch-draft-reserve",
         "prefetch_staging_slots_per_layer": "--prefetch-staging-slots-per-layer",
         "draft_stop_policy": "--draft-stop-policy",
         "draft_tpot_stop_rule": "--draft-tpot-stop-rule",
@@ -577,6 +591,7 @@ def configure_optimized_env(args: argparse.Namespace) -> dict[str, str]:
             "k2_dynamic_f16_3080_active14_phase1_recent_b1",
             "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8",
             "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11",
         }:
             env_overrides["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] = "1"
         else:
@@ -923,6 +938,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--draft-prefetch-max-per-boundary", type=int, default=16)
     parser.add_argument("--verify-prefetch-visible-budget-ms", type=float, default=12.0)
     parser.add_argument("--verify-prefetch-max-per-boundary", type=int, default=4)
+    parser.add_argument(
+        "--verify-prefetch-draft-reserve",
+        type=int,
+        default=0,
+        help=(
+            "Reserve verify-boundary dispatch positions for draft-live when "
+            "both draft-live and verify-history candidates are available."
+        ),
+    )
     parser.add_argument("--verify-prefetch-tpot-dynamic-budget-enabled", type=str2bool, default=False)
     parser.add_argument("--verify-prefetch-tpot-dynamic-budget-token-threshold", type=int, default=10)
     parser.add_argument("--verify-prefetch-tpot-dynamic-budget-small", type=int, default=4)

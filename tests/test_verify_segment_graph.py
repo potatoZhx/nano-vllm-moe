@@ -97,6 +97,60 @@ class TestVerifySegmentConfig(unittest.TestCase):
             assert cfg.verify_prefetch_max_per_boundary >= cfg.verify_prefetch_min_per_boundary
 
 
+class TestVerifySourceAwareRanking(unittest.TestCase):
+    @staticmethod
+    def _candidate(source: str, expert_idx: int, priority: float):
+        from nanovllm.expert.prefetcher import PrefetchCandidate
+
+        return PrefetchCandidate(
+            layer_idx=0,
+            expert_idx=expert_idx,
+            source=source,
+            score_sum=priority,
+            activation_count=1,
+            first_seen_step=1,
+            last_seen_step=1,
+            priority=priority,
+        )
+
+    def test_reserves_one_draft_and_preserves_priority_fallback(self):
+        from nanovllm.expert.prefetcher import source_aware_verify_candidates
+
+        history0 = self._candidate("verify_history", 0, 4.0)
+        history1 = self._candidate("verify_history", 1, 3.0)
+        draft0 = self._candidate("draft_live", 2, 2.0)
+        draft1 = self._candidate("draft_live", 3, 1.0)
+
+        ranked = source_aware_verify_candidates(
+            [history0, history1, draft0, draft1],
+            dispatch_budget=2,
+            draft_reserve=1,
+        )
+
+        self.assertEqual(ranked[:2], [history0, draft0])
+        self.assertEqual(ranked[2:], [history1, draft1])
+
+    def test_disabled_or_single_source_keeps_existing_order(self):
+        from nanovllm.expert.prefetcher import source_aware_verify_candidates
+
+        history0 = self._candidate("verify_history", 0, 2.0)
+        history1 = self._candidate("verify_history", 1, 1.0)
+        original = [history0, history1]
+
+        self.assertIs(
+            source_aware_verify_candidates(
+                original, dispatch_budget=2, draft_reserve=0
+            ),
+            original,
+        )
+        self.assertIs(
+            source_aware_verify_candidates(
+                original, dispatch_budget=2, draft_reserve=1
+            ),
+            original,
+        )
+
+
 # ===================================================================
 # 2. Segment boundary computation tests
 # ===================================================================
@@ -516,7 +570,7 @@ class TestVerifySegmentReplay(unittest.TestCase):
             "hidden_states": torch.zeros(4, 8),
         }
         mr._select_verify_bucket = MagicMock(return_value=4)
-        mr.runtime_meta_recorder = None
+        mr.runtime_meta_recorder = MagicMock()
         mr._enqueue_verify_segment_metadata = MagicMock()
         mr._prefetch_runtime_lock = MagicMock()
         mr.profile_enabled = False
@@ -539,12 +593,16 @@ class TestVerifySegmentReplay(unittest.TestCase):
             block_tables=torch.zeros(1, 2, dtype=torch.int32),
         )
         try:
-            ModelRunner._run_verify_with_kt_hybrid_segment_graph(
-                mr,
-                torch.tensor([1, 2], dtype=torch.int64),
-                torch.tensor([0, 1], dtype=torch.int64),
-                step_id=7,
-            )
+            with patch.dict(
+                "os.environ",
+                {"NANOVLLM_VERIFY_DEFER_SEGMENT_METADATA": "0"},
+            ):
+                ModelRunner._run_verify_with_kt_hybrid_segment_graph(
+                    mr,
+                    torch.tensor([1, 2], dtype=torch.int64),
+                    torch.tensor([0, 1], dtype=torch.int64),
+                    step_id=7,
+                )
         finally:
             reset_context()
 
@@ -881,6 +939,80 @@ class TestSubmitVerifySegmentPrefetch(unittest.TestCase):
         self.assertEqual(submitted, 1)
         self.assertEqual(rt._profile["verify_segment_prefetch_submit_count"], 1)
         self.assertIn((18, 3), rt.inflight)
+
+    def test_source_reserve_submits_one_history_and_one_draft(self):
+        from nanovllm.expert.prefetcher import (
+            PrefetchCandidate,
+            PrefetchRuntime,
+            SegmentCandidateIndex,
+        )
+
+        config = self._config(
+            verify_prefetch_max_per_boundary=2,
+            verify_prefetch_draft_reserve=1,
+        )
+        rt = object.__new__(PrefetchRuntime)
+        rt.config = config
+        cache = MagicMock()
+        cache.is_cached_cpu.return_value = False
+        cache.is_pending_cpu.return_value = False
+        cache.reserve_active_slot_for_prefetch_deferred.side_effect = [
+            SimpleNamespace(active_slot_idx=0, generation=1, prev_expert=4),
+            SimpleNamespace(active_slot_idx=1, generation=1, prev_expert=5),
+        ]
+        rt.layer_caches = {0: cache}
+        weights = {
+            "gate_up": torch.zeros(4, 4),
+            "down": torch.zeros(4, 2),
+        }
+        rt.cpu_expert_pool = {0: {expert_idx: weights for expert_idx in range(4)}}
+        rt.inflight = {}
+        rt._profile = defaultdict(float)
+        rt.draft_segment_index = SegmentCandidateIndex(config)
+        rt.verify_segment_index = SegmentCandidateIndex(config)
+        rt.long_term_segment_index = SegmentCandidateIndex(config)
+
+        def add(index, source, expert_idx, score):
+            candidate = PrefetchCandidate(
+                layer_idx=0,
+                expert_idx=expert_idx,
+                source=source,
+                score_sum=score,
+                activation_count=1,
+                first_seen_step=1,
+                last_seen_step=1,
+                priority=0.0,
+            )
+            index.entries_by_segment[0][(0, expert_idx)] = candidate
+
+        add(rt.verify_segment_index, "verify_history", 0, 3.0)
+        add(rt.verify_segment_index, "verify_history", 1, 2.0)
+        add(rt.draft_segment_index, "draft_live", 2, 1.0)
+        add(rt.draft_segment_index, "draft_live", 3, 0.5)
+        rt._select_publish_slot_cpu = MagicMock(side_effect=[0, 1])
+        rt._begin_prefetch_transfer = MagicMock(
+            side_effect=[
+                (MagicMock(), 100.0, 0.1, 64, 0),
+                (MagicMock(), 101.0, 0.1, 64, 0),
+            ]
+        )
+        rt._record_prefetch_submitted = MagicMock()
+        rt._record_source_submit = MagicMock()
+
+        submitted = PrefetchRuntime.submit_verify_segment_prefetch(
+            rt,
+            step_id=1,
+            target_layer_start=0,
+            target_layer_end=12,
+            visible_budget_ms=3.0,
+        )
+
+        self.assertEqual(submitted, 2)
+        self.assertEqual(
+            [call.args[0] for call in rt._record_source_submit.call_args_list],
+            ["verify_history", "draft_live"],
+        )
+        self.assertEqual(set(rt.inflight), {(0, 0), (0, 2)})
 
 
 if __name__ == "__main__":

@@ -306,9 +306,30 @@ def test_active14_ghost8_lutfuse_t16_is_independent_preset(tmp_path):
     assert args.predictive_ghost_window_steps == 8
     assert args.predictive_ghost_protect_steps == 8
     assert args.fused_cache_lut_updates is True
+    assert args.verify_prefetch_draft_reserve == 0
     assert args.kt_num_threads == 16
     env = configure_optimized_env(args)
     assert env["NANOVLLM_GROUPED_GEMM_FIXED_QWEN3"] == "1"
+
+
+def test_active14_source11_is_independent_t16_preset(tmp_path):
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--optimized-config",
+            "k2_dynamic_f16_3080_active14_phase1_recent_b1_ghost8_lutfuse_source11",
+        ]
+    )
+
+    assert args.verify_prefetch_max_per_boundary == 2
+    assert args.verify_prefetch_draft_reserve == 1
+    assert args.predictive_phase1_budget == 1
+    assert args.predictive_ghost_window_steps == 8
+    assert args.fused_cache_lut_updates is True
+    assert args.kt_num_threads == 16
+    assert args.kt_threadpool_count == 2
+    assert args.kt_numa_nodes == "0,1"
 
 
 def test_every_builtin_optimized_preset_uses_sixteen_threads(tmp_path):
